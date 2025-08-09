@@ -49,3 +49,21 @@ border_input = "#484848"
 popup_title = "Red"
 popup_accent = "Yellow"
 popup_text = "Gray"
+
+# Syntax highlighting
+[syntax]
+enabled = true
+# If you prefer a built-in syntect theme (used only when no [syntax.custom] is provided)
+theme_name = "base16-ocean.dark"
+
+# Custom syntax palette (takes precedence over theme_name when present)
+[syntax.custom]
+keyword  = "#CC99CD"
+string   = "#7EC699"
+comment  = "#999999"
+type     = "#5FB4B4"
+function = "#6699CC"
+number   = "#F2777A"
+operator = "#F99157"
+punct    = "light_gray"
+text     = "white"
