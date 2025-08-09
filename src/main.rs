@@ -1,8 +1,10 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::Write,
     path::PathBuf,
     time::Duration,
+    str::FromStr,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -32,6 +34,18 @@ use tokio::process::Command;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+
+// syntect for code highlighting
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{
+        Color as SynColor, FontStyle, ScopeSelectors, Style as SynStyle, StyleModifier, Theme as SynTheme, ThemeItem, ThemeSet
+    },
+    parsing::SyntaxSet,
+};
 
 // ---------- Data models ----------
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -281,6 +295,13 @@ fn apply_selection(style: Style, selected: bool, bold_selection: bool) -> Style 
 
 // ---------- Config ----------
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SyntaxSection {
+    enabled: Option<bool>,
+    theme_name: Option<String>,
+    custom: Option<toml::value::Table>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct AppConfig {
     model: Option<String>,
     api_url: Option<String>,
@@ -288,6 +309,9 @@ struct AppConfig {
     system_prompt: Option<String>,
     bold_selection: Option<bool>,
     colors: Option<toml::value::Table>,
+    syntax: Option<SyntaxSection>,
+    // legacy fallback:
+    syntax_theme: Option<String>,
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -443,6 +467,15 @@ struct App {
     focus: Focus,
     selected_msg: Option<usize>,
     popup: Popup,
+
+    // syntect
+    syntax_enabled: bool,
+    syn_ss: SyntaxSet,
+    syn_theme: SynTheme,
+
+    // render cache
+    render_cache: HashMap<(usize, u16), (u64, Text<'static>)>, // (msg_idx, width) -> (hash, rendered)
+    pending_cache: Option<(u16, u64, Text<'static>)>,          // (width, hash, rendered)
 }
 
 impl App {
@@ -453,8 +486,16 @@ impl App {
         system_prompt: Option<String>,
         bold_selection: bool,
         theme: Theme,
+        syntax_enabled: bool,
+        syntax_theme_name: String,
+        syntax_custom: Option<toml::value::Table>,
     ) -> Self {
         let chats = list_chats().unwrap_or_default();
+
+        // syntect assets
+        let syn_ss = SyntaxSet::load_defaults_newlines();
+        let syn_theme = build_syntect_theme(&syntax_theme_name, syntax_custom.as_ref());
+
         Self {
             current_chat_id: None,
             current_created_ts: None,
@@ -478,6 +519,11 @@ impl App {
             focus: Focus::Chat,
             selected_msg: None,
             popup: Popup::None,
+            syntax_enabled,
+            syn_ss,
+            syn_theme,
+            render_cache: HashMap::new(),
+            pending_cache: None,
         }
     }
 }
@@ -497,16 +543,16 @@ async fn stream_ollama(
     api_url: String,
     model: String,
     options: Option<JsonValue>,
-    messages: Vec<Message>,
+    mut messages: Vec<Message>,
     tx: UnboundedSender<AppEvent>,
 ) {
-    let client = reqwest::Client::new();
     let req = OllamaChatRequest {
         model: &model,
         messages: &messages,
         stream: true,
         options: options.as_ref(),
     };
+    let client = reqwest::Client::new();
 
     let resp = match client.post(api_url).json(&req).send().await {
         Ok(r) => r,
@@ -564,7 +610,7 @@ async fn stream_ollama(
 
 // ---------- Sanitization + Preview ----------
 fn sanitize_for_html(input: &str) -> String {
-    let mut out = input.replace('\u{2011}', "-");
+    let mut out = input.replace('\u{2011}', "-"); // non-breaking hyphen -> hyphen
     out = out.replace('<', "").replace('>', "");
     let re_display = Regex::new(r"(?s)\\\[\s*(.*?)\s*\\\]").unwrap();
     out = re_display
@@ -720,75 +766,140 @@ fn stylize_inline(input: &str, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
-// code rows padded with NBSP to keep bg for empty lines and right edge
-fn push_code_rows(line: &str, inner_width: u16, text: &mut Text<'static>, theme: &Theme) {
-    let w = inner_width.max(1) as usize;
-    let style = Style::default()
-        .fg(theme.code_block_fg)
-        .bg(theme.code_block_bg);
-    const NBSP: char = '\u{00A0}';
-
-    let expanded = line.replace('\t', "    ");
-
-    if expanded.is_empty() {
-        let fill: String = std::iter::repeat(NBSP).take(w).collect();
-        text.push_line(Line::styled(fill, style));
-        return;
-    }
-
-    let mut row = String::new();
-    let mut row_w = 0usize;
-
-    for g in UnicodeSegmentation::graphemes(expanded.as_str(), true) {
-        let gw = UnicodeWidthStr::width(g);
-
-        if gw > w {
-            if row_w > 0 {
-                row.extend(std::iter::repeat(NBSP).take(w - row_w));
-                text.push_line(Line::styled(row.clone(), style));
-                row.clear();
-                row_w = 0;
-            }
-            let mut s = g.to_string();
-            let pad = w.saturating_sub(w.min(gw));
-            s.extend(std::iter::repeat(NBSP).take(pad));
-            text.push_line(Line::styled(s, style));
-            continue;
-        }
-
-        if row_w + gw > w {
-            row.extend(std::iter::repeat(NBSP).take(w - row_w));
-            text.push_line(Line::styled(row.clone(), style));
-            row.clear();
-            row_w = 0;
-        }
-
-        row.push_str(g);
-        row_w += gw;
-    }
-
-    row.extend(std::iter::repeat(NBSP).take(w.saturating_sub(row_w)));
-    text.push_line(Line::styled(row, style));
+fn syn_to_color(c: SynColor) -> Color {
+    Color::Rgb(c.r, c.g, c.b)
 }
 
-fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text<'static> {
+fn render_markdown_to_text(
+    input: &str,
+    theme: &Theme,
+    inner_width: u16,
+    ss: &SyntaxSet,
+    syn_theme: &SynTheme,
+    syntax_enabled: bool,
+) -> Text<'static> {
     let mut text = Text::default();
     let mut in_code_block = false;
+    let mut high: Option<HighlightLines> = None;
     let hr_line_len = inner_width.max(1) as usize;
+    const NBSP: char = '\u{00A0}';
 
-    for line in input.lines() {
-        let trimmed = line.trim_start();
+    for raw in input.lines() {
+        let trimmed = raw.trim_start();
 
+        // Fenced code start/end with optional language tag
         if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
+            if in_code_block {
+                in_code_block = false;
+                high = None;
+            } else {
+                in_code_block = true;
+                let lang = trimmed.trim_start_matches("```").trim();
+                if syntax_enabled {
+                    let syn = if lang.is_empty() {
+                        ss.find_syntax_plain_text()
+                    } else {
+                        ss.find_syntax_by_token(lang).unwrap_or_else(|| ss.find_syntax_plain_text())
+                    };
+                    high = Some(HighlightLines::new(syn, syn_theme));
+                } else {
+                    high = None;
+                }
+            }
             continue;
         }
 
         if in_code_block {
-            push_code_rows(line, inner_width, &mut text, theme);
+            let style_bg = Style::default().bg(theme.code_block_bg);
+            let w = inner_width.max(1) as usize;
+
+            // Empty line -> full-width padding to preserve background
+            if raw.is_empty() {
+                let fill: String = std::iter::repeat(NBSP).take(w).collect();
+                text.push_line(Line::styled(fill, style_bg.fg(theme.code_block_fg)));
+                continue;
+            }
+
+            if let Some(h) = high.as_mut() {
+                let ranges = h.highlight_line(raw, ss).unwrap_or_default();
+
+                // Collect styled segments as owned strings
+                let mut segs: Vec<(Style, String)> = Vec::with_capacity(ranges.len());
+                for (sty, seg) in ranges {
+                    if seg.is_empty() {
+                        continue;
+                    }
+                    let st = style_bg.fg(syn_to_color(sty.foreground));
+                    segs.push((st, seg.to_string()));
+                }
+
+                // Hard-wrap by visible width, preserving styles
+                let mut cur_line: Vec<Span<'static>> = Vec::new();
+                let mut cur_w = 0usize;
+
+                for (st, seg) in segs {
+                    for g in UnicodeSegmentation::graphemes(seg.as_str(), true) {
+                        let gw = UnicodeWidthStr::width(g);
+
+                        if gw > w {
+                            // flush current line if non-empty
+                            if !cur_line.is_empty() || cur_w > 0 {
+                                let pad_len = w.saturating_sub(cur_w);
+                                if pad_len > 0 {
+                                    let pad: String = std::iter::repeat(NBSP).take(pad_len).collect();
+                                    cur_line.push(Span::styled(pad, style_bg.fg(theme.code_block_fg)));
+                                }
+                                text.push_line(Line::from(std::mem::take(&mut cur_line)));
+                                cur_w = 0;
+                            }
+                            // emit huge grapheme as its own padded line
+                            let mut spans: Vec<Span<'static>> = Vec::new();
+                            spans.push(Span::styled(g.to_string(), st));
+                            let pad_len = w.saturating_sub(gw.min(w));
+                            if pad_len > 0 {
+                                let pad: String = std::iter::repeat(NBSP).take(pad_len).collect();
+                                spans.push(Span::styled(pad, style_bg.fg(theme.code_block_fg)));
+                            }
+                            text.push_line(Line::from(spans));
+                            continue;
+                        }
+
+                        if cur_w + gw > w {
+                            let pad_len = w.saturating_sub(cur_w);
+                            if pad_len > 0 {
+                                let pad: String = std::iter::repeat(NBSP).take(pad_len).collect();
+                                cur_line.push(Span::styled(pad, style_bg.fg(theme.code_block_fg)));
+                            }
+                            text.push_line(Line::from(std::mem::take(&mut cur_line)));
+                            cur_w = 0;
+                        }
+
+                        cur_line.push(Span::styled(g.to_string(), st));
+                        cur_w += gw;
+                    }
+                }
+
+                // flush last visual line
+                let pad_len = w.saturating_sub(cur_w);
+                if pad_len > 0 {
+                    let pad: String = std::iter::repeat(NBSP).take(pad_len).collect();
+                    cur_line.push(Span::styled(pad, style_bg.fg(theme.code_block_fg)));
+                }
+                text.push_line(Line::from(cur_line));
+            } else {
+                // fallback (plain)
+                let mut line = raw.replace('\t', "    ");
+                let cur_w = UnicodeWidthStr::width(line.as_str());
+                if cur_w < w {
+                    let pad: String = std::iter::repeat(NBSP).take(w - cur_w).collect();
+                    line.push_str(&pad);
+                }
+                text.push_line(Line::styled(line, style_bg.fg(theme.code_block_fg)));
+            }
             continue;
         }
 
+        // Non-code markdown enhancements
         if !trimmed.is_empty() && trimmed.chars().all(|c| c == '-') && trimmed.len() >= 3 {
             let hr = "─".repeat(hr_line_len);
             text.push_line(Line::styled(hr, Style::default().fg(theme.hr)));
@@ -855,10 +966,133 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
             }
         }
 
-        text.push_line(Line::from(stylize_inline(line, theme)));
+        text.push_line(Line::from(stylize_inline(raw, theme)));
     }
 
     text
+}
+
+// ---------- Custom syntect theme builder ----------
+fn syn_color_from_str(s: &str) -> Option<SynColor> {
+    let t = s.trim().to_lowercase().replace('-', "_");
+    let c = match t.as_str() {
+        "black" => SynColor { r: 0, g: 0, b: 0, a: 0xFF },
+        "red" => SynColor { r: 0xFF, g: 0, b: 0, a: 0xFF },
+        "green" => SynColor { r: 0, g: 0x80, b: 0, a: 0xFF },
+        "yellow" => SynColor { r: 0xFF, g: 0xFF, b: 0, a: 0xFF },
+        "blue" => SynColor { r: 0, g: 0, b: 0xFF, a: 0xFF },
+        "magenta" => SynColor { r: 0xFF, g: 0, b: 0xFF, a: 0xFF },
+        "cyan" => SynColor { r: 0, g: 0xFF, b: 0xFF, a: 0xFF },
+        "white" => SynColor { r: 0xFF, g: 0xFF, b: 0xFF, a: 0xFF },
+        "gray" | "grey" => SynColor { r: 0x80, g: 0x80, b: 0x80, a: 0xFF },
+        "dark_gray" | "dark_grey" => SynColor { r: 0x40, g: 0x40, b: 0x40, a: 0xFF },
+        "light_red" => SynColor { r: 0xFF, g: 0x66, b: 0x66, a: 0xFF },
+        "light_green" => SynColor { r: 0x66, g: 0xFF, b: 0x66, a: 0xFF },
+        "light_yellow" => SynColor { r: 0xFF, g: 0xFF, b: 0x99, a: 0xFF },
+        "light_blue" => SynColor { r: 0x66, g: 0x99, b: 0xFF, a: 0xFF },
+        "light_magenta" => SynColor { r: 0xFF, g: 0x66, b: 0xFF, a: 0xFF },
+        "light_cyan" => SynColor { r: 0x99, g: 0xFF, b: 0xFF, a: 0xFF },
+        _ => {
+            if let Some(hex) = t.strip_prefix('#') {
+                if hex.len() == 6 {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        u8::from_str_radix(&hex[0..2], 16),
+                        u8::from_str_radix(&hex[2..4], 16),
+                        u8::from_str_radix(&hex[4..6], 16),
+                    ) {
+                        return Some(SynColor { r, g, b, a: 0xFF });
+                    }
+                }
+            }
+            return None;
+        }
+    };
+    Some(c)
+}
+
+fn theme_item_for(scope_sel: &str, color: SynColor) -> Option<ThemeItem> {
+    let sels = ScopeSelectors::from_str(scope_sel).ok()?;
+    let style = StyleModifier {
+        foreground: Some(color),
+        background: Some(SynColor { r: 0, g: 0, b: 0, a: 0 }), // transparent
+        font_style: Some(FontStyle::empty()),
+    };
+    Some(ThemeItem { scope: sels, style })
+}
+
+fn build_custom_syn_theme(tbl: &toml::value::Table) -> Option<SynTheme> {
+    let mut items: Vec<ThemeItem> = Vec::new();
+
+    let map = |key: &str, scopes: &str, items: &mut Vec<ThemeItem>| {
+        if let Some(v) = tbl.get(key).and_then(|v| v.as_str()).and_then(syn_color_from_str) {
+            if let Some(item) = theme_item_for(scopes, v) {
+                items.push(item);
+            }
+        }
+    };
+
+    map("keyword", "keyword, storage, keyword.operator", &mut items);
+    map("string", "string", &mut items);
+    map("comment", "comment", &mut items);
+    map("type", "storage.type, support.type, entity.name.type", &mut items);
+    map("function", "entity.name.function, support.function", &mut items);
+    map("number", "constant.numeric", &mut items);
+    map("operator", "keyword.operator", &mut items);
+    map("punct", "punctuation", &mut items);
+    map("text", "text, source", &mut items);
+
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut th = SynTheme::default();
+    th.scopes = items;
+    Some(th)
+}
+
+fn build_syntect_theme(theme_name: &str, custom: Option<&toml::value::Table>) -> SynTheme {
+    if let Some(tbl) = custom {
+        if let Some(t) = build_custom_syn_theme(tbl) {
+            return t;
+        }
+    }
+    let ts = ThemeSet::load_defaults();
+    ts.themes
+        .get(theme_name)
+        .or_else(|| ts.themes.get("base16-ocean.dark"))
+        .cloned()
+        .unwrap_or_else(|| ts.themes.values().next().cloned().unwrap_or_default())
+}
+
+// ---------- Cache helpers ----------
+fn role_tag(r: &Role) -> u8 {
+    match r {
+        Role::User => 1,
+        Role::Assistant => 2,
+        Role::System => 3,
+    }
+}
+
+fn message_hash(m: &Message) -> u64 {
+    let mut h = DefaultHasher::new();
+    role_tag(&m.role).hash(&mut h);
+    m.content.hash(&mut h);
+    h.finish()
+}
+
+fn str_hash(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+fn clone_with_modifier(mut t: Text<'static>, m: Modifier) -> Text<'static> {
+    for line in &mut t.lines {
+        for span in &mut line.spans {
+            span.style = span.style.add_modifier(m);
+        }
+    }
+    t
 }
 
 // ---------- UI helpers ----------
@@ -1098,18 +1332,45 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         pstyle = apply_selection(pstyle, selected, app.bold_selection);
         text.push_line(Line::styled(prefix_text, pstyle));
 
-        let mut md = render_markdown_to_text(&m.content, &app.theme, inner_w);
+        // Cached body render
+        let msg_h = message_hash(m);
+        let key = (i, inner_w);
+        let body: Text<'static> = if let Some((h, cached)) = app.render_cache.get(&key) {
+            if *h == msg_h {
+                cached.clone()
+            } else {
+                let t = render_markdown_to_text(
+                    &m.content,
+                    &app.theme,
+                    inner_w,
+                    &app.syn_ss,
+                    &app.syn_theme,
+                    app.syntax_enabled,
+                );
+                app.render_cache.insert(key, (msg_h, t.clone()));
+                t
+            }
+        } else {
+            let t = render_markdown_to_text(
+                &m.content,
+                &app.theme,
+                inner_w,
+                &app.syn_ss,
+                &app.syn_theme,
+                app.syntax_enabled,
+            );
+            app.render_cache.insert(key, (msg_h, t.clone()));
+            t
+        };
+
+        let mut md = body;
         if selected {
             let m = if app.bold_selection {
                 Modifier::BOLD
             } else {
                 Modifier::REVERSED
             };
-            for line in &mut md.lines {
-                for span in &mut line.spans {
-                    span.style = span.style.add_modifier(m);
-                }
-            }
+            md = clone_with_modifier(md, m);
         }
         for line in md.lines {
             text.push_line(line);
@@ -1125,7 +1386,25 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         hdr_style = apply_selection(hdr_style, selected, app.bold_selection);
         text.push_line(Line::styled(format!("{}:", app.model), hdr_style));
 
-        let mut md = render_markdown_to_text(&app.pending_assistant, &app.theme, inner_w);
+        // Cached pending render
+        let pending_h = str_hash(&app.pending_assistant);
+        let pending_text: Text<'static> = match &app.pending_cache {
+            Some((w, h, t)) if *w == inner_w && *h == pending_h => t.clone(),
+            _ => {
+                let t = render_markdown_to_text(
+                    &app.pending_assistant,
+                    &app.theme,
+                    inner_w,
+                    &app.syn_ss,
+                    &app.syn_theme,
+                    app.syntax_enabled,
+                );
+                app.pending_cache = Some((inner_w, pending_h, t.clone()));
+                t
+            }
+        };
+
+        let mut md = pending_text.clone();
         if let Some(last) = md.lines.last_mut() {
             last.spans.push(Span::raw("▌"));
         } else {
@@ -1137,11 +1416,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             } else {
                 Modifier::REVERSED
             };
-            for line in &mut md.lines {
-                for span in &mut line.spans {
-                    span.style = span.style.add_modifier(m);
-                }
-            }
+            md = clone_with_modifier(md, m);
         }
         for line in md.lines {
             text.push_line(line);
@@ -1212,8 +1487,6 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .fg(app.theme.mode_insert)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
         ]),
         Mode::Normal => {
             let base = if app.focus == Focus::Sidebar {
@@ -1234,7 +1507,6 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_normal)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
             ])
         }
         Mode::Visual => {
@@ -1256,7 +1528,6 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_visual)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
             ])
         }
     };
@@ -1270,7 +1541,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     );
     frame.render_widget(input, v_chunks[1]);
 
-    // Cursor (as line) only in INSERT mode within chat focus
+    // Cursor (as thin bar) only in INSERT mode within chat focus
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
         let visual_x = input_visual_x(&app.input, app.input_cursor) as u16;
         frame.set_cursor(v_chunks[1].x + 1 + visual_x, v_chunks[1].y + 1);
@@ -1314,7 +1585,29 @@ async fn main() -> Result<()> {
     let bold_selection = cfg.bold_selection.unwrap_or(false);
     let theme = Theme::from_config(cfg.colors.as_ref());
 
-    let mut app = App::new(model, api_url, options, system_prompt, bold_selection, theme);
+    let (syntax_enabled, syntax_theme_name, syntax_custom) = {
+        let s = cfg.syntax.clone();
+        let enabled = s.as_ref().and_then(|x| x.enabled).unwrap_or(true);
+        let theme_name = s
+            .as_ref()
+            .and_then(|x| x.theme_name.clone())
+            .or(cfg.syntax_theme.clone())
+            .unwrap_or_else(|| "base16-ocean.dark".to_string());
+        let custom = s.and_then(|x| x.custom);
+        (enabled, theme_name, custom)
+    };
+
+    let mut app = App::new(
+        model,
+        api_url,
+        options,
+        system_prompt,
+        bold_selection,
+        theme,
+        syntax_enabled,
+        syntax_theme_name,
+        syntax_custom,
+    );
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -1350,9 +1643,11 @@ async fn main() -> Result<()> {
                 AppEvent::Input(key) => handle_key(key, &mut app, &tx).await?,
                 AppEvent::OllamaChunk(delta) => {
                     app.pending_assistant.push_str(&delta);
+                    app.pending_cache = None; // invalidate pending render cache
                 }
                 AppEvent::OllamaDone => {
                     let content = std::mem::take(&mut app.pending_assistant);
+                    app.pending_cache = None;
                     app.messages.push(Message {
                         role: Role::Assistant,
                         content: content.clone(),
@@ -1365,6 +1660,7 @@ async fn main() -> Result<()> {
                 }
                 AppEvent::OllamaError(e) => {
                     app.pending_assistant.clear();
+                    app.pending_cache = None;
                     app.sending = false;
                     app.messages.push(Message {
                         role: Role::System,
@@ -1394,6 +1690,7 @@ fn now_sec() -> i64 {
         .as_secs() as i64
 }
 
+// These estimations are used only for G/top/bottom and selection auto-adjust; they don't account for markdown wrapping.
 fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
     let mut y: u16 = 0;
     for m in messages {
@@ -1429,6 +1726,8 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.selected_msg = None;
     app.chat_scroll = 0;
     app.chat_inner_height = 0;
+    app.render_cache.clear();
+    app.pending_cache = None;
     let chat = Chat {
         id: id.clone(),
         title: "Untitled chat".to_string(),
@@ -1482,6 +1781,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     app.pending_assistant.clear();
                     app.selected_msg = None;
                     app.chat_scroll = 0;
+                    app.render_cache.clear();
+                    app.pending_cache = None;
                 }
                 app.popup = Popup::None;
                 app.chats = list_chats().unwrap_or_default();
@@ -1538,16 +1839,20 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     role: Role::User,
                     content: input.clone(),
                 });
+                app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height)); // harmless
                 persist_current_chat(app)?;
                 app.sending = true;
                 let mut convo = app.messages.clone();
                 convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
                 if !convo.iter().any(|m| matches!(m.role, Role::System)) {
                     if let Some(sp) = app.system_prompt.clone() {
-                        convo.insert(0, Message {
-                            role: Role::System,
-                            content: sp,
-                        });
+                        convo.insert(
+                            0,
+                            Message {
+                                role: Role::System,
+                                content: sp,
+                            },
+                        );
                     }
                 }
                 let api_url = app.api_url.clone();
@@ -1644,6 +1949,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                                     role: Role::System,
                                     content: format!("Clipboard paste failed: {}", e),
                                 });
+                                app.render_cache.clear();
                             }
                         }
                     }
@@ -1696,6 +2002,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                             app.current_chat_id = Some(chat.id.clone());
                             app.current_created_ts = Some(chat.created_ts);
                             app.messages = chat.messages;
+                            app.render_cache.clear();
+                            app.pending_cache = None;
                             let total = content_total_height(&app.messages, None);
                             app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                             app.focus = Focus::Chat;
@@ -1737,6 +2045,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                                     role: Role::System,
                                     content: format!("Clipboard copy failed: {}", e),
                                 });
+                                app.render_cache.clear();
                             }
                         }
                     }
@@ -1798,6 +2107,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                         app.current_chat_id = Some(chat.id.clone());
                         app.current_created_ts = Some(chat.created_ts);
                         app.messages = chat.messages;
+                        app.render_cache.clear();
+                        app.pending_cache = None;
                         app.selected_msg = Some(app.messages.len().saturating_sub(1));
                         app.chat_scroll =
                             offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));
