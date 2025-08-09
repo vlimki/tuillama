@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers},
@@ -1338,13 +1338,13 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let ts = NaiveDateTime::from_timestamp_opt(c.updated_ts, 0)
-                .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| c.updated_ts.to_string());
+            let ts_utc: DateTime<Utc> = Utc.timestamp_opt(c.updated_ts, 0).unwrap();
+            let ts_local = ts_utc.with_timezone(&Local);
+            let ts = ts_local.format("%d/%m %H:%M").to_string();
             let selected = app.focus == Focus::Sidebar && i == app.sidebar_idx;
             let mut spans = vec![
-                Span::styled(ts, Style::default().fg(app.theme.sidebar_timestamp)),
-                Span::raw("  "),
+                Span::styled(format!("[{ts}]"), Style::default().fg(app.theme.sidebar_timestamp)),
+                Span::raw(" "),
                 Span::styled(&c.title, Style::default().fg(app.theme.sidebar_item)),
             ];
             if selected {
@@ -1556,12 +1556,12 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "[INSERT]",
+                "[INSERT] ",
                 Style::default()
                     .fg(app.theme.mode_insert)
                     .add_modifier(Modifier::BOLD),
             ),
-            help_hint.clone(),
+            //help_hint.clone(),
         ]),
         Mode::Normal => {
             let base = if app.focus == Focus::Sidebar {
@@ -1604,16 +1604,25 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_visual)
                         .add_modifier(Modifier::BOLD),
                 ),
-                help_hint,
+                //help_hint,
             ])
         }
     };
 
     // Horizontal scrolling input view to keep cursor visible
     let input_inner_w = v_chunks[1].width.saturating_sub(2) as usize;
-    let (input_view_str, cursor_x) = input_view(&app.input, app.input_cursor, input_inner_w);
+    let (mut input_view_str, cursor_x) = input_view(&app.input, app.input_cursor, input_inner_w);
 
-    let input = Paragraph::new(input_view_str).block(
+    let style = if input_view_str.is_empty() && app.mode == Mode::Normal {
+        input_view_str = String::from("Press `i` to enter insert mode...");
+        Style::default().fg(Color::from_str("#484848").unwrap()) 
+    } else {
+        Style::default()
+    };
+
+    let input = Paragraph::new(input_view_str.clone())
+        .style(style)
+        .block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border_input))
