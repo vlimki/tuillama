@@ -29,6 +29,8 @@ use regex::{Captures, Regex};
 use tokio::process::Command;
 use std::process::Stdio;
 use rand::random;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 // ---------- Data models ----------
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -575,37 +577,53 @@ fn stylize_inline(input: &str, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
+// Fill code rows with NBSP so empty lines and right padding keep the background across the full width.
 fn push_code_rows(line: &str, inner_width: u16, text: &mut Text<'static>, theme: &Theme) {
     let w = inner_width.max(1) as usize;
     let style = Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg);
-    let nbsp = '\u{00A0}';
+    const NBSP: char = '\u{00A0}';
 
-    // Expand tabs for stable width
     let expanded = line.replace('\t', "    ");
 
-    // If the line is empty, emit a full-width NBSP row so the background fills
     if expanded.is_empty() {
-        let fill: String = std::iter::repeat(nbsp).take(w).collect();
+        let fill: String = std::iter::repeat(NBSP).take(w).collect();
         text.push_line(Line::styled(fill, style));
         return;
     }
 
-    // Chunk into fixed-width rows so bg spans the whole line
-    let mut cur = String::new();
-    for ch in expanded.chars() {
-        cur.push(ch);
-        if cur.chars().count() == w {
-            text.push_line(Line::styled(cur.clone(), style));
-            cur.clear();
+    let mut row = String::new();
+    let mut row_w = 0usize;
+
+    for g in UnicodeSegmentation::graphemes(expanded.as_str(), true) {
+        let gw = UnicodeWidthStr::width(g);
+
+        if gw > w {
+            if row_w > 0 {
+                row.extend(std::iter::repeat(NBSP).take(w - row_w));
+                text.push_line(Line::styled(row.clone(), style));
+                row.clear();
+                row_w = 0;
+            }
+            let mut s = g.to_string();
+            let pad = w.saturating_sub(w.min(gw));
+            s.extend(std::iter::repeat(NBSP).take(pad));
+            text.push_line(Line::styled(s, style));
+            continue;
         }
-    }
-    if !cur.is_empty() {
-        let cur_len = cur.chars().count();
-        if cur_len < w {
-            cur.extend(std::iter::repeat(nbsp).take(w - cur_len));
+
+        if row_w + gw > w {
+            row.extend(std::iter::repeat(NBSP).take(w - row_w));
+            text.push_line(Line::styled(row.clone(), style));
+            row.clear();
+            row_w = 0;
         }
-        text.push_line(Line::styled(cur, style));
+
+        row.push_str(g);
+        row_w += gw;
     }
+
+    row.extend(std::iter::repeat(NBSP).take(w.saturating_sub(row_w)));
+    text.push_line(Line::styled(row, style));
 }
 
 fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text<'static> {
@@ -618,7 +636,6 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
 
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
-            // No labels for code fences
             continue;
         }
 
@@ -627,14 +644,12 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
             continue;
         }
 
-        // horizontal rule: '---' or longer runs of '-'
         if !trimmed.is_empty() && trimmed.chars().all(|c| c == '-') && trimmed.len() >= 3 {
             let hr = "─".repeat(hr_line_len);
             text.push_line(Line::styled(hr, Style::default().fg(theme.hr)));
             continue;
         }
 
-        // headings
         let hashes = trimmed.chars().take_while(|&c| c == '#').count();
         if hashes > 0 && trimmed.chars().nth(hashes) == Some(' ') {
             let content = trimmed[hashes + 1..].to_string();
@@ -649,7 +664,6 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
             continue;
         }
 
-        // blockquote
         if trimmed.starts_with("> ") {
             let inner = &trimmed[2..];
             let mut spans = vec![Span::styled("▏ ", Style::default().fg(theme.blockquote_bar))];
@@ -658,7 +672,6 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
             continue;
         }
 
-        // list bullets
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let inner = &trimmed[2..];
             let mut spans = vec![Span::styled("• ", Style::default().fg(theme.list_bullet))];
@@ -666,7 +679,7 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
             text.push_line(Line::from(spans));
             continue;
         }
-        // ordered list
+
         if let Some(pos) = trimmed.find(". ") {
             if trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
                 let num = &trimmed[..pos + 1];
@@ -901,7 +914,6 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .scroll((app.chat_scroll, 0));
     frame.render_widget(messages, v_chunks[0]);
 
-    // Status/input bar
     let input_title_line: Line = match app.mode {
         Mode::Insert => Line::from(vec![
             Span::styled("Message ", Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
