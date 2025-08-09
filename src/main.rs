@@ -82,6 +82,10 @@ struct Theme {
     sidebar_timestamp: Color,
     sidebar_item: Color,
 
+    // titles
+    title_chat: Color,
+    title_input: Color,
+
     // prefixes
     user_prefix: Color,
     assistant_prefix: Color,
@@ -124,6 +128,9 @@ impl Default for Theme {
             sidebar_title: Color::Cyan,
             sidebar_timestamp: Color::DarkGray,
             sidebar_item: Color::White,
+
+            title_chat: Color::White,
+            title_input: Color::White,
 
             user_prefix: Color::Cyan,
             assistant_prefix: Color::Magenta,
@@ -209,6 +216,9 @@ impl Theme {
             t.sidebar_title = color_from_cfg(map, "sidebar_title", t.sidebar_title);
             t.sidebar_timestamp = color_from_cfg(map, "sidebar_timestamp", t.sidebar_timestamp);
             t.sidebar_item = color_from_cfg(map, "sidebar_item", t.sidebar_item);
+
+            t.title_chat = color_from_cfg(map, "title_chat", t.title_chat);
+            t.title_input = color_from_cfg(map, "title_input", t.title_input);
 
             t.user_prefix = color_from_cfg(map, "user_prefix", t.user_prefix);
             t.assistant_prefix = color_from_cfg(map, "assistant_prefix", t.assistant_prefix);
@@ -433,9 +443,14 @@ async fn stream_ollama(
     api_url: String,
     model: String,
     options: Option<JsonValue>,
-    messages: Vec<Message>,
+    mut messages: Vec<Message>,
     tx: UnboundedSender<AppEvent>,
 ) {
+    // inject system prompt if not present
+    if !messages.iter().any(|m| matches!(m.role, Role::System)) {
+        // no-op here; App handles insertion on send
+    }
+
     let client = reqwest::Client::new();
     let req = OllamaChatRequest { model: &model, messages: &messages, stream: true, options: options.as_ref() };
 
@@ -579,7 +594,17 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
         }
 
         if in_code_block {
-            text.push_line(Line::styled(line.to_string(), Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg)));
+            // expand tabs for more stable width
+            let mut content = line.replace('\t', "    ");
+            // clamp/pad to inner width so bg covers full row
+            let target = inner_width as usize;
+            if content.chars().count() < target {
+                // right-pad with spaces to fill the whole row
+                let pad = target.saturating_sub(content.chars().count());
+                content.push_str(&" ".repeat(pad));
+            }
+            // do not truncate; let UI wrap if too long
+            text.push_line(Line::styled(content, Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg)));
             continue;
         }
 
@@ -634,7 +659,6 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
             }
         }
 
-        // normal
         text.push_line(Line::from(stylize_inline(line, theme)));
     }
 
@@ -701,7 +725,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("? ", Style::default().fg(app.theme.popup_accent).add_modifier(Modifier::BOLD)),
-                Span::raw("Show/close help"),
+                Span::raw("Show/close help (NORMAL mode)"),
             ]));
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -843,7 +867,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Mode::Normal => Span::styled("[NORMAL]", Style::default().fg(app.theme.mode_normal).add_modifier(Modifier::BOLD)),
         Mode::Visual => Span::styled("[VISUAL]", Style::default().fg(app.theme.mode_visual).add_modifier(Modifier::BOLD)),
     };
-    let mut title_spans = vec![Span::raw("Chat "), mode_span];
+    let mut title_spans = vec![Span::styled("Chat ", Style::default().fg(app.theme.title_chat).add_modifier(Modifier::BOLD)), mode_span];
     if matches!(app.focus, Focus::Chat) && matches!(app.mode, Mode::Normal | Mode::Visual) {
         title_spans.push(Span::styled(" [FOCUS]", Style::default().fg(app.theme.mode_focus).add_modifier(Modifier::BOLD)));
     }
@@ -861,7 +885,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // Status/input bar
     let input_title_line: Line = match app.mode {
         Mode::Insert => Line::from(vec![
-            Span::raw("Message "),
+            Span::styled("Message ", Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
             Span::styled("[INSERT]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
@@ -869,7 +893,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Mode::Normal => {
             let base = if app.focus == Focus::Sidebar { "Sidebar " } else { "Navigation " };
             Line::from(vec![
-                Span::raw(base),
+                Span::styled(base, Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
                 Span::styled("[NORMAL] ", Style::default().fg(app.theme.mode_normal).add_modifier(Modifier::BOLD)),
                 Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
             ])
@@ -877,7 +901,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Mode::Visual => {
             let base = if app.focus == Focus::Sidebar { "Sidebar " } else { "Navigation " };
             Line::from(vec![
-                Span::raw(base),
+                Span::styled(base, Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
                 Span::styled("[VISUAL] ", Style::default().fg(app.theme.mode_visual).add_modifier(Modifier::BOLD)),
                 Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
             ])
@@ -962,21 +986,30 @@ fn now_sec() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn persist_current_chat(app: &mut App) -> Result<()> {
-    let now = now_sec();
-    if app.current_chat_id.is_none() {
-        let id = gen_chat_id();
-        app.current_chat_id = Some(id);
-        app.current_created_ts = Some(now);
+fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
+    let mut y: u16 = 0;
+    for m in messages {
+        // prefix + content lines + blank line
+        y = y.saturating_add(1);
+        y = y.saturating_add(m.content.lines().count() as u16);
+        y = y.saturating_add(1);
     }
-    let id = app.current_chat_id.clone().unwrap();
-    let created = app.current_created_ts.unwrap_or(now);
-    let title = derive_title(&app.messages);
-    let chat = Chat { id: id.clone(), title, created_ts: created, updated_ts: now, messages: app.messages.clone() };
-    save_chat(&chat)?;
-    app.chats = list_chats().unwrap_or_default();
-    if let Some(idx) = app.chats.iter().position(|c| c.id == id) { app.sidebar_idx = idx; }
-    Ok(())
+    if let Some(p) = pending {
+        y = y.saturating_add(1); // prefix
+        y = y.saturating_add(p.lines().count() as u16);
+        y = y.saturating_add(1); // blank
+    }
+    y
+}
+
+fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
+    let mut y: u16 = 0;
+    for m in &messages[..idx.min(messages.len())] {
+        y = y.saturating_add(1);
+        y = y.saturating_add(m.content.lines().count() as u16);
+        y = y.saturating_add(1);
+    }
+    y
 }
 
 fn start_new_chat(app: &mut App) -> Result<()> {
@@ -996,14 +1029,21 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
-    let mut y: u16 = 0;
-    for m in &messages[..idx.min(messages.len())] {
-        y = y.saturating_add(1);
-        y = y.saturating_add(m.content.lines().count() as u16);
-        y = y.saturating_add(1);
+fn persist_current_chat(app: &mut App) -> Result<()> {
+    let now = now_sec();
+    if app.current_chat_id.is_none() {
+        let id = gen_chat_id();
+        app.current_chat_id = Some(id);
+        app.current_created_ts = Some(now);
     }
-    y
+    let id = app.current_chat_id.clone().unwrap();
+    let created = app.current_created_ts.unwrap_or(now);
+    let title = derive_title(&app.messages);
+    let chat = Chat { id: id.clone(), title, created_ts: created, updated_ts: now, messages: app.messages.clone() };
+    save_chat(&chat)?;
+    app.chats = list_chats().unwrap_or_default();
+    if let Some(idx) = app.chats.iter().position(|c| c.id == id) { app.sidebar_idx = idx; }
+    Ok(())
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) -> Result<()> {
@@ -1041,12 +1081,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
         Popup::None => {}
     }
 
-    // Global quick toggles
-    if let KeyCode::Char('?') = key.code {
-        app.popup = Popup::Help;
-        return Ok(());
-    }
-
     // Quit
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { app.quit = true; return Ok(()); }
     if key.code == KeyCode::Char('q') && app.mode == Mode::Normal { app.quit = true; return Ok(()); }
@@ -1063,8 +1097,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 app.sending = true;
                 let mut convo = app.messages.clone();
                 convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
-                let has_sys = convo.iter().any(|m| matches!(m.role, Role::System));
-                if !has_sys {
+                if !convo.iter().any(|m| matches!(m.role, Role::System)) {
                     if let Some(sp) = app.system_prompt.clone() {
                         convo.insert(0, Message { role: Role::System, content: sp });
                     }
@@ -1077,9 +1110,13 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             KeyCode::Tab => { app.input.push('\t'); }
             KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
             KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
+            // '?' disabled in INSERT
             _ => {}
         },
         Mode::Normal => {
+            // '?' only in NORMAL
+            if let KeyCode::Char('?') = key.code { app.popup = Popup::Help; return Ok(()); }
+
             match key.code {
                 KeyCode::Char('h') => { app.focus = Focus::Sidebar; }
                 KeyCode::Char('l') => { app.focus = Focus::Chat; }
@@ -1109,8 +1146,9 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 }
                 KeyCode::Char('G') => {
                     if app.focus == Focus::Chat {
-                        let last = app.messages.len().saturating_sub(1);
-                        app.chat_scroll = offset_for_message(&app.messages, last);
+                        // go to end of chat (bottom), not start of last message
+                        let total = content_total_height(&app.messages, if app.pending_assistant.is_empty() { None } else { Some(app.pending_assistant.as_str()) });
+                        app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                     }
                 }
                 KeyCode::Enter => {
@@ -1122,7 +1160,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                                 app.current_chat_id = Some(chat.id.clone());
                                 app.current_created_ts = Some(chat.created_ts);
                                 app.messages = chat.messages;
-                                app.chat_scroll = offset_for_message(&app.messages, app.messages.len().saturating_sub(1));
+                                let total = content_total_height(&app.messages, None);
+                                app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                                 app.focus = Focus::Chat;
                             }
                         }
@@ -1135,6 +1174,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             }
         }
         Mode::Visual => {
+            // '?' disabled in VISUAL
             match key.code {
                 KeyCode::Esc | KeyCode::Char('v') => { app.mode = Mode::Normal; }
                 KeyCode::Char('h') => { app.focus = Focus::Sidebar; }
