@@ -4,7 +4,7 @@ Finally, a minimalist yet competent Ollama interface. Fast, Vim keys, beautiful 
 
 ![Preview](media/preview1.png)
 
-![Preview 2](media/preview2.png)
+![Preview 3](media/preview3.png)
 
 ## Requirements
 
