@@ -27,6 +27,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use chrono::NaiveDateTime;
 use regex::{Captures, Regex};
 use tokio::process::Command;
+use tokio::io::AsyncWriteExt;
 use std::process::Stdio;
 use rand::random;
 use unicode_segmentation::UnicodeSegmentation;
@@ -448,11 +449,11 @@ async fn stream_ollama(
     api_url: String,
     model: String,
     options: Option<JsonValue>,
-    messages: Vec<Message>,
+    mut messages: Vec<Message>,
     tx: UnboundedSender<AppEvent>,
 ) {
-    let client = reqwest::Client::new();
     let req = OllamaChatRequest { model: &model, messages: &messages, stream: true, options: options.as_ref() };
+    let client = reqwest::Client::new();
 
     let resp = match client.post(api_url).json(&req).send().await {
         Ok(r) => r,
@@ -516,6 +517,50 @@ async fn preview_to_html(content: String) -> Result<()> {
         .status().await?;
     if !status.success() { return Err(anyhow!("pandoc failed")); }
     let _ = Command::new("xdg-open").arg(&out_path).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    Ok(())
+}
+
+// ---------- Clipboard helpers (xclip) ----------
+async fn read_clipboard_text() -> Result<String> {
+    // Try explicit MIME first
+    let try1 = Command::new("xclip")
+        .args(["-selection", "clipboard", "-o", "-t", "text/plain"])
+        .output()
+        .await;
+
+    let out = match try1 {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => {
+            // Fallback without -t (lets xclip pick target, often UTF8_STRING)
+            let o2 = Command::new("xclip")
+                .args(["-selection", "clipboard", "-o"])
+                .output()
+                .await
+                .with_context(|| "xclip -o fallback failed")?;
+            if !o2.status.success() {
+                return Err(anyhow!("xclip returned non-zero status"));
+            }
+            o2.stdout
+        }
+    };
+
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
+
+async fn write_clipboard_text(s: &str) -> Result<()> {
+    let mut child = Command::new("xclip")
+        .args(["-selection", "clipboard", "-i", "-t", "text/plain"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| "spawn xclip -i failed")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(s.as_bytes()).await?;
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(anyhow!("xclip copy failed"));
+    }
     Ok(())
 }
 
@@ -772,12 +817,13 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
 
             lines.push(Line::from(Span::styled("Chat — NORMAL", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
             lines.push(Line::from("  h: to sidebar, i: insert, v: visual"));
-            lines.push(Line::from("  ↑/k: scroll up   ↓/j: scroll down   g: top   G: bottom"));
+            lines.push(Line::from("  ↑/k: scroll up   ↓/j: scroll down   g: top   G: bottom   p: paste clipboard to input"));
             lines.push(Line::from(""));
 
             lines.push(Line::from(Span::styled("Chat — VISUAL (message select)", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
             lines.push(Line::from("  v/Esc: exit visual, h: to sidebar"));
-            lines.push(Line::from("  j/k: select next/prev message (auto-scroll into view)"));
+            lines.push(Line::from("  j/k: select next/prev message"));
+            lines.push(Line::from("  y: yank (copy) selected message to clipboard"));
             lines.push(Line::from("  Enter: preview selected message (Pandoc)"));
             lines.push(Line::from("  ↑/↓: manual scroll"));
             lines.push(Line::from(""));
@@ -939,8 +985,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         }
     };
     let bottom = match app.mode {
-        Mode::Insert => app.input.as_str(),
-        _ => "Press ? for help",
+        _ => app.input.as_str(),
     };
     let input = Paragraph::new(bottom)
         .block(Block::default()
@@ -1155,6 +1200,14 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                         app.popup = Popup::ConfirmDelete { id: meta.id.clone(), title: meta.title.clone() };
                     }
                 }
+                KeyCode::Char('p') => {
+                    if app.focus == Focus::Chat {
+                        match read_clipboard_text().await {
+                            Ok(clip) => { app.input.push_str(&clip); }
+                            Err(e) => { app.messages.push(Message { role: Role::System, content: format!("Clipboard paste failed: {}", e) }); }
+                        }
+                    }
+                }
                 KeyCode::Char('j') => {
                     match app.focus {
                         Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len()-1); } }
@@ -1204,6 +1257,17 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 KeyCode::Char('h') => { app.focus = Focus::Sidebar; }
                 KeyCode::Char('l') => { app.focus = Focus::Chat; }
                 KeyCode::Char('i') => { if app.focus == Focus::Chat { app.mode = Mode::Insert; } }
+                KeyCode::Char('y') => {
+                    if app.focus == Focus::Chat {
+                        if let Some(i) = app.selected_msg {
+                            if let Some(m) = app.messages.get(i) {
+                                if let Err(e) = write_clipboard_text(&m.content).await {
+                                    app.messages.push(Message { role: Role::System, content: format!("Clipboard copy failed: {}", e) });
+                                }
+                            }
+                        }
+                    }
+                }
                 KeyCode::Char('j') => {
                     match app.focus {
                         Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len()-1); } }
