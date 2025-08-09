@@ -303,8 +303,8 @@ struct SyntaxSection {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Performance {
-    stream_fps: Option<u64>,      // throttle redraws while streaming (default 30)
-    input_poll_ms: Option<u64>,   // terminal input poll period (default 250)
+    stream_fps: Option<u64>,    // throttle redraws while streaming (default 30)
+    input_poll_ms: Option<u64>, // terminal input poll period (default 250)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -455,6 +455,7 @@ struct App {
     // sidebar
     chats: Vec<ChatMeta>,
     sidebar_idx: usize,
+    show_sidebar: bool,
 
     // UI/input
     input: String,
@@ -514,6 +515,7 @@ impl App {
             pending_assistant: String::new(),
             chats,
             sidebar_idx: 0,
+            show_sidebar: true,
             input: String::new(),
             input_cursor: 0,
             chat_scroll: 0,
@@ -1025,7 +1027,7 @@ fn theme_item_for(scope_sel: &str, color: SynColor) -> Option<ThemeItem> {
     let style = StyleModifier {
         foreground: Some(color),
         background: Some(SynColor { r: 0, g: 0, b: 0, a: 0 }),
-        font_style: Some(FontStyle::empty()),
+        font_style: Some(FontStyle::empty())
     };
     Some(ThemeItem { scope: sels, style })
 }
@@ -1126,12 +1128,59 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     h[1]
 }
 
+// Compute a horizontally-scrolled input view so the cursor stays visible.
+// Returns (render_string, cursor_x_in_view).
+fn input_view(s: &str, cursor_gi: usize, maxw: usize) -> (String, usize) {
+    let maxw = maxw.max(1);
+    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(s, true).collect();
+    let widths: Vec<usize> = graphemes.iter().map(|g| UnicodeWidthStr::width(*g)).collect();
+
+    // Total width up to cursor
+    let mut w_to_cursor = 0usize;
+    for i in 0..cursor_gi.min(widths.len()) {
+        w_to_cursor += widths[i];
+    }
+
+    // Find start so that width(start..cursor) <= maxw
+    let mut start = 0usize;
+    let mut w_from_start_to_cursor = w_to_cursor;
+    while w_from_start_to_cursor > maxw {
+        w_from_start_to_cursor = w_from_start_to_cursor.saturating_sub(widths[start]);
+        start += 1;
+    }
+
+    // Build visible window up to maxw and compute used width
+    let mut out = String::new();
+    let mut used = 0usize;
+    for i in start..graphemes.len() {
+        let w = widths[i];
+        if used + w > maxw {
+            break;
+        }
+        out.push_str(graphemes[i]);
+        used += w;
+    }
+
+    // Cursor position should be exactly the width from start to cursor, capped by used
+    let cursor_x = w_from_start_to_cursor.min(used);
+
+    (out, cursor_x)
+}
+
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
+    let constraints = if app.show_sidebar {
+        [Constraint::Percentage(30), Constraint::Percentage(70)]
+    } else {
+        [Constraint::Length(0), Constraint::Percentage(100)]
+    };
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints(constraints)
         .split(frame.size());
-    draw_sidebar(frame, chunks[0], app);
+
+    if app.show_sidebar {
+        draw_sidebar(frame, chunks[0], app);
+    }
     draw_chat(frame, chunks[1], app);
 
     match &app.popup {
@@ -1197,6 +1246,16 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("Show/close help (NORMAL mode)"),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Ctrl+T ",
+                    Style::default()
+                        .fg(app.theme.popup_accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Hide/Show sidebar (chat focus)"),
             ]));
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -1482,7 +1541,12 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .scroll((app.chat_scroll, 0));
     frame.render_widget(messages, v_chunks[0]);
 
-    // Status/input bar
+    // Status/input bar (always shows current input contents)
+    let help_hint = Span::styled(
+        "— Press ? for help",
+        Style::default().fg(app.theme.status_hint),
+    );
+
     let input_title_line: Line = match app.mode {
         Mode::Insert => Line::from(vec![
             Span::styled(
@@ -1497,6 +1561,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .fg(app.theme.mode_insert)
                     .add_modifier(Modifier::BOLD),
             ),
+            help_hint.clone(),
         ]),
         Mode::Normal => {
             let base = if app.focus == Focus::Sidebar {
@@ -1517,6 +1582,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_normal)
                         .add_modifier(Modifier::BOLD),
                 ),
+                help_hint.clone(),
             ])
         }
         Mode::Visual => {
@@ -1538,12 +1604,16 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_visual)
                         .add_modifier(Modifier::BOLD),
                 ),
+                help_hint,
             ])
         }
     };
 
-    // Always show current input in the box across modes
-    let input = Paragraph::new(app.input.as_str()).block(
+    // Horizontal scrolling input view to keep cursor visible
+    let input_inner_w = v_chunks[1].width.saturating_sub(2) as usize;
+    let (input_view_str, cursor_x) = input_view(&app.input, app.input_cursor, input_inner_w);
+
+    let input = Paragraph::new(input_view_str).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border_input))
@@ -1551,10 +1621,9 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     );
     frame.render_widget(input, v_chunks[1]);
 
-    // Cursor (as thin bar) only in INSERT mode within chat focus
+    // Cursor (thin bar) only in INSERT mode within chat focus
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
-        let visual_x = input_visual_x(&app.input, app.input_cursor) as u16;
-        frame.set_cursor(v_chunks[1].x + 1 + visual_x, v_chunks[1].y + 1);
+        frame.set_cursor(v_chunks[1].x + 1 + cursor_x as u16, v_chunks[1].y + 1);
     }
 }
 
@@ -1658,7 +1727,6 @@ async fn main() -> Result<()> {
             AppEvent::OllamaChunk(delta) => {
                 app.pending_assistant.push_str(&delta);
                 app.pending_cache = None;
-                // throttle frequent redraws while streaming
                 if app.last_draw.elapsed() < app.stream_throttle {
                     should_draw = false;
                 }
@@ -1792,6 +1860,7 @@ fn persist_current_chat(app: &mut App) -> Result<()> {
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) -> Result<()> {
+    // Popups
     match &app.popup {
         Popup::ConfirmDelete { id, .. } => match key.code {
             KeyCode::Char('y') => {
@@ -1834,12 +1903,25 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
         Popup::None => {}
     }
 
+    // Global exits
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.quit = true;
         return Ok(());
     }
     if key.code == KeyCode::Char('q') && app.mode == Mode::Normal {
         app.quit = true;
+        return Ok(());
+    }
+
+    // Global: toggle sidebar visibility with Ctrl+T
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
+        app.show_sidebar = !app.show_sidebar;
+        if app.show_sidebar {
+            app.focus = Focus::Sidebar; // auto-focus Chats when showing
+            app.mode = Mode::Normal;
+        } else {
+            app.focus = Focus::Chat;
+        }
         return Ok(());
     }
 
@@ -1929,7 +2011,9 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
 
             match key.code {
                 KeyCode::Char('h') => {
-                    app.focus = Focus::Sidebar;
+                    if app.show_sidebar {
+                        app.focus = Focus::Sidebar;
+                    }
                 }
                 KeyCode::Char('l') => {
                     app.focus = Focus::Chat;
@@ -1979,7 +2063,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 }
                 KeyCode::Char('j') => match app.focus {
                     Focus::Sidebar => {
-                        if !app.chats.is_empty() {
+                        if app.show_sidebar && !app.chats.is_empty() {
                             app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len() - 1);
                         }
                     }
@@ -1989,7 +2073,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 },
                 KeyCode::Char('k') => match app.focus {
                     Focus::Sidebar => {
-                        if !app.chats.is_empty() {
+                        if app.show_sidebar && !app.chats.is_empty() {
                             app.sidebar_idx = app.sidebar_idx.saturating_sub(1);
                         }
                     }
@@ -2017,19 +2101,18 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 }
                 KeyCode::Enter => match app.focus {
                     Focus::Sidebar => {
-                        if app.chats.is_empty() {
-                            return Ok(());
-                        }
-                        let meta = &app.chats[app.sidebar_idx];
-                        if let Ok(chat) = load_chat(&meta.id) {
-                            app.current_chat_id = Some(chat.id.clone());
-                            app.current_created_ts = Some(chat.created_ts);
-                            app.messages = chat.messages;
-                            app.render_cache.clear();
-                            app.pending_cache = None;
-                            let total = content_total_height(&app.messages, None);
-                            app.chat_scroll = total.saturating_sub(app.chat_inner_height);
-                            app.focus = Focus::Chat;
+                        if app.show_sidebar && !app.chats.is_empty() {
+                            let meta = &app.chats[app.sidebar_idx];
+                            if let Ok(chat) = load_chat(&meta.id) {
+                                app.current_chat_id = Some(chat.id.clone());
+                                app.current_created_ts = Some(chat.created_ts);
+                                app.messages = chat.messages;
+                                app.render_cache.clear();
+                                app.pending_cache = None;
+                                let total = content_total_height(&app.messages, None);
+                                app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+                                app.focus = Focus::Chat;
+                            }
                         }
                     }
                     Focus::Chat => {}
@@ -2048,7 +2131,9 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 app.mode = Mode::Normal;
             }
             KeyCode::Char('h') => {
-                app.focus = Focus::Sidebar;
+                if app.show_sidebar {
+                    app.focus = Focus::Sidebar;
+                }
             }
             KeyCode::Char('l') => {
                 app.focus = Focus::Chat;
@@ -2076,7 +2161,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             }
             KeyCode::Char('j') => match app.focus {
                 Focus::Sidebar => {
-                    if !app.chats.is_empty() {
+                    if app.show_sidebar && !app.chats.is_empty() {
                         app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len() - 1);
                     }
                 }
@@ -2099,7 +2184,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             },
             KeyCode::Char('k') => match app.focus {
                 Focus::Sidebar => {
-                    if !app.chats.is_empty() {
+                    if app.show_sidebar && !app.chats.is_empty() {
                         app.sidebar_idx = app.sidebar_idx.saturating_sub(1);
                     }
                 }
@@ -2122,20 +2207,19 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             },
             KeyCode::Enter => match app.focus {
                 Focus::Sidebar => {
-                    if app.chats.is_empty() {
-                        return Ok(());
-                    }
-                    let meta = &app.chats[app.sidebar_idx];
-                    if let Ok(chat) = load_chat(&meta.id) {
-                        app.current_chat_id = Some(chat.id.clone());
-                        app.current_created_ts = Some(chat.created_ts);
-                        app.messages = chat.messages;
-                        app.render_cache.clear();
-                        app.pending_cache = None;
-                        app.selected_msg = Some(app.messages.len().saturating_sub(1));
-                        app.chat_scroll =
-                            offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));
-                        app.focus = Focus::Chat;
+                    if app.show_sidebar && !app.chats.is_empty() {
+                        let meta = &app.chats[app.sidebar_idx];
+                        if let Ok(chat) = load_chat(&meta.id) {
+                            app.current_chat_id = Some(chat.id.clone());
+                            app.current_created_ts = Some(chat.created_ts);
+                            app.messages = chat.messages;
+                            app.render_cache.clear();
+                            app.pending_cache = None;
+                            app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                            app.chat_scroll =
+                                offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));
+                            app.focus = Focus::Chat;
+                        }
                     }
                 }
                 Focus::Chat => {
