@@ -96,7 +96,9 @@ struct Theme {
     list_bullet: Color,
     ordered_number: Color,
     inline_code: Color,
-    code_block: Color,
+    code_block_fg: Color,
+    code_block_bg: Color,
+    hr: Color,
 
     // status / mode
     status_hint: Color,
@@ -104,6 +106,11 @@ struct Theme {
     mode_normal: Color,
     mode_visual: Color,
     mode_focus: Color,
+
+    // borders
+    border_sidebar: Color,
+    border_chat: Color,
+    border_input: Color,
 
     // popup
     popup_title: Color,
@@ -130,13 +137,19 @@ impl Default for Theme {
             list_bullet: Color::Green,
             ordered_number: Color::Green,
             inline_code: Color::Yellow,
-            code_block: Color::Gray,
+            code_block_fg: Color::Gray,
+            code_block_bg: Color::Black,
+            hr: Color::DarkGray,
 
             status_hint: Color::Gray,
             mode_insert: Color::Green,
             mode_normal: Color::Yellow,
             mode_visual: Color::LightMagenta,
             mode_focus: Color::Blue,
+
+            border_sidebar: Color::Gray,
+            border_chat: Color::Gray,
+            border_input: Color::Gray,
 
             popup_title: Color::Red,
             popup_accent: Color::Yellow,
@@ -209,13 +222,19 @@ impl Theme {
             t.list_bullet = color_from_cfg(map, "list_bullet", t.list_bullet);
             t.ordered_number = color_from_cfg(map, "ordered_number", t.ordered_number);
             t.inline_code = color_from_cfg(map, "inline_code", t.inline_code);
-            t.code_block = color_from_cfg(map, "code_block", t.code_block);
+            t.code_block_fg = color_from_cfg(map, "code_block_fg", t.code_block_fg);
+            t.code_block_bg = color_from_cfg(map, "code_block_bg", t.code_block_bg);
+            t.hr = color_from_cfg(map, "hr", t.hr);
 
             t.status_hint = color_from_cfg(map, "status_hint", t.status_hint);
             t.mode_insert = color_from_cfg(map, "mode_insert", t.mode_insert);
             t.mode_normal = color_from_cfg(map, "mode_normal", t.mode_normal);
             t.mode_visual = color_from_cfg(map, "mode_visual", t.mode_visual);
             t.mode_focus = color_from_cfg(map, "mode_focus", t.mode_focus);
+
+            t.border_sidebar = color_from_cfg(map, "border_sidebar", t.border_sidebar);
+            t.border_chat = color_from_cfg(map, "border_chat", t.border_chat);
+            t.border_input = color_from_cfg(map, "border_input", t.border_input);
 
             t.popup_title = color_from_cfg(map, "popup_title", t.popup_title);
             t.popup_accent = color_from_cfg(map, "popup_accent", t.popup_accent);
@@ -543,9 +562,10 @@ fn stylize_inline(input: &str, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
-fn render_markdown_to_text(input: &str, theme: &Theme) -> Text<'static> {
+fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text<'static> {
     let mut text = Text::default();
     let mut in_code_block = false;
+    let hr_line_len = inner_width.max(1) as usize;
 
     for line in input.lines() {
         let trimmed = line.trim_start();
@@ -554,15 +574,23 @@ fn render_markdown_to_text(input: &str, theme: &Theme) -> Text<'static> {
             in_code_block = !in_code_block;
             let fence_label = trimmed.strip_prefix("```").unwrap_or("").trim();
             let label = if in_code_block { format!("─ code {} ─", fence_label) } else { "─ end code ─".into() };
-            text.push_line(Line::styled(label, Style::default().fg(theme.code_block)));
+            text.push_line(Line::styled(label, Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg)));
             continue;
         }
 
         if in_code_block {
-            text.push_line(Line::styled(line.to_string(), Style::default().fg(theme.code_block)));
+            text.push_line(Line::styled(line.to_string(), Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg)));
             continue;
         }
 
+        // horizontal rule: '---' or longer runs of '-'
+        if !trimmed.is_empty() && trimmed.chars().all(|c| c == '-') && trimmed.len() >= 3 {
+            let hr = "─".repeat(hr_line_len);
+            text.push_line(Line::styled(hr, Style::default().fg(theme.hr)));
+            continue;
+        }
+
+        // headings
         let hashes = trimmed.chars().take_while(|&c| c == '#').count();
         if hashes > 0 && trimmed.chars().nth(hashes) == Some(' ') {
             let content = trimmed[hashes + 1..].to_string();
@@ -577,6 +605,7 @@ fn render_markdown_to_text(input: &str, theme: &Theme) -> Text<'static> {
             continue;
         }
 
+        // blockquote
         if trimmed.starts_with("> ") {
             let inner = &trimmed[2..];
             let mut spans = vec![Span::styled("▏ ", Style::default().fg(theme.blockquote_bar))];
@@ -585,6 +614,7 @@ fn render_markdown_to_text(input: &str, theme: &Theme) -> Text<'static> {
             continue;
         }
 
+        // list bullets
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let inner = &trimmed[2..];
             let mut spans = vec![Span::styled("• ", Style::default().fg(theme.list_bullet))];
@@ -592,6 +622,7 @@ fn render_markdown_to_text(input: &str, theme: &Theme) -> Text<'static> {
             text.push_line(Line::from(spans));
             continue;
         }
+        // ordered list
         if let Some(pos) = trimmed.find(". ") {
             if trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
                 let num = &trimmed[..pos + 1];
@@ -603,6 +634,7 @@ fn render_markdown_to_text(input: &str, theme: &Theme) -> Text<'static> {
             }
         }
 
+        // normal
         text.push_line(Line::from(stylize_inline(line, theme)));
     }
 
@@ -644,7 +676,8 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
             frame.render_widget(Clear, area);
             let block = Block::default()
                 .title(Span::styled("Confirm delete", Style::default().fg(app.theme.popup_title).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL);
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border_chat));
             let msg = vec![
                 Line::from(""),
                 Line::from(Span::styled("Delete chat:", Style::default().fg(app.theme.popup_accent))),
@@ -660,7 +693,8 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
             frame.render_widget(Clear, area);
             let block = Block::default()
                 .title(Span::styled("Keybindings", Style::default().fg(app.theme.popup_title).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL);
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border_chat));
 
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(Span::styled("Global", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
@@ -682,7 +716,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
 
             lines.push(Line::from(Span::styled("Chat — NORMAL", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
             lines.push(Line::from("  h: to sidebar, i: insert, v: visual"));
-            lines.push(Line::from("  ↑/k: scroll up   ↓/j: scroll down"));
+            lines.push(Line::from("  ↑/k: scroll up   ↓/j: scroll down   g: top   G: bottom"));
             lines.push(Line::from(""));
 
             lines.push(Line::from(Span::styled("Chat — VISUAL (message select)", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
@@ -736,6 +770,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border_sidebar))
             .title(Span::styled(
                 "Chats",
                 Style::default().fg(app.theme.sidebar_title).add_modifier(Modifier::BOLD),
@@ -751,6 +786,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .split(area);
 
     app.chat_inner_height = v_chunks[0].height.saturating_sub(2);
+    let inner_w = v_chunks[0].width.saturating_sub(2);
 
     let mut text = Text::default();
     let sel = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
@@ -767,7 +803,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         pstyle = apply_selection(pstyle, selected, app.bold_selection);
         text.push_line(Line::styled(prefix_text, pstyle));
 
-        let mut md = render_markdown_to_text(&m.content, &app.theme);
+        let mut md = render_markdown_to_text(&m.content, &app.theme, inner_w);
         if selected {
             let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
             for line in &mut md.lines {
@@ -788,7 +824,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         hdr_style = apply_selection(hdr_style, selected, app.bold_selection);
         text.push_line(Line::styled(format!("{}:", app.model), hdr_style));
 
-        let mut md = render_markdown_to_text(&app.pending_assistant, &app.theme);
+        let mut md = render_markdown_to_text(&app.pending_assistant, &app.theme, inner_w);
         if let Some(last) = md.lines.last_mut() { last.spans.push(Span::raw("▌")); } else { md.lines.push(Line::from("▌")); }
         if selected {
             let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
@@ -811,7 +847,10 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     if matches!(app.focus, Focus::Chat) && matches!(app.mode, Mode::Normal | Mode::Visual) {
         title_spans.push(Span::styled(" [FOCUS]", Style::default().fg(app.theme.mode_focus).add_modifier(Modifier::BOLD)));
     }
-    let chat_block = Block::default().borders(Borders::ALL).title(Line::from(title_spans));
+    let chat_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border_chat))
+        .title(Line::from(title_spans));
 
     let messages = Paragraph::new(text)
         .block(chat_block)
@@ -849,7 +888,10 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         _ => "Press ? for help",
     };
     let input = Paragraph::new(bottom)
-        .block(Block::default().borders(Borders::ALL).title(input_title_line));
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border_input))
+            .title(input_title_line));
     frame.render_widget(input, v_chunks[1]);
 
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
@@ -1033,7 +1075,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             KeyCode::Backspace => { app.input.pop(); }
             KeyCode::Char(c) => { app.input.push(c); }
             KeyCode::Tab => { app.input.push('\t'); }
-            // Invert scroll: Up decreases offset (scroll up), Down increases (scroll down)
             KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
             KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
             _ => {}
@@ -1051,17 +1092,25 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                         app.popup = Popup::ConfirmDelete { id: meta.id.clone(), title: meta.title.clone() };
                     }
                 }
-                // NORMAL: j/k act like scroll keys when focus is Chat; otherwise navigate sidebar
                 KeyCode::Char('j') => {
                     match app.focus {
                         Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len()-1); } }
-                        Focus::Chat => { app.chat_scroll = app.chat_scroll.saturating_add(1); } // scroll down
+                        Focus::Chat => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
                     }
                 }
                 KeyCode::Char('k') => {
                     match app.focus {
                         Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = app.sidebar_idx.saturating_sub(1); } }
-                    Focus::Chat => { app.chat_scroll = app.chat_scroll.saturating_sub(1); } // scroll up
+                        Focus::Chat => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
+                    }
+                }
+                KeyCode::Char('g') => {
+                    if app.focus == Focus::Chat { app.chat_scroll = 0; }
+                }
+                KeyCode::Char('G') => {
+                    if app.focus == Focus::Chat {
+                        let last = app.messages.len().saturating_sub(1);
+                        app.chat_scroll = offset_for_message(&app.messages, last);
                     }
                 }
                 KeyCode::Enter => {
@@ -1077,11 +1126,11 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                                 app.focus = Focus::Chat;
                             }
                         }
-                        Focus::Chat => { /* noop in NORMAL */ }
+                        Focus::Chat => {}
                     }
                 }
-                KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }   // scroll up
-                KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); } // scroll down
+                KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
+                KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
                 _ => {}
             }
         }
@@ -1143,9 +1192,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                         }
                     }
                 }
-                // manual scroll in VISUAL
-                KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }   // up
-                KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); } // down
+                KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
+                KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
                 _ => {}
             }
         }
