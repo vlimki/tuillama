@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     io::Write,
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
     str::FromStr,
 };
 
@@ -302,6 +302,12 @@ struct SyntaxSection {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Performance {
+    stream_fps: Option<u64>,      // throttle redraws while streaming (default 30)
+    input_poll_ms: Option<u64>,   // terminal input poll period (default 250)
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct AppConfig {
     model: Option<String>,
     api_url: Option<String>,
@@ -310,8 +316,8 @@ struct AppConfig {
     bold_selection: Option<bool>,
     colors: Option<toml::value::Table>,
     syntax: Option<SyntaxSection>,
-    // legacy fallback:
-    syntax_theme: Option<String>,
+    syntax_theme: Option<String>, // legacy
+    performance: Option<Performance>,
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -476,6 +482,10 @@ struct App {
     // render cache
     render_cache: HashMap<(usize, u16), (u64, Text<'static>)>, // (msg_idx, width) -> (hash, rendered)
     pending_cache: Option<(u16, u64, Text<'static>)>,          // (width, hash, rendered)
+
+    // redraw throttle
+    last_draw: Instant,
+    stream_throttle: Duration,
 }
 
 impl App {
@@ -489,6 +499,7 @@ impl App {
         syntax_enabled: bool,
         syntax_theme_name: String,
         syntax_custom: Option<toml::value::Table>,
+        stream_throttle: Duration,
     ) -> Self {
         let chats = list_chats().unwrap_or_default();
 
@@ -524,6 +535,8 @@ impl App {
             syn_theme,
             render_cache: HashMap::new(),
             pending_cache: None,
+            last_draw: Instant::now(),
+            stream_throttle,
         }
     }
 }
@@ -531,7 +544,6 @@ impl App {
 // ---------- Events ----------
 #[derive(Debug)]
 enum AppEvent {
-    Tick,
     Input(KeyEvent),
     OllamaChunk(String),
     OllamaDone,
@@ -842,7 +854,6 @@ fn render_markdown_to_text(
                         let gw = UnicodeWidthStr::width(g);
 
                         if gw > w {
-                            // flush current line if non-empty
                             if !cur_line.is_empty() || cur_w > 0 {
                                 let pad_len = w.saturating_sub(cur_w);
                                 if pad_len > 0 {
@@ -852,7 +863,6 @@ fn render_markdown_to_text(
                                 text.push_line(Line::from(std::mem::take(&mut cur_line)));
                                 cur_w = 0;
                             }
-                            // emit huge grapheme as its own padded line
                             let mut spans: Vec<Span<'static>> = Vec::new();
                             spans.push(Span::styled(g.to_string(), st));
                             let pad_len = w.saturating_sub(gw.min(w));
@@ -1014,7 +1024,7 @@ fn theme_item_for(scope_sel: &str, color: SynColor) -> Option<ThemeItem> {
     let sels = ScopeSelectors::from_str(scope_sel).ok()?;
     let style = StyleModifier {
         foreground: Some(color),
-        background: Some(SynColor { r: 0, g: 0, b: 0, a: 0 }), // transparent
+        background: Some(SynColor { r: 0, g: 0, b: 0, a: 0 }),
         font_style: Some(FontStyle::empty()),
     };
     Some(ThemeItem { scope: sels, style })
@@ -1597,6 +1607,13 @@ async fn main() -> Result<()> {
         (enabled, theme_name, custom)
     };
 
+    let (stream_throttle, input_poll_ms) = {
+        let p = cfg.performance.clone().unwrap_or_default();
+        let fps = p.stream_fps.unwrap_or(30).max(1);
+        let poll = p.input_poll_ms.unwrap_or(250).max(1);
+        (Duration::from_millis(1000 / fps as u64), poll)
+    };
+
     let mut app = App::new(
         model,
         api_url,
@@ -1607,6 +1624,7 @@ async fn main() -> Result<()> {
         syntax_enabled,
         syntax_theme_name,
         syntax_custom,
+        stream_throttle,
     );
 
     enable_raw_mode()?;
@@ -1617,58 +1635,63 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) = unbounded_channel();
 
+    // Blocking input reader thread with configurable poll period
     let tx_input = tx.clone();
     std::thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(250)).unwrap_or(false) {
+        if event::poll(Duration::from_millis(input_poll_ms)).unwrap_or(false) {
             if let Ok(CEvent::Key(key)) = event::read() {
                 let _ = tx_input.send(AppEvent::Input(key));
             }
         }
     });
 
-    let tx_tick = tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(33));
-        loop {
-            interval.tick().await;
-            let _ = tx_tick.send(AppEvent::Tick);
-        }
-    });
+    // Initial draw once (no idle redraw loop)
+    terminal.draw(|f| draw_ui(f, &mut app))?;
+    app.last_draw = Instant::now();
 
-    loop {
-        terminal.draw(|f| draw_ui(f, &mut app))?;
-        if let Some(ev) = rx.recv().await {
-            match ev {
-                AppEvent::Tick => {}
-                AppEvent::Input(key) => handle_key(key, &mut app, &tx).await?,
-                AppEvent::OllamaChunk(delta) => {
-                    app.pending_assistant.push_str(&delta);
-                    app.pending_cache = None; // invalidate pending render cache
-                }
-                AppEvent::OllamaDone => {
-                    let content = std::mem::take(&mut app.pending_assistant);
-                    app.pending_cache = None;
-                    app.messages.push(Message {
-                        role: Role::Assistant,
-                        content: content.clone(),
-                    });
-                    persist_current_chat(&mut app)?;
-                    app.sending = false;
-                    if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
-                        app.selected_msg = Some(app.messages.len().saturating_sub(1));
-                    }
-                }
-                AppEvent::OllamaError(e) => {
-                    app.pending_assistant.clear();
-                    app.pending_cache = None;
-                    app.sending = false;
-                    app.messages.push(Message {
-                        role: Role::System,
-                        content: format!("Error: {}", e),
-                    });
+    // Event-driven UI loop with streaming redraw throttle
+    while let Some(ev) = rx.recv().await {
+        let mut should_draw = true;
+
+        match ev {
+            AppEvent::Input(key) => handle_key(key, &mut app, &tx).await?,
+            AppEvent::OllamaChunk(delta) => {
+                app.pending_assistant.push_str(&delta);
+                app.pending_cache = None;
+                // throttle frequent redraws while streaming
+                if app.last_draw.elapsed() < app.stream_throttle {
+                    should_draw = false;
                 }
             }
+            AppEvent::OllamaDone => {
+                let content = std::mem::take(&mut app.pending_assistant);
+                app.pending_cache = None;
+                app.messages.push(Message {
+                    role: Role::Assistant,
+                    content: content.clone(),
+                });
+                persist_current_chat(&mut app)?;
+                app.sending = false;
+                if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
+                    app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                }
+            }
+            AppEvent::OllamaError(e) => {
+                app.pending_assistant.clear();
+                app.pending_cache = None;
+                app.sending = false;
+                app.messages.push(Message {
+                    role: Role::System,
+                    content: format!("Error: {}", e),
+                });
+            }
         }
+
+        if should_draw {
+            terminal.draw(|f| draw_ui(f, &mut app))?;
+            app.last_draw = Instant::now();
+        }
+
         if app.quit {
             break;
         }
@@ -1839,7 +1862,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     role: Role::User,
                     content: input.clone(),
                 });
-                app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height)); // harmless
+                app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
                 persist_current_chat(app)?;
                 app.sending = true;
                 let mut convo = app.messages.clone();
