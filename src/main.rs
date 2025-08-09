@@ -100,6 +100,7 @@ struct Theme {
     list_bullet: Color,
     ordered_number: Color,
     inline_code: Color,
+    inline_code_bg: Color,
     code_block_fg: Color,
     code_block_bg: Color,
     hr: Color,
@@ -144,6 +145,7 @@ impl Default for Theme {
             list_bullet: Color::Green,
             ordered_number: Color::Green,
             inline_code: Color::Yellow,
+            inline_code_bg: Color::DarkGray,
             code_block_fg: Color::Gray,
             code_block_bg: Color::Black,
             hr: Color::DarkGray,
@@ -232,6 +234,7 @@ impl Theme {
             t.list_bullet = color_from_cfg(map, "list_bullet", t.list_bullet);
             t.ordered_number = color_from_cfg(map, "ordered_number", t.ordered_number);
             t.inline_code = color_from_cfg(map, "inline_code", t.inline_code);
+            t.inline_code_bg = color_from_cfg(map, "inline_code_bg", t.inline_code_bg);
             t.code_block_fg = color_from_cfg(map, "code_block_fg", t.code_block_fg);
             t.code_block_bg = color_from_cfg(map, "code_block_bg", t.code_block_bg);
             t.hr = color_from_cfg(map, "hr", t.hr);
@@ -443,14 +446,9 @@ async fn stream_ollama(
     api_url: String,
     model: String,
     options: Option<JsonValue>,
-    mut messages: Vec<Message>,
+    messages: Vec<Message>,
     tx: UnboundedSender<AppEvent>,
 ) {
-    // inject system prompt if not present
-    if !messages.iter().any(|m| matches!(m.role, Role::System)) {
-        // no-op here; App handles insertion on send
-    }
-
     let client = reqwest::Client::new();
     let req = OllamaChatRequest { model: &model, messages: &messages, stream: true, options: options.as_ref() };
 
@@ -531,7 +529,7 @@ fn style_from_state(s: InlineState, theme: &Theme) -> Style {
     let mut st = Style::default();
     if s.bold { st = st.add_modifier(Modifier::BOLD); }
     if s.italic { st = st.add_modifier(Modifier::ITALIC); }
-    if s.code { st = st.fg(theme.inline_code); }
+    if s.code { st = st.fg(theme.inline_code).bg(theme.inline_code_bg); }
     st
 }
 
@@ -577,6 +575,39 @@ fn stylize_inline(input: &str, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
+fn push_code_rows(line: &str, inner_width: u16, text: &mut Text<'static>, theme: &Theme) {
+    let w = inner_width.max(1) as usize;
+    let style = Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg);
+    let nbsp = '\u{00A0}';
+
+    // Expand tabs for stable width
+    let expanded = line.replace('\t', "    ");
+
+    // If the line is empty, emit a full-width NBSP row so the background fills
+    if expanded.is_empty() {
+        let fill: String = std::iter::repeat(nbsp).take(w).collect();
+        text.push_line(Line::styled(fill, style));
+        return;
+    }
+
+    // Chunk into fixed-width rows so bg spans the whole line
+    let mut cur = String::new();
+    for ch in expanded.chars() {
+        cur.push(ch);
+        if cur.chars().count() == w {
+            text.push_line(Line::styled(cur.clone(), style));
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        let cur_len = cur.chars().count();
+        if cur_len < w {
+            cur.extend(std::iter::repeat(nbsp).take(w - cur_len));
+        }
+        text.push_line(Line::styled(cur, style));
+    }
+}
+
 fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text<'static> {
     let mut text = Text::default();
     let mut in_code_block = false;
@@ -587,24 +618,12 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
 
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
-            let fence_label = trimmed.strip_prefix("```").unwrap_or("").trim();
-            let label = if in_code_block { format!("─ code {} ─", fence_label) } else { "─ end code ─".into() };
-            text.push_line(Line::styled(label, Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg)));
+            // No labels for code fences
             continue;
         }
 
         if in_code_block {
-            // expand tabs for more stable width
-            let mut content = line.replace('\t', "    ");
-            // clamp/pad to inner width so bg covers full row
-            let target = inner_width as usize;
-            if content.chars().count() < target {
-                // right-pad with spaces to fill the whole row
-                let pad = target.saturating_sub(content.chars().count());
-                content.push_str(&" ".repeat(pad));
-            }
-            // do not truncate; let UI wrap if too long
-            text.push_line(Line::styled(content, Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg)));
+            push_code_rows(line, inner_width, &mut text, theme);
             continue;
         }
 
@@ -989,15 +1008,14 @@ fn now_sec() -> i64 {
 fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
     let mut y: u16 = 0;
     for m in messages {
-        // prefix + content lines + blank line
         y = y.saturating_add(1);
         y = y.saturating_add(m.content.lines().count() as u16);
         y = y.saturating_add(1);
     }
     if let Some(p) = pending {
-        y = y.saturating_add(1); // prefix
+        y = y.saturating_add(1);
         y = y.saturating_add(p.lines().count() as u16);
-        y = y.saturating_add(1); // blank
+        y = y.saturating_add(1);
     }
     y
 }
@@ -1047,7 +1065,6 @@ fn persist_current_chat(app: &mut App) -> Result<()> {
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) -> Result<()> {
-    // Popups
     match &app.popup {
         Popup::ConfirmDelete { id, .. } => {
             match key.code {
@@ -1081,7 +1098,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
         Popup::None => {}
     }
 
-    // Quit
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { app.quit = true; return Ok(()); }
     if key.code == KeyCode::Char('q') && app.mode == Mode::Normal { app.quit = true; return Ok(()); }
 
@@ -1110,11 +1126,9 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             KeyCode::Tab => { app.input.push('\t'); }
             KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
             KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
-            // '?' disabled in INSERT
             _ => {}
         },
         Mode::Normal => {
-            // '?' only in NORMAL
             if let KeyCode::Char('?') = key.code { app.popup = Popup::Help; return Ok(()); }
 
             match key.code {
@@ -1146,7 +1160,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 }
                 KeyCode::Char('G') => {
                     if app.focus == Focus::Chat {
-                        // go to end of chat (bottom), not start of last message
                         let total = content_total_height(&app.messages, if app.pending_assistant.is_empty() { None } else { Some(app.pending_assistant.as_str()) });
                         app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                     }
@@ -1174,7 +1187,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             }
         }
         Mode::Visual => {
-            // '?' disabled in VISUAL
             match key.code {
                 KeyCode::Esc | KeyCode::Char('v') => { app.mode = Mode::Normal; }
                 KeyCode::Char('h') => { app.focus = Focus::Sidebar; }
