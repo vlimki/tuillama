@@ -2,7 +2,9 @@
 
 Finally, a minimalist yet competent Ollama interface. Fast, Vim keys, beautiful markdown formatting on the terminal, dynamic compilation to HTML for viewing LaTeX.
 
----
+![Preview](media/preview1.png)
+
+![Preview 2](media/preview2.png)
 
 ## Requirements
 
@@ -14,8 +16,6 @@ Finally, a minimalist yet competent Ollama interface. Fast, Vim keys, beautiful 
 Optional
 
 * A font with good Unicode/emoji support
-
----
 
 ## Build and run
 
@@ -37,8 +37,6 @@ export OLLAMA_MODEL=llama3
 export OLLAMA_CHAT_URL=http://localhost:11434/api/chat
 ```
 
----
-
 ## Configuration
 
 Config file path (XDG):
@@ -49,13 +47,11 @@ Precedence: environment variables > config file > built-ins.
 
 All keys under `[options]` are forwarded to Ollama's `options` field.
 
----
-
 ## No LaTeX on the terminal? No problem
 
 Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, select a message, and press `Enter`.
 
----
+![Preview 2](media/preview2.png)
 
 ## Limitations (for now)
 
