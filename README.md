@@ -2,12 +2,14 @@
 
 Finally, a minimalist yet competent Ollama interface. 
 
-**Features:**
+## Features 
 
 * Really fast and minimal
 * Vim keys
 * Beautiful markdown formatting and syntax highlighting on the terminal
 * Dynamic compilation to HTML for viewing LaTeX
+
+## Preview
 
 ![Preview](media/preview1.png)
 
