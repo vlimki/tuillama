@@ -1,44 +1,50 @@
-# Core
-model = "gpt-oss:20b"
-api_url = "http://192.168.100.2:11434/api/chat"
+model = "llama3"
+api_url = "http://localhost:11434/api/chat"
+system_prompt = "You are a helpful assistant."
 
-# Optional system prompt. Empty = disabled (no system message is sent).
-system_prompt = ""
-
-# Selection rendering: false = reverse video, true = bold text
+# in visual mode, the selected message will be typed out as bold instead of recoloring the background
 bold_selection = false
 
-# Ollama options forwarded verbatim. Empty = Ollama defaults.
 [options]
 # num_ctx = 4096
 # num_thread = 6
 # temperature = 0.7
 
-# Colors. Names or #RRGGBB.
+# Names or #RRGGBB
 [colors]
 sidebar_title = "Green"
 sidebar_timestamp = "DarkGray"
 sidebar_item = "White"
 
-user_prefix = "Green"
-assistant_prefix = "Green"
+title_chat = "Blue"
+title_input = "Blue"
+
+user_prefix = "Magenta"
+assistant_prefix = "Magenta"
 system_prefix = "Yellow"
 
 heading1 = "Yellow"
 heading2 = "LightYellow"
-heading3 = "Blue"
-heading4 = "LightGreen"
-
+heading3 = "Cyan"
+heading4 = "LightCyan"
 blockquote_bar = "DarkGray"
-list_bullet = "Magenta"
-ordered_number = "Magenta"
+list_bullet = "Green"
+ordered_number = "Green"
 inline_code = "Yellow"
-code_block = "Gray"
+inline_code_bg = "#080808"
+code_block_fg = "#080808"
+code_block_bg = "#888888"
+hr = "#282828"
 
 status_hint = "Gray"
 mode_insert = "Green"
 mode_normal = "Yellow"
+mode_visual = "Magenta"
 mode_focus = "Blue"
+
+border_sidebar = "#484848"
+border_chat = "#484848"
+border_input = "#484848"
 
 popup_title = "Red"
 popup_accent = "Yellow"
