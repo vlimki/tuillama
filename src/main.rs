@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Terminal,
 };
 use serde::{Deserialize, Serialize};
@@ -67,12 +67,182 @@ enum Mode { Normal, Insert }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Focus { Sidebar, Chat }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Popup {
+    None,
+    ConfirmDelete { id: String, title: String },
+}
+
+// ---------- Theme ----------
+#[derive(Clone, Debug)]
+struct Theme {
+    // sidebar
+    sidebar_title: Color,
+    sidebar_timestamp: Color,
+    sidebar_item: Color,
+
+    // prefixes
+    user_prefix: Color,
+    assistant_prefix: Color,
+    system_prefix: Color,
+
+    // markdown
+    heading1: Color,
+    heading2: Color,
+    heading3: Color,
+    heading4: Color,
+    blockquote_bar: Color,
+    list_bullet: Color,
+    ordered_number: Color,
+    inline_code: Color,
+    code_block: Color,
+
+    // status / mode
+    status_hint: Color,
+    mode_insert: Color,
+    mode_normal: Color,
+    mode_focus: Color,
+
+    // popup
+    popup_title: Color,
+    popup_accent: Color,
+    popup_text: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            sidebar_title: Color::Cyan,
+            sidebar_timestamp: Color::DarkGray,
+            sidebar_item: Color::White,
+
+            user_prefix: Color::Cyan,
+            assistant_prefix: Color::Magenta,
+            system_prefix: Color::Yellow,
+
+            heading1: Color::Yellow,
+            heading2: Color::LightYellow,
+            heading3: Color::Cyan,
+            heading4: Color::LightCyan,
+            blockquote_bar: Color::DarkGray,
+            list_bullet: Color::Green,
+            ordered_number: Color::Green,
+            inline_code: Color::Yellow,
+            code_block: Color::Gray,
+
+            status_hint: Color::Gray,
+            mode_insert: Color::Green,
+            mode_normal: Color::Yellow,
+            mode_focus: Color::Blue,
+
+            popup_title: Color::Red,
+            popup_accent: Color::Yellow,
+            popup_text: Color::Gray,
+        }
+    }
+}
+
+fn parse_color_name(s: &str) -> Option<Color> {
+    let t = s.trim().to_lowercase().replace('-', "_");
+    let c = match t.as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "dark_gray" | "dark_grey" => Color::DarkGray,
+        "light_red" => Color::LightRed,
+        "light_green" => Color::LightGreen,
+        "light_yellow" => Color::LightYellow,
+        "light_blue" => Color::LightBlue,
+        "light_magenta" => Color::LightMagenta,
+        "light_cyan" => Color::LightCyan,
+        "white" => Color::White,
+        _ => {
+            // #RRGGBB
+            if let Some(hex) = t.strip_prefix('#') {
+                if hex.len() == 6 {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        u8::from_str_radix(&hex[0..2], 16),
+                        u8::from_str_radix(&hex[2..4], 16),
+                        u8::from_str_radix(&hex[4..6], 16),
+                    ) {
+                        return Some(Color::Rgb(r, g, b));
+                    }
+                }
+            }
+            return None;
+        }
+    };
+    Some(c)
+}
+
+fn color_from_cfg(tbl: &toml::value::Table, key: &str, default: Color) -> Color {
+    tbl.get(key)
+        .and_then(|v| v.as_str())
+        .and_then(parse_color_name)
+        .unwrap_or(default)
+}
+
+impl Theme {
+    fn from_config(tbl: Option<&toml::value::Table>) -> Self {
+        let mut t = Theme::default();
+        if let Some(map) = tbl {
+            t.sidebar_title = color_from_cfg(map, "sidebar_title", t.sidebar_title);
+            t.sidebar_timestamp = color_from_cfg(map, "sidebar_timestamp", t.sidebar_timestamp);
+            t.sidebar_item = color_from_cfg(map, "sidebar_item", t.sidebar_item);
+
+            t.user_prefix = color_from_cfg(map, "user_prefix", t.user_prefix);
+            t.assistant_prefix = color_from_cfg(map, "assistant_prefix", t.assistant_prefix);
+            t.system_prefix = color_from_cfg(map, "system_prefix", t.system_prefix);
+
+            t.heading1 = color_from_cfg(map, "heading1", t.heading1);
+            t.heading2 = color_from_cfg(map, "heading2", t.heading2);
+            t.heading3 = color_from_cfg(map, "heading3", t.heading3);
+            t.heading4 = color_from_cfg(map, "heading4", t.heading4);
+            t.blockquote_bar = color_from_cfg(map, "blockquote_bar", t.blockquote_bar);
+            t.list_bullet = color_from_cfg(map, "list_bullet", t.list_bullet);
+            t.ordered_number = color_from_cfg(map, "ordered_number", t.ordered_number);
+            t.inline_code = color_from_cfg(map, "inline_code", t.inline_code);
+            t.code_block = color_from_cfg(map, "code_block", t.code_block);
+
+            t.status_hint = color_from_cfg(map, "status_hint", t.status_hint);
+            t.mode_insert = color_from_cfg(map, "mode_insert", t.mode_insert);
+            t.mode_normal = color_from_cfg(map, "mode_normal", t.mode_normal);
+            t.mode_focus = color_from_cfg(map, "mode_focus", t.mode_focus);
+
+            t.popup_title = color_from_cfg(map, "popup_title", t.popup_title);
+            t.popup_accent = color_from_cfg(map, "popup_accent", t.popup_accent);
+            t.popup_text = color_from_cfg(map, "popup_text", t.popup_text);
+        }
+        t
+    }
+}
+
+fn apply_selection(style: Style, selected: bool, bold_selection: bool) -> Style {
+    if selected {
+        if bold_selection {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style.add_modifier(Modifier::REVERSED)
+        }
+    } else {
+        style
+    }
+}
+
 // ---------- Config ----------
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct AppConfig {
     model: Option<String>,
     api_url: Option<String>,
     options: Option<toml::value::Table>,
+    system_prompt: Option<String>,
+    bold_selection: Option<bool>,
+    colors: Option<toml::value::Table>,
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -135,6 +305,14 @@ fn save_chat(chat: &Chat) -> Result<()> {
     Ok(())
 }
 
+fn delete_chat_file(id: &str) -> Result<()> {
+    let p = chat_file_path(id)?;
+    if p.exists() {
+        fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
+    }
+    Ok(())
+}
+
 fn gen_chat_id() -> String { format!("{}-{:08x}", now_sec(), random::<u32>()) }
 
 fn derive_title(messages: &[Message]) -> String {
@@ -157,7 +335,11 @@ struct OllamaChatRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-struct OllamaChatStreamChunk { done: bool, #[serde(default)] error: Option<String>, #[serde(default)] message: Option<OllamaChatMessage> }
+struct OllamaChatStreamChunk {
+    done: bool,
+    #[serde(default)] error: Option<String>,
+    #[serde(default)] message: Option<OllamaChatMessage>
+}
 #[derive(Debug, Deserialize)]
 struct OllamaChatMessage { role: String, content: String }
 
@@ -181,14 +363,18 @@ struct App {
     model: String,
     api_url: String,
     options: Option<JsonValue>,
+    system_prompt: Option<String>,
+    bold_selection: bool,
+    theme: Theme,
     quit: bool,
     mode: Mode,
     focus: Focus,
     selected_msg: Option<usize>,
+    popup: Popup,
 }
 
 impl App {
-    fn new(model: String, api_url: String, options: Option<JsonValue>) -> Self {
+    fn new(model: String, api_url: String, options: Option<JsonValue>, system_prompt: Option<String>, bold_selection: bool, theme: Theme) -> Self {
         let chats = list_chats().unwrap_or_default();
         Self {
             current_chat_id: None,
@@ -204,10 +390,14 @@ impl App {
             model,
             api_url,
             options,
+            system_prompt,
+            bold_selection,
+            theme,
             quit: false,
             mode: Mode::Normal,
             focus: Focus::Chat,
             selected_msg: None,
+            popup: Popup::None,
         }
     }
 }
@@ -247,7 +437,7 @@ async fn stream_ollama(
                 buf.extend_from_slice(&chunk);
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.drain(..=pos).collect::<Vec<u8>>();
-                    let line = &line[..line.len().saturating_sub(1)]; // drop '\n'
+                    let line = &line[..line.len().saturating_sub(1)];
                     if line.is_empty() { continue; }
                     match serde_json::from_slice::<OllamaChatStreamChunk>(line) {
                         Ok(obj) => {
@@ -255,7 +445,7 @@ async fn stream_ollama(
                             if let Some(msg) = obj.message { let _ = tx.send(AppEvent::OllamaChunk(msg.content)); }
                             if obj.done { let _ = tx.send(AppEvent::OllamaDone); }
                         }
-                        Err(_) => { /* ignore malformed lines */ }
+                        Err(_) => {}
                     }
                 }
             }
@@ -292,7 +482,151 @@ async fn preview_to_html(content: String) -> Result<()> {
     Ok(())
 }
 
+// ---------- Markdown -> Text formatting ----------
+#[derive(Clone, Copy, Default)]
+struct InlineState {
+    bold: bool,
+    italic: bool,
+    code: bool,
+}
+
+fn style_from_state(s: InlineState, theme: &Theme) -> Style {
+    let mut st = Style::default();
+    if s.bold { st = st.add_modifier(Modifier::BOLD); }
+    if s.italic { st = st.add_modifier(Modifier::ITALIC); }
+    if s.code { st = st.fg(theme.inline_code); }
+    st
+}
+
+fn stylize_inline(input: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut buf = String::new();
+    let mut st = InlineState::default();
+    let mut i = 0usize;
+
+    let mut push_buf = |spans: &mut Vec<Span>, buf: &mut String, st: InlineState| {
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf.clone(), style_from_state(st, theme)));
+            buf.clear();
+        }
+    };
+
+    while i < chars.len() {
+        if chars[i] == '`' {
+            push_buf(&mut spans, &mut buf, st);
+            st.code = !st.code;
+            i += 1;
+            continue;
+        }
+        if !st.code {
+            if i + 1 < chars.len() && ((chars[i] == '*' && chars[i + 1] == '*') || (chars[i] == '_' && chars[i + 1] == '_')) {
+                push_buf(&mut spans, &mut buf, st);
+                st.bold = !st.bold;
+                i += 2;
+                continue;
+            }
+            if chars[i] == '*' || chars[i] == '_' {
+                push_buf(&mut spans, &mut buf, st);
+                st.italic = !st.italic;
+                i += 1;
+                continue;
+            }
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    push_buf(&mut spans, &mut buf, st);
+    spans
+}
+
+fn render_markdown_to_text(input: &str, theme: &Theme) -> Text<'static> {
+    let mut text = Text::default();
+    let mut in_code_block = false;
+
+    for line in input.lines() {
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            let fence_label = trimmed.strip_prefix("```").unwrap_or("").trim();
+            let label = if in_code_block { format!("─ code {} ─", fence_label) } else { "─ end code ─".into() };
+            text.push_line(Line::styled(label, Style::default().fg(theme.code_block)));
+            continue;
+        }
+
+        if in_code_block {
+            text.push_line(Line::styled(line.to_string(), Style::default().fg(theme.code_block)));
+            continue;
+        }
+
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if hashes > 0 && trimmed.chars().nth(hashes) == Some(' ') {
+            let content = trimmed[hashes + 1..].to_string();
+            let style = match hashes {
+                1 => Style::default().fg(theme.heading1).add_modifier(Modifier::BOLD),
+                2 => Style::default().fg(theme.heading2).add_modifier(Modifier::BOLD),
+                3 => Style::default().fg(theme.heading3).add_modifier(Modifier::BOLD),
+                4 => Style::default().fg(theme.heading4).add_modifier(Modifier::BOLD),
+                _ => Style::default().fg(theme.heading4).add_modifier(Modifier::BOLD),
+            };
+            text.push_line(Line::styled(content, style));
+            continue;
+        }
+
+        if trimmed.starts_with("> ") {
+            let inner = &trimmed[2..];
+            let mut spans = vec![Span::styled("▏ ", Style::default().fg(theme.blockquote_bar))];
+            spans.extend(stylize_inline(inner, theme));
+            text.push_line(Line::from(spans));
+            continue;
+        }
+
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            let inner = &trimmed[2..];
+            let mut spans = vec![Span::styled("• ", Style::default().fg(theme.list_bullet))];
+            spans.extend(stylize_inline(inner, theme));
+            text.push_line(Line::from(spans));
+            continue;
+        }
+        if let Some(pos) = trimmed.find(". ") {
+            if trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
+                let num = &trimmed[..pos + 1];
+                let rest = &trimmed[pos + 2..];
+                let mut spans = vec![Span::styled(format!("{} ", num), Style::default().fg(theme.ordered_number))];
+                spans.extend(stylize_inline(rest, theme));
+                text.push_line(Line::from(spans));
+                continue;
+            }
+        }
+
+        text.push_line(Line::from(stylize_inline(line, theme)));
+    }
+
+    text
+}
+
 // ---------- UI ----------
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(v[1]);
+    h[1]
+}
+
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -300,6 +634,23 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
         .split(frame.size());
     draw_sidebar(frame, chunks[0], app);
     draw_chat(frame, chunks[1], app);
+
+    if let Popup::ConfirmDelete { id: _, title } = &app.popup {
+        let area = centered_rect(60, 30, frame.size());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Span::styled("Confirm delete", Style::default().fg(app.theme.popup_title).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL);
+        let msg = vec![
+            Line::from(""),
+            Line::from(Span::styled("Delete chat:", Style::default().fg(app.theme.popup_accent))),
+            Line::from(Span::styled(format!("  {}", title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("Press y to confirm, n to cancel", Style::default().fg(app.theme.popup_text))),
+        ];
+        let p = Paragraph::new(Text::from(msg)).block(block).wrap(Wrap { trim: false });
+        frame.render_widget(p, area);
+    }
 }
 
 fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -311,17 +662,20 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             let ts = NaiveDateTime::from_timestamp_opt(c.updated_ts, 0)
                 .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| c.updated_ts.to_string());
-            let style = if app.focus == Focus::Sidebar && i == app.sidebar_idx {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(ts, Style::default().fg(Color::DarkGray)),
+            let selected = app.focus == Focus::Sidebar && i == app.sidebar_idx;
+            let mut spans = vec![
+                Span::styled(ts, Style::default().fg(app.theme.sidebar_timestamp)),
                 Span::raw("  "),
-                Span::styled(&c.title, Style::default().fg(Color::White)),
-            ]))
-            .style(style)
+                Span::styled(&c.title, Style::default().fg(app.theme.sidebar_item)),
+            ];
+            // apply selection as a modifier on each span (bold or reversed)
+            if selected {
+                let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
+                for s in &mut spans {
+                    s.style = s.style.add_modifier(m);
+                }
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -330,7 +684,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             .borders(Borders::ALL)
             .title(Span::styled(
                 "Chats",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(app.theme.sidebar_title).add_modifier(Modifier::BOLD),
             )),
     );
     frame.render_widget(list, area);
@@ -342,45 +696,65 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(area);
 
-    // track inner viewport height for minimal selection scrolling
     app.chat_inner_height = v_chunks[0].height.saturating_sub(2);
 
     let mut text = Text::default();
     let sel = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
+
     for (i, m) in app.messages.iter().enumerate() {
-        let active = app.focus == Focus::Chat && app.mode == Mode::Normal && i == sel;
-        let (prefix_text, mut pstyle) = match m.role {
-            Role::User => ("You:".to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Role::Assistant => (format!("{}:", app.model), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Role::System => ("System:".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        let selected = app.focus == Focus::Chat && app.mode == Mode::Normal && i == sel;
+
+        let (prefix_text, prefix_color) = match m.role {
+            Role::User => ("You:".to_string(), app.theme.user_prefix),
+            Role::Assistant => (format!("{}:", app.model), app.theme.assistant_prefix),
+            Role::System => ("System:".to_string(), app.theme.system_prefix),
         };
-        if active { pstyle = pstyle.add_modifier(Modifier::REVERSED); }
+        let mut pstyle = Style::default().fg(prefix_color).add_modifier(Modifier::BOLD);
+        pstyle = apply_selection(pstyle, selected, app.bold_selection);
         text.push_line(Line::styled(prefix_text, pstyle));
-        let content_style = if active { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-        for line in m.content.lines() {
-            text.push_line(Line::styled(line.to_string(), content_style));
+
+        let mut md = render_markdown_to_text(&m.content, &app.theme);
+        if selected {
+            let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
+            for line in &mut md.lines {
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(m);
+                }
+            }
+        }
+        for line in md.lines {
+            text.push_line(line);
         }
         text.push_line(Line::from(""));
     }
+
     if !app.pending_assistant.is_empty() {
-        let active = app.focus == Focus::Chat && app.mode == Mode::Normal && app.messages.len() == sel;
-        let mut hdr_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
-        if active { hdr_style = hdr_style.add_modifier(Modifier::REVERSED); }
+        let selected = app.focus == Focus::Chat && app.mode == Mode::Normal && app.messages.len() == sel;
+        let mut hdr_style = Style::default().fg(app.theme.assistant_prefix).add_modifier(Modifier::BOLD);
+        hdr_style = apply_selection(hdr_style, selected, app.bold_selection);
         text.push_line(Line::styled(format!("{}:", app.model), hdr_style));
-        let mut line = app.pending_assistant.clone();
-        line.push('▌');
-        let content_style = if active { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-        text.push_line(Line::styled(line, content_style));
+
+        let mut md = render_markdown_to_text(&app.pending_assistant, &app.theme);
+        if let Some(last) = md.lines.last_mut() { last.spans.push(Span::raw("▌")); } else { md.lines.push(Line::from("▌")); }
+        if selected {
+            let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
+            for line in &mut md.lines {
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(m);
+                }
+            }
+        }
+        for line in md.lines { text.push_line(line); }
         text.push_line(Line::from(""));
     }
 
     let mode_span = match app.mode {
-        Mode::Insert => Span::styled("[INSERT]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Mode::Normal => Span::styled("[NORMAL]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Mode::Insert => Span::styled("[INSERT]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
+        Mode::Normal => Span::styled("[NORMAL]", Style::default().fg(app.theme.mode_normal).add_modifier(Modifier::BOLD)),
     };
     let mut title_spans = vec![Span::raw("Chat "), mode_span];
     if matches!(app.mode, Mode::Normal) && matches!(app.focus, Focus::Chat) {
-        title_spans.push(Span::styled(" [FOCUS]", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)));
+        title_spans.push(Span::styled(" [FOCUS]", Style::default().fg(app.theme.mode_focus).add_modifier(Modifier::BOLD)));
     }
     let chat_block = Block::default().borders(Borders::ALL).title(Line::from(title_spans));
 
@@ -395,25 +769,25 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let input_title_line: Line = match app.mode {
         Mode::Insert => Line::from(vec![
             Span::raw("Message "),
-            Span::styled("[INSERT]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("[INSERT]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
         ]),
         Mode::Normal => {
             let base = if app.focus == Focus::Sidebar { "Sidebar " } else { "Navigation " };
             let hint = if app.focus == Focus::Sidebar {
-                "(j/k nav, Enter load, l->chat, n=new)"
+                "(j/k nav, Enter load, l->chat, n=new, d=delete)"
             } else {
                 "(h->sidebar, j/k select, Enter preview, n=new)"
             };
             Line::from(vec![
                 Span::raw(base),
-                Span::styled("[NORMAL] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::raw(hint),
+                Span::styled("[NORMAL] ", Style::default().fg(app.theme.mode_normal).add_modifier(Modifier::BOLD)),
+                Span::styled(hint, Style::default().fg(app.theme.status_hint)),
             ])
         }
     };
     let bottom = match app.mode {
         Mode::Insert => app.input.as_str(),
-        Mode::Normal => "h=sidebar  l=chat  j/k=move  n=new  Enter=load/preview  ↑/↓=scroll  q=quit",
+        Mode::Normal => "h=sidebar  l=chat  j/k=move  n=new  d=delete  Enter=load/preview  ↑/↓=scroll  q=quit",
     };
     let input = Paragraph::new(bottom)
         .block(Block::default().borders(Borders::ALL).title(input_title_line));
@@ -431,8 +805,11 @@ async fn main() -> Result<()> {
     let model = std::env::var("OLLAMA_MODEL").ok().or_else(|| cfg.model.clone()).unwrap_or_else(|| "llama3".to_string());
     let api_url = std::env::var("OLLAMA_CHAT_URL").ok().or_else(|| cfg.api_url.clone()).unwrap_or_else(|| "http://localhost:11434/api/chat".to_string());
     let options: Option<JsonValue> = cfg.options.as_ref().and_then(|t| serde_json::to_value(t).ok());
+    let system_prompt = cfg.system_prompt.clone();
+    let bold_selection = cfg.bold_selection.unwrap_or(false);
+    let theme = Theme::from_config(cfg.colors.as_ref());
 
-    let mut app = App::new(model, api_url, options);
+    let mut app = App::new(model, api_url, options, system_prompt, bold_selection, theme);
 
     enable_raw_mode()?; let mut stdout = std::io::stdout(); execute!(stdout, EnterAlternateScreen)?; let backend = CrosstermBackend::new(stdout); let mut terminal = Terminal::new(backend)?;
 
@@ -519,14 +896,37 @@ fn start_new_chat(app: &mut App) -> Result<()> {
 fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
     let mut y: u16 = 0;
     for m in &messages[..idx.min(messages.len())] {
-        y = y.saturating_add(1); // header
-        y = y.saturating_add(m.content.lines().count() as u16); // content
-        y = y.saturating_add(1); // spacer
+        y = y.saturating_add(1);
+        y = y.saturating_add(m.content.lines().count() as u16);
+        y = y.saturating_add(1);
     }
     y
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) -> Result<()> {
+    if let Popup::ConfirmDelete { id, .. } = &app.popup {
+        match key.code {
+            KeyCode::Char('y') => {
+                let del_id = id.clone();
+                delete_chat_file(&del_id)?;
+                if app.current_chat_id.as_deref() == Some(&del_id) {
+                    app.current_chat_id = None;
+                    app.current_created_ts = None;
+                    app.messages.clear();
+                    app.pending_assistant.clear();
+                    app.selected_msg = None;
+                    app.chat_scroll = 0;
+                }
+                app.popup = Popup::None;
+                app.chats = list_chats().unwrap_or_default();
+                if app.sidebar_idx >= app.chats.len() { app.sidebar_idx = app.chats.len().saturating_sub(1); }
+                return Ok(());
+            }
+            KeyCode::Char('n') | KeyCode::Esc => { app.popup = Popup::None; return Ok(()); }
+            _ => { return Ok(()); }
+        }
+    }
+
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { app.quit = true; return Ok(()); }
     if key.code == KeyCode::Char('q') && app.mode == Mode::Normal { app.quit = true; return Ok(()); }
 
@@ -542,6 +942,12 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 app.sending = true;
                 let mut convo = app.messages.clone();
                 convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
+                let has_sys = convo.iter().any(|m| matches!(m.role, Role::System));
+                if !has_sys {
+                    if let Some(sp) = app.system_prompt.clone() {
+                        convo.insert(0, Message { role: Role::System, content: sp });
+                    }
+                }
                 let api_url = app.api_url.clone(); let model = app.model.clone(); let options = app.options.clone(); let tx2 = tx.clone();
                 tokio::spawn(async move { stream_ollama(api_url, model, options, convo, tx2).await; });
             }
@@ -558,6 +964,12 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 KeyCode::Char('l') => { app.focus = Focus::Chat; }
                 KeyCode::Char('i') => { if app.focus == Focus::Chat { app.mode = Mode::Insert; } }
                 KeyCode::Char('n') => { start_new_chat(app)?; }
+                KeyCode::Char('d') => {
+                    if app.focus == Focus::Sidebar && !app.chats.is_empty() {
+                        let meta = &app.chats[app.sidebar_idx];
+                        app.popup = Popup::ConfirmDelete { id: meta.id.clone(), title: meta.title.clone() };
+                    }
+                }
                 KeyCode::Char('j') => {
                     match app.focus {
                         Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len()-1); } }
@@ -566,13 +978,10 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                             let cur = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
                             let next = (cur + 1).min(app.messages.len().saturating_sub(1));
                             app.selected_msg = Some(next);
-                            // minimal selection scrolling: align to start if off-screen
                             let target_y = offset_for_message(&app.messages, next);
                             let top = app.chat_scroll;
                             let bottom = top.saturating_add(app.chat_inner_height.max(1));
-                            if target_y < top || target_y >= bottom {
-                                app.chat_scroll = target_y;
-                            }
+                            if target_y < top || target_y >= bottom { app.chat_scroll = target_y; }
                         }
                     }
                 }
@@ -584,13 +993,10 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                             let cur = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
                             let next = cur.saturating_sub(1);
                             app.selected_msg = Some(next);
-                            // minimal selection scrolling: align to start if off-screen
                             let target_y = offset_for_message(&app.messages, next);
                             let top = app.chat_scroll;
                             let bottom = top.saturating_add(app.chat_inner_height.max(1));
-                            if target_y < top || target_y >= bottom {
-                                app.chat_scroll = target_y;
-                            }
+                            if target_y < top || target_y >= bottom { app.chat_scroll = target_y; }
                         }
                     }
                 }

@@ -1,0 +1,45 @@
+# Core
+model = "gpt-oss:20b"
+api_url = "http://192.168.100.2:11434/api/chat"
+
+# Optional system prompt. Empty = disabled (no system message is sent).
+system_prompt = ""
+
+# Selection rendering: false = reverse video, true = bold text
+bold_selection = false
+
+# Ollama options forwarded verbatim. Empty = Ollama defaults.
+[options]
+# num_ctx = 4096
+# num_thread = 6
+# temperature = 0.7
+
+# Colors. Names or #RRGGBB.
+[colors]
+sidebar_title = "Green"
+sidebar_timestamp = "DarkGray"
+sidebar_item = "White"
+
+user_prefix = "Green"
+assistant_prefix = "Green"
+system_prefix = "Yellow"
+
+heading1 = "Yellow"
+heading2 = "LightYellow"
+heading3 = "Blue"
+heading4 = "LightGreen"
+
+blockquote_bar = "DarkGray"
+list_bullet = "Magenta"
+ordered_number = "Magenta"
+inline_code = "Yellow"
+code_block = "Gray"
+
+status_hint = "Gray"
+mode_insert = "Green"
+mode_normal = "Yellow"
+mode_focus = "Blue"
+
+popup_title = "Red"
+popup_accent = "Yellow"
+popup_text = "Gray"
