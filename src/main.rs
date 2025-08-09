@@ -6,13 +6,16 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use chrono::NaiveDateTime;
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use directories::ProjectDirs;
 use futures_util::StreamExt;
+use rand::random;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -21,15 +24,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Terminal,
 };
+use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use chrono::NaiveDateTime;
-use regex::{Captures, Regex};
-use tokio::process::Command;
 use tokio::io::AsyncWriteExt;
-use std::process::Stdio;
-use rand::random;
+use tokio::process::Command;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -65,10 +65,17 @@ struct ChatMeta {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Mode { Normal, Insert, Visual }
+enum Mode {
+    Normal,
+    Insert,
+    Visual,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Focus { Sidebar, Chat }
+enum Focus {
+    Sidebar,
+    Chat,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Popup {
@@ -290,7 +297,9 @@ fn config_path() -> Result<PathBuf> {
 }
 
 fn load_config(path: &PathBuf) -> Result<AppConfig> {
-    if !path.exists() { return Ok(AppConfig::default()); }
+    if !path.exists() {
+        return Ok(AppConfig::default());
+    }
     let s = fs::read_to_string(path).with_context(|| "read config".to_string())?;
     let cfg: AppConfig = toml::from_str(&s).with_context(|| "parse TOML".to_string())?;
     Ok(cfg)
@@ -309,22 +318,34 @@ fn chats_dir_path() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn chat_file_path(id: &str) -> Result<PathBuf> { Ok(chats_dir_path()?.join(format!("{}.json", id))) }
+fn chat_file_path(id: &str) -> Result<PathBuf> {
+    Ok(chats_dir_path()?.join(format!("{}.json", id)))
+}
 
 fn list_chats() -> Result<Vec<ChatMeta>> {
     let mut metas = Vec::new();
     for entry in fs::read_dir(chats_dir_path()?)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() { continue; }
-        if let Some(ext) = entry.path().extension() { if ext != "json" { continue; } }
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if let Some(ext) = entry.path().extension() {
+            if ext != "json" {
+                continue;
+            }
+        }
         let s = fs::read_to_string(entry.path());
         if let Ok(s) = s {
             if let Ok(chat) = serde_json::from_str::<Chat>(&s) {
-                metas.push(ChatMeta { id: chat.id, title: chat.title, updated_ts: chat.updated_ts });
+                metas.push(ChatMeta {
+                    id: chat.id,
+                    title: chat.title,
+                    updated_ts: chat.updated_ts,
+                });
             }
         }
     }
-    metas.sort_by(|a,b| b.updated_ts.cmp(&a.updated_ts));
+    metas.sort_by(|a, b| b.updated_ts.cmp(&a.updated_ts));
     Ok(metas)
 }
 
@@ -351,14 +372,21 @@ fn delete_chat_file(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn gen_chat_id() -> String { format!("{}-{:08x}", now_sec(), random::<u32>()) }
+fn gen_chat_id() -> String {
+    format!("{}-{:08x}", now_sec(), random::<u32>())
+}
 
 fn derive_title(messages: &[Message]) -> String {
-    let first = messages.iter().find(|m| matches!(m.role, Role::User)).or(messages.first());
+    let first = messages
+        .iter()
+        .find(|m| matches!(m.role, Role::User))
+        .or(messages.first());
     let raw = first.map(|m| m.content.trim()).unwrap_or("");
     let oneline = raw.lines().next().unwrap_or("").trim();
     let mut title = oneline.chars().take(60).collect::<String>();
-    if title.is_empty() { title = "Untitled chat".to_string(); }
+    if title.is_empty() {
+        title = "Untitled chat".to_string();
+    }
     title
 }
 
@@ -375,11 +403,16 @@ struct OllamaChatRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct OllamaChatStreamChunk {
     done: bool,
-    #[serde(default)] error: Option<String>,
-    #[serde(default)] message: Option<OllamaChatMessage>
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<OllamaChatMessage>,
 }
 #[derive(Debug, Deserialize)]
-struct OllamaChatMessage { role: String, content: String }
+struct OllamaChatMessage {
+    role: String,
+    content: String,
+}
 
 // ---------- App state ----------
 struct App {
@@ -395,6 +428,7 @@ struct App {
 
     // UI/input
     input: String,
+    input_cursor: usize, // grapheme index
     chat_scroll: u16,
     chat_inner_height: u16,
     sending: bool,
@@ -412,7 +446,14 @@ struct App {
 }
 
 impl App {
-    fn new(model: String, api_url: String, options: Option<JsonValue>, system_prompt: Option<String>, bold_selection: bool, theme: Theme) -> Self {
+    fn new(
+        model: String,
+        api_url: String,
+        options: Option<JsonValue>,
+        system_prompt: Option<String>,
+        bold_selection: bool,
+        theme: Theme,
+    ) -> Self {
         let chats = list_chats().unwrap_or_default();
         Self {
             current_chat_id: None,
@@ -422,6 +463,7 @@ impl App {
             chats,
             sidebar_idx: 0,
             input: String::new(),
+            input_cursor: 0,
             chat_scroll: 0,
             chat_inner_height: 0,
             sending: false,
@@ -442,26 +484,43 @@ impl App {
 
 // ---------- Events ----------
 #[derive(Debug)]
-enum AppEvent { Tick, Input(KeyEvent), OllamaChunk(String), OllamaDone, OllamaError(String) }
+enum AppEvent {
+    Tick,
+    Input(KeyEvent),
+    OllamaChunk(String),
+    OllamaDone,
+    OllamaError(String),
+}
 
 // ---------- Ollama streaming ----------
 async fn stream_ollama(
     api_url: String,
     model: String,
     options: Option<JsonValue>,
-    mut messages: Vec<Message>,
+    messages: Vec<Message>,
     tx: UnboundedSender<AppEvent>,
 ) {
-    let req = OllamaChatRequest { model: &model, messages: &messages, stream: true, options: options.as_ref() };
     let client = reqwest::Client::new();
+    let req = OllamaChatRequest {
+        model: &model,
+        messages: &messages,
+        stream: true,
+        options: options.as_ref(),
+    };
 
     let resp = match client.post(api_url).json(&req).send().await {
         Ok(r) => r,
-        Err(e) => { let _ = tx.send(AppEvent::OllamaError(e.to_string())); return; }
+        Err(e) => {
+            let _ = tx.send(AppEvent::OllamaError(e.to_string()));
+            return;
+        }
     };
 
     if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_else(|_| "unknown error".to_string());
+        let text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
         let _ = tx.send(AppEvent::OllamaError(format!("HTTP error: {}", text)));
         return;
     }
@@ -476,18 +535,29 @@ async fn stream_ollama(
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.drain(..=pos).collect::<Vec<u8>>();
                     let line = &line[..line.len().saturating_sub(1)];
-                    if line.is_empty() { continue; }
+                    if line.is_empty() {
+                        continue;
+                    }
                     match serde_json::from_slice::<OllamaChatStreamChunk>(line) {
                         Ok(obj) => {
-                            if let Some(err) = obj.error { let _ = tx.send(AppEvent::OllamaError(err)); }
-                            if let Some(msg) = obj.message { let _ = tx.send(AppEvent::OllamaChunk(msg.content)); }
-                            if obj.done { let _ = tx.send(AppEvent::OllamaDone); }
+                            if let Some(err) = obj.error {
+                                let _ = tx.send(AppEvent::OllamaError(err));
+                            }
+                            if let Some(msg) = obj.message {
+                                let _ = tx.send(AppEvent::OllamaChunk(msg.content));
+                            }
+                            if obj.done {
+                                let _ = tx.send(AppEvent::OllamaDone);
+                            }
                         }
                         Err(_) => {}
                     }
                 }
             }
-            Err(e) => { let _ = tx.send(AppEvent::OllamaError(e.to_string())); break; }
+            Err(e) => {
+                let _ = tx.send(AppEvent::OllamaError(e.to_string()));
+                break;
+            }
         }
     }
 }
@@ -497,11 +567,17 @@ fn sanitize_for_html(input: &str) -> String {
     let mut out = input.replace('\u{2011}', "-");
     out = out.replace('<', "").replace('>', "");
     let re_display = Regex::new(r"(?s)\\\[\s*(.*?)\s*\\\]").unwrap();
-    out = re_display.replace_all(&out, |caps: &Captures| format!("$$\n{}\n$$", &caps[1])).to_string();
+    out = re_display
+        .replace_all(&out, |caps: &Captures| format!("$$\n{}\n$$", &caps[1]))
+        .to_string();
     let re_trim_inline = Regex::new(r"\$\s+([^$]*?\S)\s+\$").unwrap();
-    out = re_trim_inline.replace_all(&out, |caps: &Captures| format!("${}$", &caps[1])).to_string();
+    out = re_trim_inline
+        .replace_all(&out, |caps: &Captures| format!("${}$", &caps[1]))
+        .to_string();
     let re_inline = Regex::new(r"\\\((.*?)\\\)").unwrap();
-    out = re_inline.replace_all(&out, |caps: &Captures| format!("${}$", caps[1].trim())).to_string();
+    out = re_inline
+        .replace_all(&out, |caps: &Captures| format!("${}$", caps[1].trim()))
+        .to_string();
     out
 }
 
@@ -513,16 +589,30 @@ async fn preview_to_html(content: String) -> Result<()> {
     let out_path = base.join(format!("tuillama_{}_output.html", stamp));
     tokio::fs::write(&in_path, sanitized).await?;
     let status = Command::new("pandoc")
-        .arg(&in_path).arg("-s").arg("--from").arg("markdown").arg("--to").arg("html").arg("--mathjax").arg("-o").arg(&out_path)
-        .status().await?;
-    if !status.success() { return Err(anyhow!("pandoc failed")); }
-    let _ = Command::new("xdg-open").arg(&out_path).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        .arg(&in_path)
+        .arg("-s")
+        .arg("--from")
+        .arg("markdown")
+        .arg("--to")
+        .arg("html")
+        .arg("--mathjax")
+        .arg("-o")
+        .arg(&out_path)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(anyhow!("pandoc failed"));
+    }
+    let _ = Command::new("xdg-open")
+        .arg(&out_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
     Ok(())
 }
 
 // ---------- Clipboard helpers (xclip) ----------
 async fn read_clipboard_text() -> Result<String> {
-    // Try explicit MIME first
     let try1 = Command::new("xclip")
         .args(["-selection", "clipboard", "-o", "-t", "text/plain"])
         .output()
@@ -531,7 +621,6 @@ async fn read_clipboard_text() -> Result<String> {
     let out = match try1 {
         Ok(o) if o.status.success() => o.stdout,
         _ => {
-            // Fallback without -t (lets xclip pick target, often UTF8_STRING)
             let o2 = Command::new("xclip")
                 .args(["-selection", "clipboard", "-o"])
                 .output()
@@ -550,7 +639,7 @@ async fn read_clipboard_text() -> Result<String> {
 async fn write_clipboard_text(s: &str) -> Result<()> {
     let mut child = Command::new("xclip")
         .args(["-selection", "clipboard", "-i", "-t", "text/plain"])
-        .stdin(Stdio::piped())
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .with_context(|| "spawn xclip -i failed")?;
 
@@ -574,9 +663,15 @@ struct InlineState {
 
 fn style_from_state(s: InlineState, theme: &Theme) -> Style {
     let mut st = Style::default();
-    if s.bold { st = st.add_modifier(Modifier::BOLD); }
-    if s.italic { st = st.add_modifier(Modifier::ITALIC); }
-    if s.code { st = st.fg(theme.inline_code).bg(theme.inline_code_bg); }
+    if s.bold {
+        st = st.add_modifier(Modifier::BOLD);
+    }
+    if s.italic {
+        st = st.add_modifier(Modifier::ITALIC);
+    }
+    if s.code {
+        st = st.fg(theme.inline_code).bg(theme.inline_code_bg);
+    }
     st
 }
 
@@ -602,7 +697,10 @@ fn stylize_inline(input: &str, theme: &Theme) -> Vec<Span<'static>> {
             continue;
         }
         if !st.code {
-            if i + 1 < chars.len() && ((chars[i] == '*' && chars[i + 1] == '*') || (chars[i] == '_' && chars[i + 1] == '_')) {
+            if i + 1 < chars.len()
+                && ((chars[i] == '*' && chars[i + 1] == '*')
+                    || (chars[i] == '_' && chars[i + 1] == '_'))
+            {
                 push_buf(&mut spans, &mut buf, st);
                 st.bold = !st.bold;
                 i += 2;
@@ -622,10 +720,12 @@ fn stylize_inline(input: &str, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
-// Fill code rows with NBSP so empty lines and right padding keep the background across the full width.
+// code rows padded with NBSP to keep bg for empty lines and right edge
 fn push_code_rows(line: &str, inner_width: u16, text: &mut Text<'static>, theme: &Theme) {
     let w = inner_width.max(1) as usize;
-    let style = Style::default().fg(theme.code_block_fg).bg(theme.code_block_bg);
+    let style = Style::default()
+        .fg(theme.code_block_fg)
+        .bg(theme.code_block_bg);
     const NBSP: char = '\u{00A0}';
 
     let expanded = line.replace('\t', "    ");
@@ -699,11 +799,21 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
         if hashes > 0 && trimmed.chars().nth(hashes) == Some(' ') {
             let content = trimmed[hashes + 1..].to_string();
             let style = match hashes {
-                1 => Style::default().fg(theme.heading1).add_modifier(Modifier::BOLD),
-                2 => Style::default().fg(theme.heading2).add_modifier(Modifier::BOLD),
-                3 => Style::default().fg(theme.heading3).add_modifier(Modifier::BOLD),
-                4 => Style::default().fg(theme.heading4).add_modifier(Modifier::BOLD),
-                _ => Style::default().fg(theme.heading4).add_modifier(Modifier::BOLD),
+                1 => Style::default()
+                    .fg(theme.heading1)
+                    .add_modifier(Modifier::BOLD),
+                2 => Style::default()
+                    .fg(theme.heading2)
+                    .add_modifier(Modifier::BOLD),
+                3 => Style::default()
+                    .fg(theme.heading3)
+                    .add_modifier(Modifier::BOLD),
+                4 => Style::default()
+                    .fg(theme.heading4)
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::default()
+                    .fg(theme.heading4)
+                    .add_modifier(Modifier::BOLD),
             };
             text.push_line(Line::styled(content, style));
             continue;
@@ -711,7 +821,10 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
 
         if trimmed.starts_with("> ") {
             let inner = &trimmed[2..];
-            let mut spans = vec![Span::styled("▏ ", Style::default().fg(theme.blockquote_bar))];
+            let mut spans = vec![Span::styled(
+                "▏ ",
+                Style::default().fg(theme.blockquote_bar),
+            )];
             spans.extend(stylize_inline(inner, theme));
             text.push_line(Line::from(spans));
             continue;
@@ -719,7 +832,10 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
 
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let inner = &trimmed[2..];
-            let mut spans = vec![Span::styled("• ", Style::default().fg(theme.list_bullet))];
+            let mut spans = vec![Span::styled(
+                "• ",
+                Style::default().fg(theme.list_bullet),
+            )];
             spans.extend(stylize_inline(inner, theme));
             text.push_line(Line::from(spans));
             continue;
@@ -729,7 +845,10 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
             if trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
                 let num = &trimmed[..pos + 1];
                 let rest = &trimmed[pos + 2..];
-                let mut spans = vec![Span::styled(format!("{} ", num), Style::default().fg(theme.ordered_number))];
+                let mut spans = vec![Span::styled(
+                    format!("{} ", num),
+                    Style::default().fg(theme.ordered_number),
+                )];
                 spans.extend(stylize_inline(rest, theme));
                 text.push_line(Line::from(spans));
                 continue;
@@ -742,7 +861,7 @@ fn render_markdown_to_text(input: &str, theme: &Theme, inner_width: u16) -> Text
     text
 }
 
-// ---------- UI ----------
+// ---------- UI helpers ----------
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -776,65 +895,129 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
             let area = centered_rect(60, 30, frame.size());
             frame.render_widget(Clear, area);
             let block = Block::default()
-                .title(Span::styled("Confirm delete", Style::default().fg(app.theme.popup_title).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(
+                    "Confirm delete",
+                    Style::default()
+                        .fg(app.theme.popup_title)
+                        .add_modifier(Modifier::BOLD),
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.border_chat));
             let msg = vec![
                 Line::from(""),
-                Line::from(Span::styled("Delete chat:", Style::default().fg(app.theme.popup_accent))),
-                Line::from(Span::styled(format!("  {}", title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "Delete chat:",
+                    Style::default().fg(app.theme.popup_accent),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", title),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
-                Line::from(Span::styled("Press y to confirm, n to cancel", Style::default().fg(app.theme.popup_text))),
+                Line::from(Span::styled(
+                    "Press y to confirm, n to cancel",
+                    Style::default().fg(app.theme.popup_text),
+                )),
             ];
-            let p = Paragraph::new(Text::from(msg)).block(block).wrap(Wrap { trim: false });
+            let p = Paragraph::new(Text::from(msg))
+                .block(block)
+                .wrap(Wrap { trim: false });
             frame.render_widget(p, area);
         }
         Popup::Help => {
             let area = centered_rect(80, 80, frame.size());
             frame.render_widget(Clear, area);
             let block = Block::default()
-                .title(Span::styled("Keybindings", Style::default().fg(app.theme.popup_title).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(
+                    "Keybindings",
+                    Style::default()
+                        .fg(app.theme.popup_title)
+                        .add_modifier(Modifier::BOLD),
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.border_chat));
 
             let mut lines: Vec<Line> = Vec::new();
-            lines.push(Line::from(Span::styled("Global", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
+            lines.push(Line::from(Span::styled(
+                "Global",
+                Style::default()
+                    .fg(app.theme.heading2)
+                    .add_modifier(Modifier::BOLD),
+            )));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("? ", Style::default().fg(app.theme.popup_accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "? ",
+                    Style::default()
+                        .fg(app.theme.popup_accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Show/close help (NORMAL mode)"),
             ]));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("q / Ctrl+C ", Style::default().fg(app.theme.popup_accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "q / Ctrl+C ",
+                    Style::default()
+                        .fg(app.theme.popup_accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Quit"),
             ]));
             lines.push(Line::from(""));
 
-            lines.push(Line::from(Span::styled("Sidebar (FOCUS Sidebar)", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
-            lines.push(Line::from("  j/k: select chat, Enter: load, l: to chat, n: new, d: delete"));
+            lines.push(Line::from(Span::styled(
+                "Sidebar (FOCUS Sidebar)",
+                Style::default()
+                    .fg(app.theme.heading2)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(
+                "  j/k: select chat, Enter: load, l: to chat, n: new, d: delete",
+            ));
             lines.push(Line::from(""));
 
-            lines.push(Line::from(Span::styled("Chat — NORMAL", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
-            lines.push(Line::from("  h: to sidebar, i: insert, v: visual"));
-            lines.push(Line::from("  ↑/k: scroll up   ↓/j: scroll down   g: top   G: bottom   p: paste clipboard to input"));
+            lines.push(Line::from(Span::styled(
+                "Chat — NORMAL",
+                Style::default()
+                    .fg(app.theme.heading2)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(
+                "  h: to sidebar, i: insert, v: visual, p: paste clipboard",
+            ));
+            lines.push(Line::from(
+                "  ↑/k: scroll up   ↓/j: scroll down   g: top   G: bottom",
+            ));
             lines.push(Line::from(""));
 
-            lines.push(Line::from(Span::styled("Chat — VISUAL (message select)", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
+            lines.push(Line::from(Span::styled(
+                "Chat — VISUAL (message select)",
+                Style::default()
+                    .fg(app.theme.heading2)
+                    .add_modifier(Modifier::BOLD),
+            )));
             lines.push(Line::from("  v/Esc: exit visual, h: to sidebar"));
-            lines.push(Line::from("  j/k: select next/prev message"));
-            lines.push(Line::from("  y: yank (copy) selected message to clipboard"));
-            lines.push(Line::from("  Enter: preview selected message (Pandoc)"));
-            lines.push(Line::from("  ↑/↓: manual scroll"));
+            lines.push(Line::from(
+                "  j/k: select next/prev message, y: yank selected to clipboard",
+            ));
+            lines.push(Line::from(
+                "  Enter: preview selected message (Pandoc), ↑/↓: manual scroll",
+            ));
             lines.push(Line::from(""));
 
-            lines.push(Line::from(Span::styled("Chat — INSERT", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
-            lines.push(Line::from("  Type, Enter: send to Ollama, Esc: back to NORMAL"));
-            lines.push(Line::from("  ↑: scroll up   ↓: scroll down"));
-            lines.push(Line::from(""));
-
-            lines.push(Line::from(Span::styled("Notes", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
-            lines.push(Line::from("  Selection styling controlled by bold_selection in config."));
+            lines.push(Line::from(Span::styled(
+                "Chat — INSERT",
+                Style::default()
+                    .fg(app.theme.heading2)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(
+                "  Type, Enter: send to Ollama, Esc: back to NORMAL",
+            ));
+            lines.push(Line::from(
+                "  ←/→: move cursor   Backspace: delete previous grapheme",
+            ));
             lines.push(Line::from(""));
 
             let p = Paragraph::new(Text::from(lines))
@@ -862,8 +1045,14 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 Span::styled(&c.title, Style::default().fg(app.theme.sidebar_item)),
             ];
             if selected {
-                let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
-                for s in &mut spans { s.style = s.style.add_modifier(m); }
+                let m = if app.bold_selection {
+                    Modifier::BOLD
+                } else {
+                    Modifier::REVERSED
+                };
+                for s in &mut spans {
+                    s.style = s.style.add_modifier(m);
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -875,7 +1064,9 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             .border_style(Style::default().fg(app.theme.border_sidebar))
             .title(Span::styled(
                 "Chats",
-                Style::default().fg(app.theme.sidebar_title).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(app.theme.sidebar_title)
+                    .add_modifier(Modifier::BOLD),
             )),
     );
     frame.render_widget(list, area);
@@ -901,13 +1092,19 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             Role::Assistant => (format!("{}:", app.model), app.theme.assistant_prefix),
             Role::System => ("System:".to_string(), app.theme.system_prefix),
         };
-        let mut pstyle = Style::default().fg(prefix_color).add_modifier(Modifier::BOLD);
+        let mut pstyle = Style::default()
+            .fg(prefix_color)
+            .add_modifier(Modifier::BOLD);
         pstyle = apply_selection(pstyle, selected, app.bold_selection);
         text.push_line(Line::styled(prefix_text, pstyle));
 
         let mut md = render_markdown_to_text(&m.content, &app.theme, inner_w);
         if selected {
-            let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
+            let m = if app.bold_selection {
+                Modifier::BOLD
+            } else {
+                Modifier::REVERSED
+            };
             for line in &mut md.lines {
                 for span in &mut line.spans {
                     span.style = span.style.add_modifier(m);
@@ -922,32 +1119,72 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     if !app.pending_assistant.is_empty() {
         let selected = app.focus == Focus::Chat && app.mode == Mode::Visual && app.messages.len() == sel;
-        let mut hdr_style = Style::default().fg(app.theme.assistant_prefix).add_modifier(Modifier::BOLD);
+        let mut hdr_style = Style::default()
+            .fg(app.theme.assistant_prefix)
+            .add_modifier(Modifier::BOLD);
         hdr_style = apply_selection(hdr_style, selected, app.bold_selection);
         text.push_line(Line::styled(format!("{}:", app.model), hdr_style));
 
         let mut md = render_markdown_to_text(&app.pending_assistant, &app.theme, inner_w);
-        if let Some(last) = md.lines.last_mut() { last.spans.push(Span::raw("▌")); } else { md.lines.push(Line::from("▌")); }
+        if let Some(last) = md.lines.last_mut() {
+            last.spans.push(Span::raw("▌"));
+        } else {
+            md.lines.push(Line::from("▌"));
+        }
         if selected {
-            let m = if app.bold_selection { Modifier::BOLD } else { Modifier::REVERSED };
+            let m = if app.bold_selection {
+                Modifier::BOLD
+            } else {
+                Modifier::REVERSED
+            };
             for line in &mut md.lines {
                 for span in &mut line.spans {
                     span.style = span.style.add_modifier(m);
                 }
             }
         }
-        for line in md.lines { text.push_line(line); }
+        for line in md.lines {
+            text.push_line(line);
+        }
         text.push_line(Line::from(""));
     }
 
     let mode_span = match app.mode {
-        Mode::Insert => Span::styled("[INSERT]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
-        Mode::Normal => Span::styled("[NORMAL]", Style::default().fg(app.theme.mode_normal).add_modifier(Modifier::BOLD)),
-        Mode::Visual => Span::styled("[VISUAL]", Style::default().fg(app.theme.mode_visual).add_modifier(Modifier::BOLD)),
+        Mode::Insert => Span::styled(
+            "[INSERT]",
+            Style::default()
+                .fg(app.theme.mode_insert)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Mode::Normal => Span::styled(
+            "[NORMAL]",
+            Style::default()
+                .fg(app.theme.mode_normal)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Mode::Visual => Span::styled(
+            "[VISUAL]",
+            Style::default()
+                .fg(app.theme.mode_visual)
+                .add_modifier(Modifier::BOLD),
+        ),
     };
-    let mut title_spans = vec![Span::styled("Chat ", Style::default().fg(app.theme.title_chat).add_modifier(Modifier::BOLD)), mode_span];
+    let mut title_spans = vec![
+        Span::styled(
+            "Chat ",
+            Style::default()
+                .fg(app.theme.title_chat)
+                .add_modifier(Modifier::BOLD),
+        ),
+        mode_span,
+    ];
     if matches!(app.focus, Focus::Chat) && matches!(app.mode, Mode::Normal | Mode::Visual) {
-        title_spans.push(Span::styled(" [FOCUS]", Style::default().fg(app.theme.mode_focus).add_modifier(Modifier::BOLD)));
+        title_spans.push(Span::styled(
+            " [FOCUS]",
+            Style::default()
+                .fg(app.theme.mode_focus)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     let chat_block = Block::default()
         .borders(Borders::ALL)
@@ -960,51 +1197,118 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .scroll((app.chat_scroll, 0));
     frame.render_widget(messages, v_chunks[0]);
 
+    // Status/input bar
     let input_title_line: Line = match app.mode {
         Mode::Insert => Line::from(vec![
-            Span::styled("Message ", Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
-            Span::styled("[INSERT]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Message ",
+                Style::default()
+                    .fg(app.theme.title_input)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "[INSERT]",
+                Style::default()
+                    .fg(app.theme.mode_insert)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
         ]),
         Mode::Normal => {
-            let base = if app.focus == Focus::Sidebar { "Sidebar " } else { "Navigation " };
+            let base = if app.focus == Focus::Sidebar {
+                "Sidebar "
+            } else {
+                "Navigation "
+            };
             Line::from(vec![
-                Span::styled(base, Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
-                Span::styled("[NORMAL] ", Style::default().fg(app.theme.mode_normal).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    base,
+                    Style::default()
+                        .fg(app.theme.title_input)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "[NORMAL] ",
+                    Style::default()
+                        .fg(app.theme.mode_normal)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
             ])
         }
         Mode::Visual => {
-            let base = if app.focus == Focus::Sidebar { "Sidebar " } else { "Navigation " };
+            let base = if app.focus == Focus::Sidebar {
+                "Sidebar "
+            } else {
+                "Navigation "
+            };
             Line::from(vec![
-                Span::styled(base, Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
-                Span::styled("[VISUAL] ", Style::default().fg(app.theme.mode_visual).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    base,
+                    Style::default()
+                        .fg(app.theme.title_input)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "[VISUAL] ",
+                    Style::default()
+                        .fg(app.theme.mode_visual)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("Press ? for help", Style::default().fg(app.theme.status_hint)),
             ])
         }
     };
-    let bottom = match app.mode {
-        _ => app.input.as_str(),
-    };
-    let input = Paragraph::new(bottom)
-        .block(Block::default()
+
+    // Always show current input in the box across modes
+    let input = Paragraph::new(app.input.as_str()).block(
+        Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border_input))
-            .title(input_title_line));
+            .title(input_title_line),
+    );
     frame.render_widget(input, v_chunks[1]);
 
+    // Cursor (as line) only in INSERT mode within chat focus
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
-        frame.set_cursor(v_chunks[1].x + 1 + app.input.len() as u16, v_chunks[1].y + 1);
+        let visual_x = input_visual_x(&app.input, app.input_cursor) as u16;
+        frame.set_cursor(v_chunks[1].x + 1 + visual_x, v_chunks[1].y + 1);
     }
+}
+
+// visual width of input up to grapheme index
+fn input_visual_x(s: &str, gidx: usize) -> usize {
+    let mut w = 0usize;
+    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
+        if i >= gidx {
+            break;
+        }
+        w += UnicodeWidthStr::width(g);
+    }
+    w
+}
+
+// byte index of grapheme boundary
+fn byte_index_from_grapheme(s: &str, gidx: usize) -> usize {
+    let mut it = s.grapheme_indices(true).map(|(b, _)| b).collect::<Vec<_>>();
+    it.push(s.len());
+    it.get(gidx).copied().unwrap_or(s.len())
 }
 
 // ---------- Main ----------
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg_path = config_path()?; let cfg = load_config(&cfg_path).unwrap_or_default();
-    let model = std::env::var("OLLAMA_MODEL").ok().or_else(|| cfg.model.clone()).unwrap_or_else(|| "llama3".to_string());
-    let api_url = std::env::var("OLLAMA_CHAT_URL").ok().or_else(|| cfg.api_url.clone()).unwrap_or_else(|| "http://localhost:11434/api/chat".to_string());
+    let cfg_path = config_path()?;
+    let cfg = load_config(&cfg_path).unwrap_or_default();
+    let model = std::env::var("OLLAMA_MODEL")
+        .ok()
+        .or_else(|| cfg.model.clone())
+        .unwrap_or_else(|| "llama3".to_string());
+    let api_url = std::env::var("OLLAMA_CHAT_URL")
+        .ok()
+        .or_else(|| cfg.api_url.clone())
+        .unwrap_or_else(|| "http://localhost:11434/api/chat".to_string());
     let options: Option<JsonValue> = cfg.options.as_ref().and_then(|t| serde_json::to_value(t).ok());
     let system_prompt = cfg.system_prompt.clone();
     let bold_selection = cfg.bold_selection.unwrap_or(false);
@@ -1012,23 +1316,31 @@ async fn main() -> Result<()> {
 
     let mut app = App::new(model, api_url, options, system_prompt, bold_selection, theme);
 
-    enable_raw_mode()?; let mut stdout = std::io::stdout(); execute!(stdout, EnterAlternateScreen)?; let backend = CrosstermBackend::new(stdout); let mut terminal = Terminal::new(backend)?;
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, SetCursorStyle::SteadyBar)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) = unbounded_channel();
 
     let tx_input = tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            if event::poll(Duration::from_millis(250)).unwrap_or(false) {
-                if let Ok(CEvent::Key(key)) = event::read() {
-                    let _ = tx_input.send(AppEvent::Input(key));
-                }
+    std::thread::spawn(move || loop {
+        if event::poll(Duration::from_millis(250)).unwrap_or(false) {
+            if let Ok(CEvent::Key(key)) = event::read() {
+                let _ = tx_input.send(AppEvent::Input(key));
             }
         }
     });
 
     let tx_tick = tx.clone();
-    tokio::spawn(async move { let mut interval = tokio::time::interval(Duration::from_millis(33)); loop { interval.tick().await; let _ = tx_tick.send(AppEvent::Tick); } });
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(33));
+        loop {
+            interval.tick().await;
+            let _ = tx_tick.send(AppEvent::Tick);
+        }
+    });
 
     loop {
         terminal.draw(|f| draw_ui(f, &mut app))?;
@@ -1036,10 +1348,15 @@ async fn main() -> Result<()> {
             match ev {
                 AppEvent::Tick => {}
                 AppEvent::Input(key) => handle_key(key, &mut app, &tx).await?,
-                AppEvent::OllamaChunk(delta) => { app.pending_assistant.push_str(&delta); },
+                AppEvent::OllamaChunk(delta) => {
+                    app.pending_assistant.push_str(&delta);
+                }
                 AppEvent::OllamaDone => {
                     let content = std::mem::take(&mut app.pending_assistant);
-                    app.messages.push(Message { role: Role::Assistant, content: content.clone() });
+                    app.messages.push(Message {
+                        role: Role::Assistant,
+                        content: content.clone(),
+                    });
                     persist_current_chat(&mut app)?;
                     app.sending = false;
                     if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
@@ -1047,19 +1364,34 @@ async fn main() -> Result<()> {
                     }
                 }
                 AppEvent::OllamaError(e) => {
-                    app.pending_assistant.clear(); app.sending = false; app.messages.push(Message { role: Role::System, content: format!("Error: {}", e) });
+                    app.pending_assistant.clear();
+                    app.sending = false;
+                    app.messages.push(Message {
+                        role: Role::System,
+                        content: format!("Error: {}", e),
+                    });
                 }
             }
         }
-        if app.quit { break; }
+        if app.quit {
+            break;
+        }
     }
 
-    disable_raw_mode()?; execute!(terminal.backend_mut(), LeaveAlternateScreen)?; terminal.show_cursor()?; Ok(())
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    let mut stdout2 = std::io::stdout();
+    execute!(stdout2, SetCursorStyle::DefaultUserShape)?;
+    terminal.show_cursor()?;
+    Ok(())
 }
 
 fn now_sec() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
@@ -1097,10 +1429,18 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.selected_msg = None;
     app.chat_scroll = 0;
     app.chat_inner_height = 0;
-    let chat = Chat { id: id.clone(), title: "Untitled chat".to_string(), created_ts: now, updated_ts: now, messages: Vec::new() };
+    let chat = Chat {
+        id: id.clone(),
+        title: "Untitled chat".to_string(),
+        created_ts: now,
+        updated_ts: now,
+        messages: Vec::new(),
+    };
     save_chat(&chat)?;
     app.chats = list_chats().unwrap_or_default();
-    if let Some(idx) = app.chats.iter().position(|c| c.id == id) { app.sidebar_idx = idx; }
+    if let Some(idx) = app.chats.iter().position(|c| c.id == id) {
+        app.sidebar_idx = idx;
+    }
     Ok(())
 }
 
@@ -1114,40 +1454,55 @@ fn persist_current_chat(app: &mut App) -> Result<()> {
     let id = app.current_chat_id.clone().unwrap();
     let created = app.current_created_ts.unwrap_or(now);
     let title = derive_title(&app.messages);
-    let chat = Chat { id: id.clone(), title, created_ts: created, updated_ts: now, messages: app.messages.clone() };
+    let chat = Chat {
+        id: id.clone(),
+        title,
+        created_ts: created,
+        updated_ts: now,
+        messages: app.messages.clone(),
+    };
     save_chat(&chat)?;
     app.chats = list_chats().unwrap_or_default();
-    if let Some(idx) = app.chats.iter().position(|c| c.id == id) { app.sidebar_idx = idx; }
+    if let Some(idx) = app.chats.iter().position(|c| c.id == id) {
+        app.sidebar_idx = idx;
+    }
     Ok(())
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) -> Result<()> {
     match &app.popup {
-        Popup::ConfirmDelete { id, .. } => {
-            match key.code {
-                KeyCode::Char('y') => {
-                    let del_id = id.clone();
-                    delete_chat_file(&del_id)?;
-                    if app.current_chat_id.as_deref() == Some(&del_id) {
-                        app.current_chat_id = None;
-                        app.current_created_ts = None;
-                        app.messages.clear();
-                        app.pending_assistant.clear();
-                        app.selected_msg = None;
-                        app.chat_scroll = 0;
-                    }
-                    app.popup = Popup::None;
-                    app.chats = list_chats().unwrap_or_default();
-                    if app.sidebar_idx >= app.chats.len() { app.sidebar_idx = app.chats.len().saturating_sub(1); }
-                    return Ok(());
+        Popup::ConfirmDelete { id, .. } => match key.code {
+            KeyCode::Char('y') => {
+                let del_id = id.clone();
+                delete_chat_file(&del_id)?;
+                if app.current_chat_id.as_deref() == Some(&del_id) {
+                    app.current_chat_id = None;
+                    app.current_created_ts = None;
+                    app.messages.clear();
+                    app.pending_assistant.clear();
+                    app.selected_msg = None;
+                    app.chat_scroll = 0;
                 }
-                KeyCode::Char('n') | KeyCode::Esc => { app.popup = Popup::None; return Ok(()); }
-                _ => { return Ok(()); }
+                app.popup = Popup::None;
+                app.chats = list_chats().unwrap_or_default();
+                if app.sidebar_idx >= app.chats.len() {
+                    app.sidebar_idx = app.chats.len().saturating_sub(1);
+                }
+                return Ok(());
             }
-        }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.popup = Popup::None;
+                return Ok(());
+            }
+            _ => {
+                return Ok(());
+            }
+        },
         Popup::Help => {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => { app.popup = Popup::None; }
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
+                    app.popup = Popup::None;
+                }
                 _ => {}
             }
             return Ok(());
@@ -1155,176 +1510,325 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
         Popup::None => {}
     }
 
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { app.quit = true; return Ok(()); }
-    if key.code == KeyCode::Char('q') && app.mode == Mode::Normal { app.quit = true; return Ok(()); }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.quit = true;
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('q') && app.mode == Mode::Normal {
+        app.quit = true;
+        return Ok(());
+    }
 
     match app.mode {
         Mode::Insert => match key.code {
-            KeyCode::Esc => { app.mode = Mode::Normal; }
+            KeyCode::Esc => {
+                app.mode = Mode::Normal;
+            }
             KeyCode::Enter => {
-                if app.sending { return Ok(()); }
-                let input = app.input.trim().to_string(); if input.is_empty() { return Ok(()); }
+                if app.sending {
+                    return Ok(());
+                }
+                let input = app.input.trim().to_string();
+                if input.is_empty() {
+                    return Ok(());
+                }
                 app.input.clear();
-                app.messages.push(Message { role: Role::User, content: input.clone() });
+                app.input_cursor = 0;
+                app.messages.push(Message {
+                    role: Role::User,
+                    content: input.clone(),
+                });
                 persist_current_chat(app)?;
                 app.sending = true;
                 let mut convo = app.messages.clone();
                 convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
                 if !convo.iter().any(|m| matches!(m.role, Role::System)) {
                     if let Some(sp) = app.system_prompt.clone() {
-                        convo.insert(0, Message { role: Role::System, content: sp });
+                        convo.insert(0, Message {
+                            role: Role::System,
+                            content: sp,
+                        });
                     }
                 }
-                let api_url = app.api_url.clone(); let model = app.model.clone(); let options = app.options.clone(); let tx2 = tx.clone();
+                let api_url = app.api_url.clone();
+                let model = app.model.clone();
+                let options = app.options.clone();
+                let tx2 = tx.clone();
                 tokio::spawn(async move { stream_ollama(api_url, model, options, convo, tx2).await; });
             }
-            KeyCode::Backspace => { app.input.pop(); }
-            KeyCode::Char(c) => { app.input.push(c); }
-            KeyCode::Tab => { app.input.push('\t'); }
-            KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
-            KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
+            KeyCode::Backspace => {
+                if app.input_cursor > 0 {
+                    let start = byte_index_from_grapheme(&app.input, app.input_cursor - 1);
+                    let end = byte_index_from_grapheme(&app.input, app.input_cursor);
+                    app.input.replace_range(start..end, "");
+                    app.input_cursor -= 1;
+                }
+            }
+            KeyCode::Left => {
+                if app.input_cursor > 0 {
+                    app.input_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                let gcount = app.input.graphemes(true).count();
+                if app.input_cursor < gcount {
+                    app.input_cursor += 1;
+                }
+            }
+            KeyCode::Char(c) => {
+                let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
+                app.input.insert(pos, c);
+                app.input_cursor += 1;
+            }
+            KeyCode::Tab => {
+                let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
+                app.input.insert(pos, '\t');
+                app.input_cursor += 1;
+            }
+            KeyCode::Up => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.chat_scroll = app.chat_scroll.saturating_add(1);
+            }
             _ => {}
         },
         Mode::Normal => {
-            if let KeyCode::Char('?') = key.code { app.popup = Popup::Help; return Ok(()); }
+            if let KeyCode::Char('?') = key.code {
+                app.popup = Popup::Help;
+                return Ok(());
+            }
 
             match key.code {
-                KeyCode::Char('h') => { app.focus = Focus::Sidebar; }
-                KeyCode::Char('l') => { app.focus = Focus::Chat; }
-                KeyCode::Char('v') => { if app.focus == Focus::Chat { app.mode = Mode::Visual; if app.selected_msg.is_none() { app.selected_msg = Some(app.messages.len().saturating_sub(1)); } } }
-                KeyCode::Char('i') => { if app.focus == Focus::Chat { app.mode = Mode::Insert; } }
-                KeyCode::Char('n') => { start_new_chat(app)?; }
+                KeyCode::Char('h') => {
+                    app.focus = Focus::Sidebar;
+                }
+                KeyCode::Char('l') => {
+                    app.focus = Focus::Chat;
+                }
+                KeyCode::Char('v') => {
+                    if app.focus == Focus::Chat {
+                        app.mode = Mode::Visual;
+                        if app.selected_msg.is_none() {
+                            app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                        }
+                    }
+                }
+                KeyCode::Char('i') => {
+                    if app.focus == Focus::Chat {
+                        app.mode = Mode::Insert;
+                        app.input_cursor = app.input.graphemes(true).count();
+                    }
+                }
+                KeyCode::Char('n') => {
+                    start_new_chat(app)?;
+                }
                 KeyCode::Char('d') => {
                     if app.focus == Focus::Sidebar && !app.chats.is_empty() {
                         let meta = &app.chats[app.sidebar_idx];
-                        app.popup = Popup::ConfirmDelete { id: meta.id.clone(), title: meta.title.clone() };
+                        app.popup = Popup::ConfirmDelete {
+                            id: meta.id.clone(),
+                            title: meta.title.clone(),
+                        };
                     }
                 }
                 KeyCode::Char('p') => {
                     if app.focus == Focus::Chat {
                         match read_clipboard_text().await {
-                            Ok(clip) => { app.input.push_str(&clip); }
-                            Err(e) => { app.messages.push(Message { role: Role::System, content: format!("Clipboard paste failed: {}", e) }); }
+                            Ok(clip) => {
+                                app.input.push_str(&clip);
+                                app.input_cursor = app.input.graphemes(true).count();
+                            }
+                            Err(e) => {
+                                app.messages.push(Message {
+                                    role: Role::System,
+                                    content: format!("Clipboard paste failed: {}", e),
+                                });
+                            }
                         }
                     }
                 }
-                KeyCode::Char('j') => {
-                    match app.focus {
-                        Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len()-1); } }
-                        Focus::Chat => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
+                KeyCode::Char('j') => match app.focus {
+                    Focus::Sidebar => {
+                        if !app.chats.is_empty() {
+                            app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len() - 1);
+                        }
                     }
-                }
-                KeyCode::Char('k') => {
-                    match app.focus {
-                        Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = app.sidebar_idx.saturating_sub(1); } }
-                        Focus::Chat => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
+                    Focus::Chat => {
+                        app.chat_scroll = app.chat_scroll.saturating_add(1);
                     }
-                }
+                },
+                KeyCode::Char('k') => match app.focus {
+                    Focus::Sidebar => {
+                        if !app.chats.is_empty() {
+                            app.sidebar_idx = app.sidebar_idx.saturating_sub(1);
+                        }
+                    }
+                    Focus::Chat => {
+                        app.chat_scroll = app.chat_scroll.saturating_sub(1);
+                    }
+                },
                 KeyCode::Char('g') => {
-                    if app.focus == Focus::Chat { app.chat_scroll = 0; }
+                    if app.focus == Focus::Chat {
+                        app.chat_scroll = 0;
+                    }
                 }
                 KeyCode::Char('G') => {
                     if app.focus == Focus::Chat {
-                        let total = content_total_height(&app.messages, if app.pending_assistant.is_empty() { None } else { Some(app.pending_assistant.as_str()) });
+                        let total = content_total_height(
+                            &app.messages,
+                            if app.pending_assistant.is_empty() {
+                                None
+                            } else {
+                                Some(app.pending_assistant.as_str())
+                            },
+                        );
                         app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                     }
                 }
-                KeyCode::Enter => {
-                    match app.focus {
-                        Focus::Sidebar => {
-                            if app.chats.is_empty() { return Ok(()); }
-                            let meta = &app.chats[app.sidebar_idx];
-                            if let Ok(chat) = load_chat(&meta.id) {
-                                app.current_chat_id = Some(chat.id.clone());
-                                app.current_created_ts = Some(chat.created_ts);
-                                app.messages = chat.messages;
-                                let total = content_total_height(&app.messages, None);
-                                app.chat_scroll = total.saturating_sub(app.chat_inner_height);
-                                app.focus = Focus::Chat;
-                            }
+                KeyCode::Enter => match app.focus {
+                    Focus::Sidebar => {
+                        if app.chats.is_empty() {
+                            return Ok(());
                         }
-                        Focus::Chat => {}
+                        let meta = &app.chats[app.sidebar_idx];
+                        if let Ok(chat) = load_chat(&meta.id) {
+                            app.current_chat_id = Some(chat.id.clone());
+                            app.current_created_ts = Some(chat.created_ts);
+                            app.messages = chat.messages;
+                            let total = content_total_height(&app.messages, None);
+                            app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+                            app.focus = Focus::Chat;
+                        }
                     }
+                    Focus::Chat => {}
+                },
+                KeyCode::Up => {
+                    app.chat_scroll = app.chat_scroll.saturating_sub(1);
                 }
-                KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
-                KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
+                KeyCode::Down => {
+                    app.chat_scroll = app.chat_scroll.saturating_add(1);
+                }
                 _ => {}
             }
         }
-        Mode::Visual => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('v') => { app.mode = Mode::Normal; }
-                KeyCode::Char('h') => { app.focus = Focus::Sidebar; }
-                KeyCode::Char('l') => { app.focus = Focus::Chat; }
-                KeyCode::Char('i') => { if app.focus == Focus::Chat { app.mode = Mode::Insert; } }
-                KeyCode::Char('y') => {
-                    if app.focus == Focus::Chat {
-                        if let Some(i) = app.selected_msg {
-                            if let Some(m) = app.messages.get(i) {
-                                if let Err(e) = write_clipboard_text(&m.content).await {
-                                    app.messages.push(Message { role: Role::System, content: format!("Clipboard copy failed: {}", e) });
+        Mode::Visual => match key.code {
+            KeyCode::Esc | KeyCode::Char('v') => {
+                app.mode = Mode::Normal;
+            }
+            KeyCode::Char('h') => {
+                app.focus = Focus::Sidebar;
+            }
+            KeyCode::Char('l') => {
+                app.focus = Focus::Chat;
+            }
+            KeyCode::Char('i') => {
+                if app.focus == Focus::Chat {
+                    app.mode = Mode::Insert;
+                    app.input_cursor = app.input.graphemes(true).count();
+                }
+            }
+            KeyCode::Char('y') => {
+                if app.focus == Focus::Chat {
+                    if let Some(i) = app.selected_msg {
+                        if let Some(m) = app.messages.get(i) {
+                            if let Err(e) = write_clipboard_text(&m.content).await {
+                                app.messages.push(Message {
+                                    role: Role::System,
+                                    content: format!("Clipboard copy failed: {}", e),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('j') => match app.focus {
+                Focus::Sidebar => {
+                    if !app.chats.is_empty() {
+                        app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len() - 1);
+                    }
+                }
+                Focus::Chat => {
+                    if app.messages.is_empty() {
+                        return Ok(());
+                    }
+                    let cur = app
+                        .selected_msg
+                        .unwrap_or_else(|| app.messages.len().saturating_sub(1));
+                    let next = (cur + 1).min(app.messages.len().saturating_sub(1));
+                    app.selected_msg = Some(next);
+                    let target_y = offset_for_message(&app.messages, next);
+                    let top = app.chat_scroll;
+                    let bottom = top.saturating_add(app.chat_inner_height.max(1));
+                    if target_y < top || target_y >= bottom {
+                        app.chat_scroll = target_y;
+                    }
+                }
+            },
+            KeyCode::Char('k') => match app.focus {
+                Focus::Sidebar => {
+                    if !app.chats.is_empty() {
+                        app.sidebar_idx = app.sidebar_idx.saturating_sub(1);
+                    }
+                }
+                Focus::Chat => {
+                    if app.messages.is_empty() {
+                        return Ok(());
+                    }
+                    let cur = app
+                        .selected_msg
+                        .unwrap_or_else(|| app.messages.len().saturating_sub(1));
+                    let next = cur.saturating_sub(1);
+                    app.selected_msg = Some(next);
+                    let target_y = offset_for_message(&app.messages, next);
+                    let top = app.chat_scroll;
+                    let bottom = top.saturating_add(app.chat_inner_height.max(1));
+                    if target_y < top || target_y >= bottom {
+                        app.chat_scroll = target_y;
+                    }
+                }
+            },
+            KeyCode::Enter => match app.focus {
+                Focus::Sidebar => {
+                    if app.chats.is_empty() {
+                        return Ok(());
+                    }
+                    let meta = &app.chats[app.sidebar_idx];
+                    if let Ok(chat) = load_chat(&meta.id) {
+                        app.current_chat_id = Some(chat.id.clone());
+                        app.current_created_ts = Some(chat.created_ts);
+                        app.messages = chat.messages;
+                        app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                        app.chat_scroll =
+                            offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));
+                        app.focus = Focus::Chat;
+                    }
+                }
+                Focus::Chat => {
+                    if let Some(i) = app.selected_msg {
+                        if let Some(m) = app.messages.get(i) {
+                            let tx2 = tx.clone();
+                            let content = m.content.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = preview_to_html(content).await {
+                                    let _ = tx2.send(AppEvent::OllamaError(format!(
+                                        "Preview error: {}",
+                                        e
+                                    )));
                                 }
-                            }
+                            });
                         }
                     }
                 }
-                KeyCode::Char('j') => {
-                    match app.focus {
-                        Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len()-1); } }
-                        Focus::Chat => {
-                            if app.messages.is_empty() { return Ok(()); }
-                            let cur = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
-                            let next = (cur + 1).min(app.messages.len().saturating_sub(1));
-                            app.selected_msg = Some(next);
-                            let target_y = offset_for_message(&app.messages, next);
-                            let top = app.chat_scroll;
-                            let bottom = top.saturating_add(app.chat_inner_height.max(1));
-                            if target_y < top || target_y >= bottom { app.chat_scroll = target_y; }
-                        }
-                    }
-                }
-                KeyCode::Char('k') => {
-                    match app.focus {
-                        Focus::Sidebar => { if !app.chats.is_empty() { app.sidebar_idx = app.sidebar_idx.saturating_sub(1); } }
-                        Focus::Chat => {
-                            if app.messages.is_empty() { return Ok(()); }
-                            let cur = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
-                            let next = cur.saturating_sub(1);
-                            app.selected_msg = Some(next);
-                            let target_y = offset_for_message(&app.messages, next);
-                            let top = app.chat_scroll;
-                            let bottom = top.saturating_add(app.chat_inner_height.max(1));
-                            if target_y < top || target_y >= bottom { app.chat_scroll = target_y; }
-                        }
-                    }
-                }
-                KeyCode::Enter => {
-                    match app.focus {
-                        Focus::Sidebar => {
-                            if app.chats.is_empty() { return Ok(()); }
-                            let meta = &app.chats[app.sidebar_idx];
-                            if let Ok(chat) = load_chat(&meta.id) {
-                                app.current_chat_id = Some(chat.id.clone());
-                                app.current_created_ts = Some(chat.created_ts);
-                                app.messages = chat.messages;
-                                app.selected_msg = Some(app.messages.len().saturating_sub(1));
-                                app.chat_scroll = offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));
-                                app.focus = Focus::Chat;
-                            }
-                        }
-                        Focus::Chat => {
-                            if let Some(i) = app.selected_msg { if let Some(m) = app.messages.get(i) {
-                                let tx2 = tx.clone(); let content = m.content.clone();
-                                tokio::spawn(async move { if let Err(e) = preview_to_html(content).await { let _ = tx2.send(AppEvent::OllamaError(format!("Preview error: {}", e))); } });
-                            }}
-                        }
-                    }
-                }
-                KeyCode::Up => { app.chat_scroll = app.chat_scroll.saturating_sub(1); }
-                KeyCode::Down => { app.chat_scroll = app.chat_scroll.saturating_add(1); }
-                _ => {}
+            },
+            KeyCode::Up => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(1);
             }
-        }
+            KeyCode::Down => {
+                app.chat_scroll = app.chat_scroll.saturating_add(1);
+            }
+            _ => {}
+        },
     }
     Ok(())
 }
