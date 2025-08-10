@@ -426,6 +426,7 @@ struct OllamaChatRequest<'a> {
     model: &'a str,
     messages: &'a [Message],
     stream: bool,
+    keep_alive: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<&'a JsonValue>,
 }
@@ -459,7 +460,8 @@ struct App {
 
     // UI/input
     input: String,
-    input_cursor: usize, // grapheme index
+    input_cursor: usize, // grapheme index (over entire input)
+    input_multiline: bool, // true when input contains '\n' -> 3 inner lines
     chat_scroll: u16,
     chat_inner_height: u16,
     sending: bool,
@@ -518,6 +520,7 @@ impl App {
             show_sidebar: true,
             input: String::new(),
             input_cursor: 0,
+            input_multiline: false,
             chat_scroll: 0,
             chat_inner_height: 0,
             sending: false,
@@ -564,6 +567,7 @@ async fn stream_ollama(
         model: &model,
         messages: &messages,
         stream: true,
+        keep_alive: "1h",
         options: options.as_ref(),
     };
     let client = reqwest::Client::new();
@@ -1167,6 +1171,17 @@ fn input_view(s: &str, cursor_gi: usize, maxw: usize) -> (String, usize) {
     (out, cursor_x)
 }
 
+// Given a cursor grapheme index over the whole string, return (line_idx, col_gi)
+fn cursor_line_col_from_gi(s: &str, cursor_gi: usize) -> (usize, usize) {
+    let bidx = byte_index_from_grapheme(s, cursor_gi);
+    let before = &s[..bidx];
+    let line_idx = before.chars().filter(|&c| c == '\n').count();
+    let last_nl = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col_slice = &before[last_nl..];
+    let col_gi = UnicodeSegmentation::graphemes(col_slice, true).count();
+    (line_idx, col_gi)
+}
+
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
     let constraints = if app.show_sidebar {
         [Constraint::Percentage(30), Constraint::Percentage(70)]
@@ -1316,7 +1331,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(
-                "  Type, Enter: send to Ollama, Esc: back to NORMAL",
+                "  Type; Enter: newline; Ctrl-S: send to Ollama; Esc: back to NORMAL",
             ));
             lines.push(Line::from(
                 "  ←/→: move cursor   Backspace: delete previous grapheme",
@@ -1376,9 +1391,11 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    // Input total height: borders + inner lines
+    let input_total_height = if app.input_multiline { 5 } else { 3 };
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(input_total_height)])
         .split(area);
 
     app.chat_inner_height = v_chunks[0].height.saturating_sub(2);
@@ -1541,7 +1558,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .scroll((app.chat_scroll, 0));
     frame.render_widget(messages, v_chunks[0]);
 
-    // Status/input bar (always shows current input contents)
+    // Status/input bar
     let help_hint = Span::styled(
         "— Press ? for help",
         Style::default().fg(app.theme.status_hint),
@@ -1561,7 +1578,6 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .fg(app.theme.mode_insert)
                     .add_modifier(Modifier::BOLD),
             ),
-            //help_hint.clone(),
         ]),
         Mode::Normal => {
             let base = if app.focus == Focus::Sidebar {
@@ -1604,35 +1620,78 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_visual)
                         .add_modifier(Modifier::BOLD),
                 ),
-                //help_hint,
             ])
         }
     };
 
-    // Horizontal scrolling input view to keep cursor visible
+    // Build input render (single-line or multiline)
     let input_inner_w = v_chunks[1].width.saturating_sub(2) as usize;
-    let (mut input_view_str, cursor_x) = input_view(&app.input, app.input_cursor, input_inner_w);
 
-    let style = if input_view_str.is_empty() && app.mode == Mode::Normal {
-        input_view_str = String::from("Press `i` to enter insert mode...");
-        Style::default().fg(Color::from_str("#484848").unwrap()) 
+    let (input_render, cursor_x_in_view, cursor_y_in_view) = if app.input_multiline {
+        // Show up to 3 inner lines, keeping the cursor line visible.
+        let (cur_line_idx, cur_col_gi) = cursor_line_col_from_gi(&app.input, app.input_cursor);
+        let lines: Vec<&str> = app.input.split('\n').collect();
+        let total_lines = lines.len();
+        // window of the last up to 3 lines ending at or including cursor line
+        let window_lines = 3usize;
+        let start_line = if cur_line_idx + 1 > window_lines {
+            cur_line_idx + 1 - window_lines
+        } else {
+            0
+        };
+        let end_line = cur_line_idx; // inclusive
+        let mut rendered_lines: Vec<String> = Vec::new();
+        let mut cursor_x = 0usize;
+        let mut cursor_y = end_line.saturating_sub(start_line);
+
+        for idx in start_line..=end_line {
+            let line = lines.get(idx).copied().unwrap_or("");
+            if idx == cur_line_idx {
+                let (vis, cx) = input_view(line, cur_col_gi, input_inner_w);
+                rendered_lines.push(vis);
+                cursor_x = cx;
+            } else {
+                // no horizontal scroll for non-cursor lines; just cut to width
+                let (vis, _) = input_view(line, 0, input_inner_w);
+                rendered_lines.push(vis);
+            }
+        }
+
+        let joined = rendered_lines.join("\n");
+        (joined, cursor_x, cursor_y as u16)
     } else {
-        Style::default()
+        let (mut input_view_str, cursor_x) = input_view(&app.input, app.input_cursor, input_inner_w);
+        // Placeholder when empty in NORMAL mode
+        if input_view_str.is_empty() && app.mode == Mode::Normal {
+            input_view_str = String::from("Press `i` to enter insert mode...");
+            let input = Paragraph::new(input_view_str.clone())
+                .style(Style::default().fg(Color::from_str("#484848").unwrap()))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(app.theme.border_input))
+                        .title(input_title_line),
+                );
+            frame.render_widget(input, v_chunks[1]);
+            // Cursor not shown in NORMAL anyway
+            return;
+        }
+        (input_view_str, cursor_x, 0u16)
     };
 
-    let input = Paragraph::new(input_view_str.clone())
-        .style(style)
-        .block(
+    let input_para = Paragraph::new(input_render.clone()).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border_input))
             .title(input_title_line),
     );
-    frame.render_widget(input, v_chunks[1]);
+    frame.render_widget(input_para, v_chunks[1]);
 
-    // Cursor (thin bar) only in INSERT mode within chat focus
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
-        frame.set_cursor(v_chunks[1].x + 1 + cursor_x as u16, v_chunks[1].y + 1);
+        frame.set_cursor(
+            v_chunks[1].x + 1 + cursor_x_in_view as u16,
+            v_chunks[1].y + 1 + cursor_y_in_view,
+        );
     }
 }
 
@@ -1939,41 +1998,64 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
             }
-            KeyCode::Enter => {
-                if app.sending {
-                    return Ok(());
-                }
-                let input = app.input.trim().to_string();
-                if input.is_empty() {
-                    return Ok(());
-                }
-                app.input.clear();
-                app.input_cursor = 0;
-                app.messages.push(Message {
-                    role: Role::User,
-                    content: input.clone(),
-                });
-                app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
-                persist_current_chat(app)?;
-                app.sending = true;
-                let mut convo = app.messages.clone();
-                convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
-                if !convo.iter().any(|m| matches!(m.role, Role::System)) {
-                    if let Some(sp) = app.system_prompt.clone() {
-                        convo.insert(
-                            0,
-                            Message {
-                                role: Role::System,
-                                content: sp,
-                            },
-                        );
+            KeyCode::Char('s') => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if app.sending {
+                        return Ok(());
                     }
+                    let input = app.input.trim().to_string();
+                    if input.is_empty() {
+                        // clear any whitespace/newlines
+                        app.input.clear();
+                        app.input_cursor = 0;
+                        app.input_multiline = false;
+                        return Ok(());
+                    }
+                    app.input.clear();
+                    app.input_cursor = 0;
+                    app.input_multiline = false;
+                    app.messages.push(Message {
+                        role: Role::User,
+                        content: input.clone(),
+                    });
+                    app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
+                    persist_current_chat(app)?;
+                    app.sending = true;
+                    let mut convo = app.messages.clone();
+                    convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
+                    if !convo.iter().any(|m| matches!(m.role, Role::System)) {
+                        if let Some(sp) = app.system_prompt.clone() {
+                            convo.insert(
+                                0,
+                                Message {
+                                    role: Role::System,
+                                    content: sp,
+                                },
+                            );
+                        }
+                    }
+                    let api_url = app.api_url.clone();
+                    let model = app.model.clone();
+                    let options = app.options.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move { stream_ollama(api_url, model, options, convo, tx2).await; });
+                } else {
+                    let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
+                    app.input.insert(pos, 's');
+                    app.input_cursor += 1;
+                    app.input_multiline = app.input.contains('\n');
                 }
-                let api_url = app.api_url.clone();
-                let model = app.model.clone();
-                let options = app.options.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move { stream_ollama(api_url, model, options, convo, tx2).await; });
+            }
+            KeyCode::Enter => {
+                // Shift+Enter sends; Enter inserts newline and expands box
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                } else {
+                    // Insert newline at cursor
+                    let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
+                    app.input.insert(pos, '\n');
+                    app.input_cursor += 1;
+                    app.input_multiline = true;
+                }
             }
             KeyCode::Backspace => {
                 if app.input_cursor > 0 {
@@ -1981,6 +2063,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     let end = byte_index_from_grapheme(&app.input, app.input_cursor);
                     app.input.replace_range(start..end, "");
                     app.input_cursor -= 1;
+                    app.input_multiline = app.input.contains('\n');
                 }
             }
             KeyCode::Left => {
@@ -1998,11 +2081,13 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
                 app.input.insert(pos, c);
                 app.input_cursor += 1;
+                app.input_multiline = app.input.contains('\n');
             }
             KeyCode::Tab => {
                 let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
                 app.input.insert(pos, '\t');
                 app.input_cursor += 1;
+                app.input_multiline = app.input.contains('\n');
             }
             KeyCode::Up => {
                 app.chat_scroll = app.chat_scroll.saturating_sub(1);
@@ -2039,6 +2124,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     if app.focus == Focus::Chat {
                         app.mode = Mode::Insert;
                         app.input_cursor = app.input.graphemes(true).count();
+                        app.input_multiline = app.input.contains('\n');
                     }
                 }
                 KeyCode::Char('n') => {
@@ -2059,6 +2145,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                             Ok(clip) => {
                                 app.input.push_str(&clip);
                                 app.input_cursor = app.input.graphemes(true).count();
+                                app.input_multiline = app.input.contains('\n');
                             }
                             Err(e) => {
                                 app.messages.push(Message {
@@ -2151,6 +2238,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 if app.focus == Focus::Chat {
                     app.mode = Mode::Insert;
                     app.input_cursor = app.input.graphemes(true).count();
+                    app.input_multiline = app.input.contains('\n');
                 }
             }
             KeyCode::Char('y') => {
