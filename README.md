@@ -15,6 +15,13 @@ Finally, a minimalist yet competent Ollama interface.
 
 ![Preview 3](media/preview3.png)
 
+## No LaTeX on the terminal? No problem
+
+Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, select a message, and press `Enter`.
+
+![Preview 2](media/preview2.png)
+
+
 ## Requirements
 
 * Rust toolchain
@@ -55,12 +62,6 @@ Config file path (XDG):
 Precedence: environment variables > config file > built-ins.
 
 All keys under `[options]` are forwarded to Ollama's `options` field.
-
-## No LaTeX on the terminal? No problem
-
-Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, select a message, and press `Enter`.
-
-![Preview 2](media/preview2.png)
 
 ## Limitations (for now)
 
