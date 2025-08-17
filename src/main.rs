@@ -426,7 +426,6 @@ struct OllamaChatRequest<'a> {
     model: &'a str,
     messages: &'a [Message],
     stream: bool,
-    keep_alive: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<&'a JsonValue>,
 }
@@ -460,8 +459,8 @@ struct App {
 
     // UI/input
     input: String,
-    input_cursor: usize, // grapheme index (over entire input)
-    input_multiline: bool, // true when input contains '\n' -> 3 inner lines
+    input_cursor: usize,      // grapheme index
+    input_col_goal: Option<usize>, // desired column when moving up/down
     chat_scroll: u16,
     chat_inner_height: u16,
     sending: bool,
@@ -520,7 +519,7 @@ impl App {
             show_sidebar: true,
             input: String::new(),
             input_cursor: 0,
-            input_multiline: false,
+            input_col_goal: None,
             chat_scroll: 0,
             chat_inner_height: 0,
             sending: false,
@@ -567,7 +566,6 @@ async fn stream_ollama(
         model: &model,
         messages: &messages,
         stream: true,
-        keep_alive: "1h",
         options: options.as_ref(),
     };
     let client = reqwest::Client::new();
@@ -1132,54 +1130,94 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     h[1]
 }
 
-// Compute a horizontally-scrolled input view so the cursor stays visible.
-// Returns (render_string, cursor_x_in_view).
-fn input_view(s: &str, cursor_gi: usize, maxw: usize) -> (String, usize) {
-    let maxw = maxw.max(1);
-    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(s, true).collect();
-    let widths: Vec<usize> = graphemes.iter().map(|g| UnicodeWidthStr::width(*g)).collect();
-
-    // Total width up to cursor
-    let mut w_to_cursor = 0usize;
-    for i in 0..cursor_gi.min(widths.len()) {
-        w_to_cursor += widths[i];
-    }
-
-    // Find start so that width(start..cursor) <= maxw
-    let mut start = 0usize;
-    let mut w_from_start_to_cursor = w_to_cursor;
-    while w_from_start_to_cursor > maxw {
-        w_from_start_to_cursor = w_from_start_to_cursor.saturating_sub(widths[start]);
-        start += 1;
-    }
-
-    // Build visible window up to maxw and compute used width
-    let mut out = String::new();
-    let mut used = 0usize;
-    for i in start..graphemes.len() {
-        let w = widths[i];
-        if used + w > maxw {
+// visual width of input up to grapheme index
+fn input_visual_x(s: &str, gidx: usize) -> usize {
+    let mut w = 0usize;
+    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
+        if i >= gidx {
             break;
         }
-        out.push_str(graphemes[i]);
-        used += w;
+        if g == "\n" {
+            w = 0;
+        } else {
+            w += UnicodeWidthStr::width(g);
+        }
     }
-
-    // Cursor position should be exactly the width from start to cursor, capped by used
-    let cursor_x = w_from_start_to_cursor.min(used);
-
-    (out, cursor_x)
+    w
 }
 
-// Given a cursor grapheme index over the whole string, return (line_idx, col_gi)
-fn cursor_line_col_from_gi(s: &str, cursor_gi: usize) -> (usize, usize) {
-    let bidx = byte_index_from_grapheme(s, cursor_gi);
-    let before = &s[..bidx];
-    let line_idx = before.chars().filter(|&c| c == '\n').count();
-    let last_nl = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let col_slice = &before[last_nl..];
-    let col_gi = UnicodeSegmentation::graphemes(col_slice, true).count();
-    (line_idx, col_gi)
+// byte index of grapheme boundary
+fn byte_index_from_grapheme(s: &str, gidx: usize) -> usize {
+    let mut it = s.grapheme_indices(true).map(|(b, _)| b).collect::<Vec<_>>();
+    it.push(s.len());
+    it.get(gidx).copied().unwrap_or(s.len())
+}
+
+// line/col from grapheme index
+fn lc_from_gi(s: &str, gi: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
+        if i == gi {
+            break;
+        }
+        if g == "\n" {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+// grapheme index from (line, col) clamped to line length
+fn gi_from_lc(s: &str, line: usize, col: usize) -> usize {
+    let mut cur_line = 0usize;
+    let mut cur_col = 0usize;
+    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
+        if cur_line == line && cur_col == col {
+            return i;
+        }
+        if g == "\n" {
+            if cur_line == line {
+                return i; // end of requested line
+            }
+            cur_line += 1;
+            cur_col = 0;
+            if cur_line > line {
+                return i;
+            }
+        } else {
+            if cur_line == line && cur_col == col {
+                return i;
+            }
+            cur_col += 1;
+        }
+    }
+    // end of string
+    s.graphemes(true).count()
+}
+
+// compute line length (in graphemes)
+fn line_len(s: &str, line: usize) -> usize {
+    let mut cur_line = 0usize;
+    let mut len = 0usize;
+    for g in UnicodeSegmentation::graphemes(s, true) {
+        if cur_line == line {
+            if g == "\n" {
+                break;
+            }
+            len += 1;
+        }
+        if g == "\n" {
+            cur_line += 1;
+            if cur_line > line {
+                break;
+            }
+        }
+    }
+    len
 }
 
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
@@ -1331,10 +1369,10 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(
-                "  Type; Enter: newline; Ctrl-S: send to Ollama; Esc: back to NORMAL",
+                "  Type. Enter: newline. Ctrl+S: send to Ollama. Esc: back to NORMAL",
             ));
             lines.push(Line::from(
-                "  ←/→: move cursor   Backspace: delete previous grapheme",
+                "  ←/→: move cursor   ↑/↓: move line   Backspace: delete previous grapheme",
             ));
             lines.push(Line::from(""));
 
@@ -1391,11 +1429,13 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    // Input total height: borders + inner lines
-    let input_total_height = if app.input_multiline { 5 } else { 3 };
+    // Dynamic input height: 1 line when single-line, 3 lines when multiline
+    let input_inner_lines = if app.input.contains('\n') { 3 } else { 1 };
+    let input_block_height = (input_inner_lines as u16) + 2; // +2 for borders
+
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(input_total_height)])
+        .constraints([Constraint::Min(3), Constraint::Length(input_block_height)])
         .split(area);
 
     app.chat_inner_height = v_chunks[0].height.saturating_sub(2);
@@ -1558,7 +1598,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .scroll((app.chat_scroll, 0));
     frame.render_widget(messages, v_chunks[0]);
 
-    // Status/input bar
+    // Status/input bar — always show current input; dynamic height; keep cursor visible vertically
     let help_hint = Span::styled(
         "— Press ? for help",
         Style::default().fg(app.theme.status_hint),
@@ -1578,6 +1618,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .fg(app.theme.mode_insert)
                     .add_modifier(Modifier::BOLD),
             ),
+            help_hint.clone(),
         ]),
         Mode::Normal => {
             let base = if app.focus == Focus::Sidebar {
@@ -1620,98 +1661,85 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_visual)
                         .add_modifier(Modifier::BOLD),
                 ),
+                help_hint,
             ])
         }
     };
 
-    // Build input render (single-line or multiline)
-    let input_inner_w = v_chunks[1].width.saturating_sub(2) as usize;
+    // Decide which slice of input to show (last N lines to keep cursor visible)
+    let total_lines: usize = app.input.split('\n').count();
+    let (cur_line, cur_col) = lc_from_gi(&app.input, app.input_cursor);
 
-    let (input_render, cursor_x_in_view, cursor_y_in_view) = if app.input_multiline {
-        // Show up to 3 inner lines, keeping the cursor line visible.
-        let (cur_line_idx, cur_col_gi) = cursor_line_col_from_gi(&app.input, app.input_cursor);
-        let lines: Vec<&str> = app.input.split('\n').collect();
-        let total_lines = lines.len();
-        // window of the last up to 3 lines ending at or including cursor line
-        let window_lines = 3usize;
-        let start_line = if cur_line_idx + 1 > window_lines {
-            cur_line_idx + 1 - window_lines
-        } else {
-            0
-        };
-        let end_line = cur_line_idx; // inclusive
-        let mut rendered_lines: Vec<String> = Vec::new();
-        let mut cursor_x = 0usize;
-        let mut cursor_y = end_line.saturating_sub(start_line);
-
-        for idx in start_line..=end_line {
-            let line = lines.get(idx).copied().unwrap_or("");
-            if idx == cur_line_idx {
-                let (vis, cx) = input_view(line, cur_col_gi, input_inner_w);
-                rendered_lines.push(vis);
-                cursor_x = cx;
-            } else {
-                // no horizontal scroll for non-cursor lines; just cut to width
-                let (vis, _) = input_view(line, 0, input_inner_w);
-                rendered_lines.push(vis);
-            }
-        }
-
-        let joined = rendered_lines.join("\n");
-        (joined, cursor_x, cursor_y as u16)
+    let visible_lines = input_inner_lines as usize;
+    let start_line = if total_lines > visible_lines {
+        // try to keep the cursor on the last visible line
+        total_lines.saturating_sub(visible_lines)
     } else {
-        let (mut input_view_str, cursor_x) = input_view(&app.input, app.input_cursor, input_inner_w);
-        // Placeholder when empty in NORMAL mode
-        if input_view_str.is_empty() && app.mode == Mode::Normal {
-            input_view_str = String::from("Press `i` to enter insert mode...");
-            let input = Paragraph::new(input_view_str.clone())
-                .style(Style::default().fg(Color::from_str("#484848").unwrap()))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(app.theme.border_input))
-                        .title(input_title_line),
-                );
-            frame.render_widget(input, v_chunks[1]);
-            // Cursor not shown in NORMAL anyway
-            return;
+        0
+    };
+    let rel_cursor_line = cur_line.saturating_sub(start_line).min(visible_lines.saturating_sub(1));
+
+    // Build the view string of the last visible_lines lines
+    let mut view_lines: Vec<&str> = Vec::new();
+    let mut line_idx = 0usize;
+    for line in app.input.split('\n') {
+        if line_idx >= start_line && view_lines.len() < visible_lines {
+            view_lines.push(line);
         }
-        (input_view_str, cursor_x, 0u16)
+        line_idx += 1;
+    }
+    // Join with newlines (if no lines, keep empty)
+    let input_view_str = if view_lines.is_empty() {
+        String::new()
+    } else {
+        view_lines.join("\n")
     };
 
-    let input_para = Paragraph::new(input_render.clone()).block(
+    // Render input block
+    let input_para = Paragraph::new(input_view_str.clone()).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border_input))
             .title(input_title_line),
-    );
+    )
+    .wrap(Wrap { trim: false })
+    // Scroll to show the window starting at start_line
+    .scroll((start_line as u16, 0));
     frame.render_widget(input_para, v_chunks[1]);
 
+    // Cursor (thin bar) only in INSERT mode within chat focus
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
-        frame.set_cursor(
-            v_chunks[1].x + 1 + cursor_x_in_view as u16,
-            v_chunks[1].y + 1 + cursor_y_in_view,
-        );
-    }
-}
+        // Visual x based on current line segment
+        // Compute width from beginning of current line to cursor
+        let vis_x = {
+            // get the substring of current line up to cur_col (graphemes)
+            let mut w = 0usize;
+            let mut l = 0usize;
+            let mut c = 0usize;
+            for g in UnicodeSegmentation::graphemes(app.input.as_str(), true) {
+                if l == cur_line {
+                    if c >= cur_col {
+                        break;
+                    }
+                    if g == "\n" {
+                        break;
+                    }
+                    w += UnicodeWidthStr::width(g);
+                    c += 1;
+                } else if g == "\n" {
+                    l += 1;
+                }
+            }
+            w
+        };
 
-// visual width of input up to grapheme index
-fn input_visual_x(s: &str, gidx: usize) -> usize {
-    let mut w = 0usize;
-    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
-        if i >= gidx {
-            break;
-        }
-        w += UnicodeWidthStr::width(g);
-    }
-    w
-}
+        // Cursor Y inside the input box (+1 for top border, +rel line)
+        let cursor_y = v_chunks[1].y + 1 + (rel_cursor_line as u16);
+        // Cursor X (+1 for left border, +visual width)
+        let cursor_x = v_chunks[1].x + 1 + (vis_x as u16);
 
-// byte index of grapheme boundary
-fn byte_index_from_grapheme(s: &str, gidx: usize) -> usize {
-    let mut it = s.grapheme_indices(true).map(|(b, _)| b).collect::<Vec<_>>();
-    it.push(s.len());
-    it.get(gidx).copied().unwrap_or(s.len())
+        frame.set_cursor(cursor_x, cursor_y);
+    }
 }
 
 // ---------- Main ----------
@@ -1782,7 +1810,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Initial draw once (no idle redraw loop)
+    // Initial draw
     terminal.draw(|f| draw_ui(f, &mut app))?;
     app.last_draw = Instant::now();
 
@@ -1997,65 +2025,54 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
         Mode::Insert => match key.code {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
+                app.input_col_goal = None;
             }
-            KeyCode::Char('s') => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    if app.sending {
-                        return Ok(());
-                    }
-                    let input = app.input.trim().to_string();
-                    if input.is_empty() {
-                        // clear any whitespace/newlines
-                        app.input.clear();
-                        app.input_cursor = 0;
-                        app.input_multiline = false;
-                        return Ok(());
-                    }
-                    app.input.clear();
-                    app.input_cursor = 0;
-                    app.input_multiline = false;
-                    app.messages.push(Message {
-                        role: Role::User,
-                        content: input.clone(),
-                    });
-                    app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
-                    persist_current_chat(app)?;
-                    app.sending = true;
-                    let mut convo = app.messages.clone();
-                    convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
-                    if !convo.iter().any(|m| matches!(m.role, Role::System)) {
-                        if let Some(sp) = app.system_prompt.clone() {
-                            convo.insert(
-                                0,
-                                Message {
-                                    role: Role::System,
-                                    content: sp,
-                                },
-                            );
-                        }
-                    }
-                    let api_url = app.api_url.clone();
-                    let model = app.model.clone();
-                    let options = app.options.clone();
-                    let tx2 = tx.clone();
-                    tokio::spawn(async move { stream_ollama(api_url, model, options, convo, tx2).await; });
-                } else {
-                    let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
-                    app.input.insert(pos, 's');
-                    app.input_cursor += 1;
-                    app.input_multiline = app.input.contains('\n');
+            // Ctrl+S sends the message (Enter inserts newline)
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.sending {
+                    return Ok(());
                 }
+                let input = app.input.trim().to_string();
+                if input.is_empty() {
+                    return Ok(());
+                }
+                app.input.clear();
+                app.input_cursor = 0;
+                app.input_col_goal = None;
+                app.messages.push(Message {
+                    role: Role::User,
+                    content: input.clone(),
+                });
+                app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
+                persist_current_chat(app)?;
+                app.sending = true;
+                let mut convo = app.messages.clone();
+                convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
+                if !convo.iter().any(|m| matches!(m.role, Role::System)) {
+                    if let Some(sp) = app.system_prompt.clone() {
+                        convo.insert(
+                            0,
+                            Message {
+                                role: Role::System,
+                                content: sp,
+                            },
+                        );
+                    }
+                }
+                let api_url = app.api_url.clone();
+                let model = app.model.clone();
+                let options = app.options.clone();
+                let tx2 = tx.clone();
+                tokio::spawn(async move { stream_ollama(api_url, model, options, convo, tx2).await; });
             }
+            // Enter inserts newline (multiline)
             KeyCode::Enter => {
-                // Shift+Enter sends; Enter inserts newline and expands box
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                } else {
-                    // Insert newline at cursor
-                    let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
-                    app.input.insert(pos, '\n');
-                    app.input_cursor += 1;
-                    app.input_multiline = true;
-                }
+                let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
+                app.input.insert(pos, '\n');
+                app.input_cursor += 1;
+                // keep desired column on the next line
+                let (_, col) = lc_from_gi(&app.input, app.input_cursor);
+                app.input_col_goal = Some(col);
             }
             KeyCode::Backspace => {
                 if app.input_cursor > 0 {
@@ -2063,38 +2080,56 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     let end = byte_index_from_grapheme(&app.input, app.input_cursor);
                     app.input.replace_range(start..end, "");
                     app.input_cursor -= 1;
-                    app.input_multiline = app.input.contains('\n');
+                    app.input_col_goal = None;
                 }
             }
             KeyCode::Left => {
                 if app.input_cursor > 0 {
                     app.input_cursor -= 1;
                 }
+                app.input_col_goal = None;
             }
             KeyCode::Right => {
                 let gcount = app.input.graphemes(true).count();
                 if app.input_cursor < gcount {
                     app.input_cursor += 1;
                 }
+                app.input_col_goal = None;
+            }
+            KeyCode::Up => {
+                let (line, col) = lc_from_gi(&app.input, app.input_cursor);
+                if line > 0 {
+                    let want_col = app.input_col_goal.unwrap_or(col);
+                    let prev_len = line_len(&app.input, line - 1);
+                    let new_col = want_col.min(prev_len);
+                    app.input_cursor = gi_from_lc(&app.input, line - 1, new_col);
+                    app.input_col_goal = Some(want_col);
+                }
+            }
+            KeyCode::Down => {
+                let (line, col) = lc_from_gi(&app.input, app.input_cursor);
+                let total_lines = app.input.split('\n').count();
+                if line + 1 < total_lines {
+                    let want_col = app.input_col_goal.unwrap_or(col);
+                    let next_len = line_len(&app.input, line + 1);
+                    let new_col = want_col.min(next_len);
+                    app.input_cursor = gi_from_lc(&app.input, line + 1, new_col);
+                    app.input_col_goal = Some(want_col);
+                }
             }
             KeyCode::Char(c) => {
                 let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
                 app.input.insert(pos, c);
                 app.input_cursor += 1;
-                app.input_multiline = app.input.contains('\n');
+                app.input_col_goal = None;
             }
             KeyCode::Tab => {
                 let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
-                app.input.insert(pos, '\t');
-                app.input_cursor += 1;
-                app.input_multiline = app.input.contains('\n');
+                app.input.insert_str(pos, "    ");
+                app.input_cursor += 4;
+                app.input_col_goal = None;
             }
-            KeyCode::Up => {
-                app.chat_scroll = app.chat_scroll.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                app.chat_scroll = app.chat_scroll.saturating_add(1);
-            }
+            // In INSERT, arrow keys no longer scroll chat
             _ => {}
         },
         Mode::Normal => {
@@ -2124,7 +2159,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     if app.focus == Focus::Chat {
                         app.mode = Mode::Insert;
                         app.input_cursor = app.input.graphemes(true).count();
-                        app.input_multiline = app.input.contains('\n');
+                        app.input_col_goal = None;
                     }
                 }
                 KeyCode::Char('n') => {
@@ -2145,7 +2180,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                             Ok(clip) => {
                                 app.input.push_str(&clip);
                                 app.input_cursor = app.input.graphemes(true).count();
-                                app.input_multiline = app.input.contains('\n');
+                                app.input_col_goal = None;
                             }
                             Err(e) => {
                                 app.messages.push(Message {
@@ -2238,7 +2273,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 if app.focus == Focus::Chat {
                     app.mode = Mode::Insert;
                     app.input_cursor = app.input.graphemes(true).count();
-                    app.input_multiline = app.input.contains('\n');
+                    app.input_col_goal = None;
                 }
             }
             KeyCode::Char('y') => {
