@@ -648,7 +648,7 @@ async fn preview_to_html(content: String) -> Result<()> {
     let base = std::env::temp_dir();
     let stamp = now_sec();
     let in_path = base.join(format!("tuillama_{}_input.md", stamp));
-    let out_path = base.join(format!("tuillama_{}_output.html", stamp));
+    let out_path = base.join(format!("tuillama_{}_output.pdf", stamp));
     tokio::fs::write(&in_path, sanitized).await?;
     let status = Command::new("pandoc")
         .arg(&in_path)
@@ -656,8 +656,7 @@ async fn preview_to_html(content: String) -> Result<()> {
         .arg("--from")
         .arg("markdown")
         .arg("--to")
-        .arg("html")
-        .arg("--mathjax")
+        .arg("pdf")
         .arg("-o")
         .arg(&out_path)
         .status()
@@ -665,7 +664,7 @@ async fn preview_to_html(content: String) -> Result<()> {
     if !status.success() {
         return Err(anyhow!("pandoc failed"));
     }
-    let _ = Command::new("xdg-open")
+    let _ = Command::new("zathura")
         .arg(&out_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
