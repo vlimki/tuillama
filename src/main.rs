@@ -308,6 +308,12 @@ struct Performance {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PreviewCfg {
+    preview_fmt: Option<String>,   // "html" or "pdf"
+    preview_open: Option<String>,  // e.g. "zathura", default xdg-open
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct AppConfig {
     model: Option<String>,
     api_url: Option<String>,
@@ -318,6 +324,7 @@ struct AppConfig {
     syntax: Option<SyntaxSection>,
     syntax_theme: Option<String>, // legacy
     performance: Option<Performance>,
+    preview: Option<PreviewCfg>,
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -459,8 +466,9 @@ struct App {
 
     // UI/input
     input: String,
-    input_cursor: usize,      // grapheme index
-    input_col_goal: Option<usize>, // desired column when moving up/down
+    input_cursor_line: usize, // line index in input
+    input_cursor_col: usize,  // grapheme index in current line
+    input_top_line: usize,    // first visible line in input viewport
     chat_scroll: u16,
     chat_inner_height: u16,
     sending: bool,
@@ -475,6 +483,10 @@ struct App {
     focus: Focus,
     selected_msg: Option<usize>,
     popup: Popup,
+
+    // preview cfg
+    preview_fmt: String,    // "html" | "pdf"
+    preview_open: String,   // program to open
 
     // syntect
     syntax_enabled: bool,
@@ -502,6 +514,8 @@ impl App {
         syntax_theme_name: String,
         syntax_custom: Option<toml::value::Table>,
         stream_throttle: Duration,
+        preview_fmt: String,
+        preview_open: String,
     ) -> Self {
         let chats = list_chats().unwrap_or_default();
 
@@ -518,8 +532,9 @@ impl App {
             sidebar_idx: 0,
             show_sidebar: true,
             input: String::new(),
-            input_cursor: 0,
-            input_col_goal: None,
+            input_cursor_line: 0,
+            input_cursor_col: 0,
+            input_top_line: 0,
             chat_scroll: 0,
             chat_inner_height: 0,
             sending: false,
@@ -534,6 +549,8 @@ impl App {
             focus: Focus::Chat,
             selected_msg: None,
             popup: Popup::None,
+            preview_fmt,
+            preview_open,
             syntax_enabled,
             syn_ss,
             syn_theme,
@@ -643,28 +660,31 @@ fn sanitize_for_html(input: &str) -> String {
     out
 }
 
-async fn preview_to_html(content: String) -> Result<()> {
+async fn preview_to_html_or_pdf(content: String, fmt: &str, opener: &str) -> Result<()> {
     let sanitized = sanitize_for_html(&content);
     let base = std::env::temp_dir();
     let stamp = now_sec();
     let in_path = base.join(format!("tuillama_{}_input.md", stamp));
-    let out_path = base.join(format!("tuillama_{}_output.pdf", stamp));
+    let out_path = match fmt {
+        "pdf" => base.join(format!("tuillama_{}_output.pdf", stamp)),
+        _ => base.join(format!("tuillama_{}_output.html", stamp)),
+    };
     tokio::fs::write(&in_path, sanitized).await?;
-    let status = Command::new("pandoc")
-        .arg(&in_path)
-        .arg("-s")
-        .arg("--from")
-        .arg("markdown")
-        .arg("--to")
-        .arg("pdf")
-        .arg("-o")
-        .arg(&out_path)
-        .status()
-        .await?;
+    let mut cmd = Command::new("pandoc");
+    cmd.arg(&in_path).arg("-s").arg("--from").arg("markdown");
+    match fmt {
+        "pdf" => {
+            cmd.arg("-o").arg(&out_path);
+        }
+        _ => {
+            cmd.arg("--to").arg("html").arg("--mathjax").arg("-o").arg(&out_path);
+        }
+    }
+    let status = cmd.status().await?;
     if !status.success() {
         return Err(anyhow!("pandoc failed"));
     }
-    let _ = Command::new("zathura")
+    let _ = Command::new(opener)
         .arg(&out_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1129,94 +1149,37 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     h[1]
 }
 
-// visual width of input up to grapheme index
-fn input_visual_x(s: &str, gidx: usize) -> usize {
-    let mut w = 0usize;
-    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
-        if i >= gidx {
+// Visible substring and cursor x for a line with horizontal scrolling
+fn line_view(s: &str, col_gi: usize, maxw: usize) -> (String, usize) {
+    let maxw = maxw.max(1);
+    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(s, true).collect();
+    let widths: Vec<usize> = graphemes.iter().map(|g| UnicodeWidthStr::width(*g)).collect();
+
+    let mut w_to_cursor = 0usize;
+    for i in 0..col_gi.min(widths.len()) {
+        w_to_cursor += widths[i];
+    }
+
+    let mut start = 0usize;
+    let mut w_from_start_to_cursor = w_to_cursor;
+    while w_from_start_to_cursor > maxw {
+        w_from_start_to_cursor = w_from_start_to_cursor.saturating_sub(widths[start]);
+        start += 1;
+    }
+
+    let mut out = String::new();
+    let mut used = 0usize;
+    for i in start..graphemes.len() {
+        let w = widths[i];
+        if used + w > maxw {
             break;
         }
-        if g == "\n" {
-            w = 0;
-        } else {
-            w += UnicodeWidthStr::width(g);
-        }
+        out.push_str(graphemes[i]);
+        used += w;
     }
-    w
-}
 
-// byte index of grapheme boundary
-fn byte_index_from_grapheme(s: &str, gidx: usize) -> usize {
-    let mut it = s.grapheme_indices(true).map(|(b, _)| b).collect::<Vec<_>>();
-    it.push(s.len());
-    it.get(gidx).copied().unwrap_or(s.len())
-}
-
-// line/col from grapheme index
-fn lc_from_gi(s: &str, gi: usize) -> (usize, usize) {
-    let mut line = 0usize;
-    let mut col = 0usize;
-    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
-        if i == gi {
-            break;
-        }
-        if g == "\n" {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-// grapheme index from (line, col) clamped to line length
-fn gi_from_lc(s: &str, line: usize, col: usize) -> usize {
-    let mut cur_line = 0usize;
-    let mut cur_col = 0usize;
-    for (i, g) in UnicodeSegmentation::graphemes(s, true).enumerate() {
-        if cur_line == line && cur_col == col {
-            return i;
-        }
-        if g == "\n" {
-            if cur_line == line {
-                return i; // end of requested line
-            }
-            cur_line += 1;
-            cur_col = 0;
-            if cur_line > line {
-                return i;
-            }
-        } else {
-            if cur_line == line && cur_col == col {
-                return i;
-            }
-            cur_col += 1;
-        }
-    }
-    // end of string
-    s.graphemes(true).count()
-}
-
-// compute line length (in graphemes)
-fn line_len(s: &str, line: usize) -> usize {
-    let mut cur_line = 0usize;
-    let mut len = 0usize;
-    for g in UnicodeSegmentation::graphemes(s, true) {
-        if cur_line == line {
-            if g == "\n" {
-                break;
-            }
-            len += 1;
-        }
-        if g == "\n" {
-            cur_line += 1;
-            if cur_line > line {
-                break;
-            }
-        }
-    }
-    len
+    let cursor_x = w_from_start_to_cursor.min(used);
+    (out, cursor_x)
 }
 
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
@@ -1368,7 +1331,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(
-                "  Type. Enter: newline. Ctrl+S: send to Ollama. Esc: back to NORMAL",
+                "  Type, Enter: newline, Ctrl+S: send to Ollama, Esc: back to NORMAL",
             ));
             lines.push(Line::from(
                 "  ←/→: move cursor   ↑/↓: move line   Backspace: delete previous grapheme",
@@ -1428,13 +1391,13 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    // Dynamic input height: 1 line when single-line, 3 lines when multiline
-    let input_inner_lines = if app.input.contains('\n') { 3 } else { 1 };
-    let input_block_height = (input_inner_lines as u16) + 2; // +2 for borders
+    // Input height: 1 if single-line, 3 if contains newline(s)
+    let input_multiline = app.input.contains('\n');
+    let input_height: u16 = if input_multiline { 3 } else { 1 };
 
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(input_block_height)])
+        .constraints([Constraint::Min(3), Constraint::Length(input_height + 2)]) // +2 borders
         .split(area);
 
     app.chat_inner_height = v_chunks[0].height.saturating_sub(2);
@@ -1597,7 +1560,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .scroll((app.chat_scroll, 0));
     frame.render_widget(messages, v_chunks[0]);
 
-    // Status/input bar — always show current input; dynamic height; keep cursor visible vertically
+    // Status/input bar — render multiline input (height = 1 or 3)
     let help_hint = Span::styled(
         "— Press ? for help",
         Style::default().fg(app.theme.status_hint),
@@ -1620,11 +1583,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             help_hint.clone(),
         ]),
         Mode::Normal => {
-            let base = if app.focus == Focus::Sidebar {
-                "Sidebar "
-            } else {
-                "Navigation "
-            };
+            let base = if app.focus == Focus::Sidebar { "Sidebar " } else { "Navigation " };
             Line::from(vec![
                 Span::styled(
                     base,
@@ -1642,11 +1601,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             ])
         }
         Mode::Visual => {
-            let base = if app.focus == Focus::Sidebar {
-                "Sidebar "
-            } else {
-                "Navigation "
-            };
+            let base = if app.focus == Focus::Sidebar { "Sidebar " } else { "Navigation " };
             Line::from(vec![
                 Span::styled(
                     base,
@@ -1660,85 +1615,106 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                         .fg(app.theme.mode_visual)
                         .add_modifier(Modifier::BOLD),
                 ),
-                help_hint,
+                help_hint.clone(),
             ])
         }
     };
 
-    // Decide which slice of input to show (last N lines to keep cursor visible)
-    let total_lines: usize = app.input.split('\n').count();
-    let (cur_line, cur_col) = lc_from_gi(&app.input, app.input_cursor);
-
-    let visible_lines = input_inner_lines as usize;
-    let start_line = if total_lines > visible_lines {
-        // try to keep the cursor on the last visible line
-        total_lines.saturating_sub(visible_lines)
-    } else {
-        0
-    };
-    let rel_cursor_line = cur_line.saturating_sub(start_line).min(visible_lines.saturating_sub(1));
-
-    // Build the view string of the last visible_lines lines
-    let mut view_lines: Vec<&str> = Vec::new();
-    let mut line_idx = 0usize;
-    for line in app.input.split('\n') {
-        if line_idx >= start_line && view_lines.len() < visible_lines {
-            view_lines.push(line);
-        }
-        line_idx += 1;
+    // Prepare visible input lines
+    let input_inner_w = v_chunks[1].width.saturating_sub(2) as usize;
+    let lines: Vec<&str> = app.input.split('\n').collect();
+    let total_lines = lines.len();
+    if app.input_cursor_line >= total_lines {
+        app.input_cursor_line = total_lines.saturating_sub(1);
     }
-    // Join with newlines (if no lines, keep empty)
-    let input_view_str = if view_lines.is_empty() {
-        String::new()
-    } else {
-        view_lines.join("\n")
-    };
+    let cur_line_str = lines.get(app.input_cursor_line).copied().unwrap_or("");
+    let cur_line_grs: Vec<&str> = UnicodeSegmentation::graphemes(cur_line_str, true).collect();
+    if app.input_cursor_col > cur_line_grs.len() {
+        app.input_cursor_col = cur_line_grs.len();
+    }
 
-    // Render input block
-    let input_para = Paragraph::new(input_view_str.clone()).block(
+    // Keep cursor visible with headroom: stop two lines before top when input is multiline (height=3)
+    let view_h = input_height as usize;
+    let headroom = if view_h > 1 { view_h - 1 } else { 0 }; // for h=3 -> 2 lines
+    let max_top_allowed = total_lines.saturating_sub(view_h);
+    let min_top_for_cursor = app.input_cursor_line.saturating_sub(headroom);
+    let max_top_for_cursor = app.input_cursor_line.min(max_top_allowed);
+    if app.input_top_line < min_top_for_cursor {
+        app.input_top_line = min_top_for_cursor;
+    }
+    if app.input_top_line > max_top_for_cursor {
+        app.input_top_line = max_top_for_cursor;
+    }
+    if app.input_top_line > max_top_allowed {
+        app.input_top_line = max_top_allowed;
+    }
+
+    // Build visible text and cursor position
+    let mut input_text = Text::default();
+    let mut cursor_x_in_view: usize = 0;
+    for i in 0..view_h {
+        let li = app.input_top_line + i;
+        let s = if li < total_lines { lines[li] } else { "" };
+        if li == app.input_cursor_line {
+            let (visible, cx) = line_view(s, app.input_cursor_col, input_inner_w);
+            cursor_x_in_view = cx;
+            input_text.lines.push(Line::from(visible));
+        } else {
+            // non-cursor line: simple clamp
+            let mut visible = String::new();
+            for g in UnicodeSegmentation::graphemes(s, true) {
+                let w = UnicodeWidthStr::width(g);
+                if UnicodeWidthStr::width(visible.as_str()) + w > input_inner_w {
+                    break;
+                }
+                visible.push_str(g);
+            }
+            input_text.lines.push(Line::from(visible));
+        }
+    }
+    // If single-line and completely empty in NORMAL, draw hint text style
+    let input_para = Paragraph::new(input_text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border_input))
             .title(input_title_line),
-    )
-    .wrap(Wrap { trim: false })
-    // Scroll to show the window starting at start_line
-    .scroll((start_line as u16, 0));
+    );
     frame.render_widget(input_para, v_chunks[1]);
 
     // Cursor (thin bar) only in INSERT mode within chat focus
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
-        // Visual x based on current line segment
-        // Compute width from beginning of current line to cursor
-        let vis_x = {
-            // get the substring of current line up to cur_col (graphemes)
-            let mut w = 0usize;
-            let mut l = 0usize;
-            let mut c = 0usize;
-            for g in UnicodeSegmentation::graphemes(app.input.as_str(), true) {
-                if l == cur_line {
-                    if c >= cur_col {
-                        break;
-                    }
-                    if g == "\n" {
-                        break;
-                    }
-                    w += UnicodeWidthStr::width(g);
-                    c += 1;
-                } else if g == "\n" {
-                    l += 1;
-                }
-            }
-            w
-        };
-
-        // Cursor Y inside the input box (+1 for top border, +rel line)
-        let cursor_y = v_chunks[1].y + 1 + (rel_cursor_line as u16);
-        // Cursor X (+1 for left border, +visual width)
-        let cursor_x = v_chunks[1].x + 1 + (vis_x as u16);
-
-        frame.set_cursor(cursor_x, cursor_y);
+        let cursor_row = (app.input_cursor_line.saturating_sub(app.input_top_line)) as u16;
+        frame.set_cursor(
+            v_chunks[1].x + 1 + cursor_x_in_view as u16,
+            v_chunks[1].y + 1 + cursor_row,
+        );
     }
+}
+
+// visual height estimate helpers
+fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
+    let mut y: u16 = 0;
+    for m in messages {
+        y = y.saturating_add(1);
+        y = y.saturating_add(m.content.lines().count() as u16);
+        y = y.saturating_add(1);
+    }
+    if let Some(p) = pending {
+        y = y.saturating_add(1);
+        y = y.saturating_add(p.lines().count() as u16);
+        y = y.saturating_add(1);
+    }
+    y
+}
+
+fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
+    let mut y: u16 = 0;
+    for m in &messages[..idx.min(messages.len())] {
+        y = y.saturating_add(1);
+        y = y.saturating_add(m.content.lines().count() as u16);
+        y = y.saturating_add(1);
+    }
+    y
 }
 
 // ---------- Main ----------
@@ -1778,6 +1754,13 @@ async fn main() -> Result<()> {
         (Duration::from_millis(1000 / fps as u64), poll)
     };
 
+    let (preview_fmt, preview_open) = {
+        let p = cfg.preview.clone().unwrap_or_default();
+        let fmt = p.preview_fmt.unwrap_or_else(|| "html".to_string());
+        let open = p.preview_open.unwrap_or_else(|| "xdg-open".to_string());
+        (fmt, open)
+    };
+
     let mut app = App::new(
         model,
         api_url,
@@ -1789,6 +1772,8 @@ async fn main() -> Result<()> {
         syntax_theme_name,
         syntax_custom,
         stream_throttle,
+        preview_fmt,
+        preview_open,
     );
 
     enable_raw_mode()?;
@@ -1874,32 +1859,6 @@ fn now_sec() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
-}
-
-// These estimations are used only for G/top/bottom and selection auto-adjust; they don't account for markdown wrapping.
-fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
-    let mut y: u16 = 0;
-    for m in messages {
-        y = y.saturating_add(1);
-        y = y.saturating_add(m.content.lines().count() as u16);
-        y = y.saturating_add(1);
-    }
-    if let Some(p) = pending {
-        y = y.saturating_add(1);
-        y = y.saturating_add(p.lines().count() as u16);
-        y = y.saturating_add(1);
-    }
-    y
-}
-
-fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
-    let mut y: u16 = 0;
-    for m in &messages[..idx.min(messages.len())] {
-        y = y.saturating_add(1);
-        y = y.saturating_add(m.content.lines().count() as u16);
-        y = y.saturating_add(1);
-    }
-    y
 }
 
 fn start_new_chat(app: &mut App) -> Result<()> {
@@ -2024,9 +1983,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
         Mode::Insert => match key.code {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
-                app.input_col_goal = None;
             }
-            // Ctrl+S sends the message (Enter inserts newline)
+            // Send with Ctrl+S
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if app.sending {
                     return Ok(());
@@ -2036,8 +1994,10 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                     return Ok(());
                 }
                 app.input.clear();
-                app.input_cursor = 0;
-                app.input_col_goal = None;
+                app.input_cursor_line = 0;
+                app.input_cursor_col = 0;
+                app.input_top_line = 0;
+
                 app.messages.push(Message {
                     role: Role::User,
                     content: input.clone(),
@@ -2045,6 +2005,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
                 persist_current_chat(app)?;
                 app.sending = true;
+
                 let mut convo = app.messages.clone();
                 convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
                 if !convo.iter().any(|m| matches!(m.role, Role::System)) {
@@ -2066,69 +2027,145 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             }
             // Enter inserts newline (multiline)
             KeyCode::Enter => {
-                let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
-                app.input.insert(pos, '\n');
-                app.input_cursor += 1;
-                // keep desired column on the next line
-                let (_, col) = lc_from_gi(&app.input, app.input_cursor);
-                app.input_col_goal = Some(col);
+                let lines: Vec<&str> = app.input.split('\n').collect();
+                let cur = lines.get(app.input_cursor_line).copied().unwrap_or("");
+                // byte index within current line
+                let mut col_byte = 0usize;
+                for (i, g) in UnicodeSegmentation::graphemes(cur, true).enumerate() {
+                    if i >= app.input_cursor_col {
+                        break;
+                    }
+                    col_byte += g.len();
+                }
+                // byte index in whole string at cursor
+                let mut byte_cursor = 0usize;
+                for li in 0..app.input_cursor_line {
+                    byte_cursor += lines[li].len() + 1; // include '\n'
+                }
+                byte_cursor += col_byte;
+
+                app.input.insert(byte_cursor, '\n');
+                app.input_cursor_line += 1;
+                app.input_cursor_col = 0;
+                // input_top_line adjust with headroom (handled in draw)
             }
             KeyCode::Backspace => {
-                if app.input_cursor > 0 {
-                    let start = byte_index_from_grapheme(&app.input, app.input_cursor - 1);
-                    let end = byte_index_from_grapheme(&app.input, app.input_cursor);
-                    app.input.replace_range(start..end, "");
-                    app.input_cursor -= 1;
-                    app.input_col_goal = None;
+                // Delete previous grapheme, merging lines if at col 0
+                if app.input_cursor_line == 0 && app.input_cursor_col == 0 {
+                    // nothing
+                } else {
+                    let mut lines: Vec<String> = app.input.split('\n').map(|s| s.to_string()).collect();
+                    if app.input_cursor_col > 0 {
+                        // delete grapheme in current line
+                        let cur = &mut lines[app.input_cursor_line];
+                        let grs: Vec<&str> = UnicodeSegmentation::graphemes(cur.as_str(), true).collect();
+                        let mut start_byte = 0usize;
+                        for i in 0..app.input_cursor_col - 1 {
+                            start_byte += grs[i].len();
+                        }
+                        let end_byte = start_byte + grs[app.input_cursor_col - 1].len();
+                        cur.replace_range(start_byte..end_byte, "");
+                        app.input_cursor_col -= 1;
+                    } else {
+                        // merge with previous line
+                        let prev_len_gr = UnicodeSegmentation::graphemes(lines[app.input_cursor_line - 1].as_str(), true).count();
+                        let cur_line = lines.remove(app.input_cursor_line);
+                        let prev = &mut lines[app.input_cursor_line - 1];
+                        prev.push_str(&cur_line);
+                        app.input_cursor_line -= 1;
+                        app.input_cursor_col = prev_len_gr;
+                    }
+                    app.input = lines.join("\n");
                 }
             }
             KeyCode::Left => {
-                if app.input_cursor > 0 {
-                    app.input_cursor -= 1;
+                if app.input_cursor_col > 0 {
+                    app.input_cursor_col -= 1;
+                } else if app.input_cursor_line > 0 {
+                    // move to end of previous line
+                    app.input_cursor_line -= 1;
+                    let prev = app.input.split('\n').nth(app.input_cursor_line).unwrap_or("");
+                    app.input_cursor_col = UnicodeSegmentation::graphemes(prev, true).count();
                 }
-                app.input_col_goal = None;
             }
             KeyCode::Right => {
-                let gcount = app.input.graphemes(true).count();
-                if app.input_cursor < gcount {
-                    app.input_cursor += 1;
+                let cur = app.input.split('\n').nth(app.input_cursor_line).unwrap_or("");
+                let cur_len = UnicodeSegmentation::graphemes(cur, true).count();
+                if app.input_cursor_col < cur_len {
+                    app.input_cursor_col += 1;
+                } else if app.input_cursor_line + 1 < app.input.split('\n').count() {
+                    app.input_cursor_line += 1;
+                    app.input_cursor_col = 0;
                 }
-                app.input_col_goal = None;
             }
             KeyCode::Up => {
-                let (line, col) = lc_from_gi(&app.input, app.input_cursor);
-                if line > 0 {
-                    let want_col = app.input_col_goal.unwrap_or(col);
-                    let prev_len = line_len(&app.input, line - 1);
-                    let new_col = want_col.min(prev_len);
-                    app.input_cursor = gi_from_lc(&app.input, line - 1, new_col);
-                    app.input_col_goal = Some(want_col);
+                if app.input_cursor_line > 0 {
+                    app.input_cursor_line -= 1;
+                    // clamp column to target line length
+                    let tgt = app.input.split('\n').nth(app.input_cursor_line).unwrap_or("");
+                    let len = UnicodeSegmentation::graphemes(tgt, true).count();
+                    if app.input_cursor_col > len {
+                        app.input_cursor_col = len;
+                    }
                 }
             }
             KeyCode::Down => {
-                let (line, col) = lc_from_gi(&app.input, app.input_cursor);
-                let total_lines = app.input.split('\n').count();
-                if line + 1 < total_lines {
-                    let want_col = app.input_col_goal.unwrap_or(col);
-                    let next_len = line_len(&app.input, line + 1);
-                    let new_col = want_col.min(next_len);
-                    app.input_cursor = gi_from_lc(&app.input, line + 1, new_col);
-                    app.input_col_goal = Some(want_col);
+                let total = app.input.split('\n').count();
+                if app.input_cursor_line + 1 < total {
+                    app.input_cursor_line += 1;
+                    let tgt = app.input.split('\n').nth(app.input_cursor_line).unwrap_or("");
+                    let len = UnicodeSegmentation::graphemes(tgt, true).count();
+                    if app.input_cursor_col > len {
+                        app.input_cursor_col = len;
+                    }
                 }
             }
             KeyCode::Char(c) => {
-                let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
-                app.input.insert(pos, c);
-                app.input_cursor += 1;
-                app.input_col_goal = None;
+                // insert at cursor
+                let lines: Vec<&str> = app.input.split('\n').collect();
+                let cur = lines.get(app.input_cursor_line).copied().unwrap_or("");
+                let mut col_byte = 0usize;
+                for (i, g) in UnicodeSegmentation::graphemes(cur, true).enumerate() {
+                    if i >= app.input_cursor_col {
+                        break;
+                    }
+                    col_byte += g.len();
+                }
+                let mut byte_cursor = 0usize;
+                for li in 0..app.input_cursor_line {
+                    byte_cursor += lines[li].len() + 1;
+                }
+                byte_cursor += col_byte;
+
+                app.input.insert(byte_cursor, c);
+                app.input_cursor_col += 1;
             }
             KeyCode::Tab => {
-                let pos = byte_index_from_grapheme(&app.input, app.input_cursor);
-                app.input.insert_str(pos, "    ");
-                app.input_cursor += 4;
-                app.input_col_goal = None;
+                let lines: Vec<&str> = app.input.split('\n').collect();
+                let cur = lines.get(app.input_cursor_line).copied().unwrap_or("");
+                let mut col_byte = 0usize;
+                for (i, g) in UnicodeSegmentation::graphemes(cur, true).enumerate() {
+                    if i >= app.input_cursor_col {
+                        break;
+                    }
+                    col_byte += g.len();
+                }
+                let mut byte_cursor = 0usize;
+                for li in 0..app.input_cursor_line {
+                    byte_cursor += lines[li].len() + 1;
+                }
+                byte_cursor += col_byte;
+
+                app.input.insert(byte_cursor, '\t');
+                app.input_cursor_col += 1;
             }
-            // In INSERT, arrow keys no longer scroll chat
+            // manual chat scroll while typing
+            KeyCode::PageUp => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(app.chat_inner_height.max(1));
+            }
+            KeyCode::PageDown => {
+                app.chat_scroll = app.chat_scroll.saturating_add(app.chat_inner_height.max(1));
+            }
             _ => {}
         },
         Mode::Normal => {
@@ -2157,8 +2194,11 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                 KeyCode::Char('i') => {
                     if app.focus == Focus::Chat {
                         app.mode = Mode::Insert;
-                        app.input_cursor = app.input.graphemes(true).count();
-                        app.input_col_goal = None;
+                        // place cursor at end of input
+                        let lines: Vec<&str> = app.input.split('\n').collect();
+                        app.input_cursor_line = lines.len().saturating_sub(1);
+                        let last = lines.last().copied().unwrap_or("");
+                        app.input_cursor_col = UnicodeSegmentation::graphemes(last, true).count();
                     }
                 }
                 KeyCode::Char('n') => {
@@ -2173,13 +2213,17 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                         };
                     }
                 }
+                // Paste appends to current input (not overwrite)
                 KeyCode::Char('p') => {
                     if app.focus == Focus::Chat {
                         match read_clipboard_text().await {
                             Ok(clip) => {
+                                // append at end
                                 app.input.push_str(&clip);
-                                app.input_cursor = app.input.graphemes(true).count();
-                                app.input_col_goal = None;
+                                let lines: Vec<&str> = app.input.split('\n').collect();
+                                app.input_cursor_line = lines.len().saturating_sub(1);
+                                let last = lines.last().copied().unwrap_or("");
+                                app.input_cursor_col = UnicodeSegmentation::graphemes(last, true).count();
                             }
                             Err(e) => {
                                 app.messages.push(Message {
@@ -2271,8 +2315,10 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
             KeyCode::Char('i') => {
                 if app.focus == Focus::Chat {
                     app.mode = Mode::Insert;
-                    app.input_cursor = app.input.graphemes(true).count();
-                    app.input_col_goal = None;
+                    let lines: Vec<&str> = app.input.split('\n').collect();
+                    app.input_cursor_line = lines.len().saturating_sub(1);
+                    let last = lines.last().copied().unwrap_or("");
+                    app.input_cursor_col = UnicodeSegmentation::graphemes(last, true).count();
                 }
             }
             KeyCode::Char('y') => {
@@ -2358,8 +2404,10 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                         if let Some(m) = app.messages.get(i) {
                             let tx2 = tx.clone();
                             let content = m.content.clone();
+                            let fmt = app.preview_fmt.clone();
+                            let opener = app.preview_open.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = preview_to_html(content).await {
+                                if let Err(e) = preview_to_html_or_pdf(content, &fmt, &opener).await {
                                     let _ = tx2.send(AppEvent::OllamaError(format!(
                                         "Preview error: {}",
                                         e
