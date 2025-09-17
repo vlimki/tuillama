@@ -5,10 +5,16 @@ system_prompt = "You are a helpful assistant."
 # in visual mode, the selected message will be typed out as bold instead of recoloring the background
 bold_selection = false
 
+[preview]
+preview_fmt = "pdf"
+preview_open = "zathura"
+
 [options]
+# e.g.:
 # num_ctx = 4096
 # num_thread = 6
 # temperature = 0.7
+# num_gpu = 50
 
 # Names or #RRGGBB
 [colors]
@@ -32,8 +38,8 @@ list_bullet = "Green"
 ordered_number = "Green"
 inline_code = "Yellow"
 inline_code_bg = "#080808"
-code_block_fg = "#080808"
-code_block_bg = "#888888"
+code_block_fg = "#888888"
+code_block_bg = "#080808"
 hr = "#282828"
 
 status_hint = "Gray"

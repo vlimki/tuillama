@@ -674,7 +674,7 @@ async fn preview_to_html_or_pdf(content: String, fmt: &str, opener: &str) -> Res
     cmd.arg(&in_path).arg("-s").arg("--from").arg("markdown");
     match fmt {
         "pdf" => {
-            cmd.arg("-o").arg(&out_path);
+            cmd.arg("--pdf-engine").arg("latexmk").arg("-o").arg(&out_path);
         }
         _ => {
             cmd.arg("--to").arg("html").arg("--mathjax").arg("-o").arg(&out_path);
@@ -818,6 +818,9 @@ fn render_markdown_to_text(
     let mut high: Option<HighlightLines> = None;
     let hr_line_len = inner_width.max(1) as usize;
     const NBSP: char = '\u{00A0}';
+
+    // Fix a GPT-ism
+    let input = &input.replace("‑", "-");
 
     for raw in input.lines() {
         let trimmed = raw.trim_start();
