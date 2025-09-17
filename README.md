@@ -26,8 +26,9 @@ Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, s
 
 * Rust toolchain
 * Ollama
-* `pandoc` and a default browser (`xdg-open` on Linux)
+* `pandoc` and a default browser (`xdg-open` on Linux) for previewing messages
 * `xclip` for clipboard integration
+* `latexmk` and the LaTeX toolkit for previewing messages
 
 Optional
 
