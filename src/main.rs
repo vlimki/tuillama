@@ -674,7 +674,7 @@ async fn preview_to_html_or_pdf(content: String, fmt: &str, opener: &str) -> Res
     cmd.arg(&in_path).arg("-s").arg("--from").arg("markdown");
     match fmt {
         "pdf" => {
-            cmd.arg("--pdf-engine").arg("latexmk").arg("-o").arg(&out_path);
+            cmd.arg("--pdf-engine").arg("lualatex").arg("-o").arg(&out_path);
         }
         _ => {
             cmd.arg("--to").arg("html").arg("--mathjax").arg("-o").arg(&out_path);
@@ -1395,8 +1395,8 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
 fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // Input height: 1 if single-line, 3 if contains newline(s)
-    let input_multiline = app.input.contains('\n');
-    let input_height: u16 = if input_multiline { 3 } else { 1 };
+    let input_multiline = app.input.chars().filter(|&c| c == '\n').count();
+    let input_height: u16 = std::cmp::min(input_multiline as u16 + 1, 5);
 
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
