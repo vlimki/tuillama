@@ -644,7 +644,7 @@ async fn stream_ollama(
 // ---------- Sanitization + Preview ----------
 fn sanitize_for_html(input: &str) -> String {
     let mut out = input.replace('\u{2011}', "-"); // non-breaking hyphen -> hyphen
-    out = out.replace('<', "").replace('>', "");
+    //out = out.replace('<', "").replace('>', "");
     let re_display = Regex::new(r"(?s)\\\[\s*(.*?)\s*\\\]").unwrap();
     out = re_display
         .replace_all(&out, |caps: &Captures| format!("$$\n{}\n$$", &caps[1]))
