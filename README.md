@@ -7,7 +7,7 @@ Finally, a minimalist yet competent Ollama interface.
 * Really fast and minimal
 * Vim keys
 * Beautiful markdown formatting and syntax highlighting on the terminal
-* Dynamic compilation to HTML for viewing LaTeX
+* Dynamic compilation of messages to PDF or HTML (with LaTeX support!)
 
 ## Preview
 
@@ -28,7 +28,7 @@ Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, s
 * Ollama
 * `pandoc` and a default browser (`xdg-open` on Linux) for previewing messages
 * `xclip` for clipboard integration
-* `latexmk` and the LaTeX toolkit for previewing messages
+* `lualatex` and the LaTeX toolkit for previewing messages (I will eventually make the LaTeX engine configurable)
 
 Optional
 
@@ -67,5 +67,6 @@ All keys under `[options]` are forwarded to Ollama's `options` field.
 ## Limitations (for now)
 
 * Models and custom options require manually editing the config file and restarting the app
+* The UI is clumsy at times + you must have the proper chat open at all times whilst the LLM is typing
 * No image support (this should be relatively easy to fix)
 * A bunch of other stuff, probably, since the app is so minimal
