@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use regex::Regex;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::{env, sync::Arc};
@@ -125,160 +124,6 @@ fn normalize_tool_name(name: &str) -> &str {
     }
 }
 
-fn tool_arg_string(args: &JsonValue, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(v) = args.get(*key).and_then(|x| x.as_str()) {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    if let Some(v) = args.as_str() {
-        let trimmed = v.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    None
-}
-
-fn decode_duckduckgo_redirect(raw_href: &str) -> Option<String> {
-    if raw_href.starts_with("http://") || raw_href.starts_with("https://") {
-        return Some(raw_href.to_string());
-    }
-    if raw_href.starts_with("//") {
-        return Some(format!("https:{}", raw_href));
-    }
-    let full = if raw_href.starts_with('/') {
-        format!("https://duckduckgo.com{raw_href}")
-    } else {
-        format!("https://duckduckgo.com/{raw_href}")
-    };
-    let url = reqwest::Url::parse(&full).ok()?;
-    for (k, v) in url.query_pairs() {
-        if k == "uddg" {
-            let out = v.to_string();
-            if out.starts_with("http://") || out.starts_with("https://") {
-                return Some(out);
-            }
-        }
-    }
-    None
-}
-
-async fn fallback_web_search(
-    client: &reqwest::Client,
-    query: &str,
-    request_id: &str,
-    debug: bool,
-) -> JsonValue {
-    let mut url = match reqwest::Url::parse("https://duckduckgo.com/html/") {
-        Ok(u) => u,
-        Err(e) => {
-            return json!({"error": format!("fallback search url parse failed: {e}")});
-        }
-    };
-    url.query_pairs_mut().append_pair("q", query);
-
-    debug_log(
-        debug,
-        request_id,
-        format!("fallback web_search url={}", url),
-    );
-
-    let resp = match client
-        .get(url)
-        .header(USER_AGENT, "tuillama/0.5 (+https://github.com)")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return json!({"error": format!("fallback search request failed: {e}")}),
-    };
-
-    if !resp.status().is_success() {
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-        return json!({"error": format!("fallback search HTTP error: {body}")});
-    }
-
-    let html = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => return json!({"error": format!("fallback search body read failed: {e}")}),
-    };
-
-    let href_re = match Regex::new(r#"href="([^"]+)""#) {
-        Ok(r) => r,
-        Err(e) => return json!({"error": format!("fallback search regex failed: {e}")}),
-    };
-
-    let mut urls: Vec<String> = Vec::new();
-    for cap in href_re.captures_iter(&html) {
-        let raw = &cap[1];
-        if let Some(decoded) = decode_duckduckgo_redirect(raw) {
-            if (decoded.starts_with("http://") || decoded.starts_with("https://"))
-                && !urls.iter().any(|u| u == &decoded)
-            {
-                urls.push(decoded);
-                if urls.len() >= 5 {
-                    break;
-                }
-            }
-        }
-    }
-
-    json!({"query": query, "results": urls})
-}
-
-async fn fallback_web_fetch(
-    client: &reqwest::Client,
-    target_url: &str,
-    request_id: &str,
-    debug: bool,
-) -> JsonValue {
-    debug_log(
-        debug,
-        request_id,
-        format!("fallback web_fetch url={target_url}"),
-    );
-
-    let resp = match client
-        .get(target_url)
-        .header(USER_AGENT, "tuillama/0.5 (+https://github.com)")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return json!({"error": format!("fallback fetch request failed: {e}")}),
-    };
-
-    if !resp.status().is_success() {
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-        return json!({"error": format!("fallback fetch HTTP error: {body}")});
-    }
-
-    let html = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => return json!({"error": format!("fallback fetch body read failed: {e}")}),
-    };
-
-    let strip_re = match Regex::new(r"<[^>]+>") {
-        Ok(r) => r,
-        Err(e) => return json!({"error": format!("fallback fetch regex failed: {e}")}),
-    };
-    let text = strip_re.replace_all(&html, " ").to_string();
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let snippet = truncate_for_context(&compact, TOOL_RESULT_LIMIT);
-
-    json!({"url": target_url, "content": snippet})
-}
-
 async fn run_tool_call(
     client: &reqwest::Client,
     api_base: &str,
@@ -342,7 +187,6 @@ async fn run_tool_call(
     };
 
     if !resp.status().is_success() {
-        let status = resp.status();
         let body = resp
             .text()
             .await
@@ -352,38 +196,6 @@ async fn run_tool_call(
             request_id,
             format!("tool call http error body: name={normalized} body={body}"),
         );
-
-        if status == reqwest::StatusCode::NOT_FOUND {
-            debug_log(
-                debug,
-                request_id,
-                format!(
-                    "tool endpoint not found for {normalized}; using built-in fallback retriever"
-                ),
-            );
-            return match normalized {
-                "web_search" => {
-                    let query = tool_arg_string(&payload, &["query", "q", "text", "prompt"])
-                        .unwrap_or_default();
-                    if query.is_empty() {
-                        json!({"error": "fallback web_search: missing query"})
-                    } else {
-                        fallback_web_search(client, &query, request_id, debug).await
-                    }
-                }
-                "web_fetch" => {
-                    let url =
-                        tool_arg_string(&payload, &["url", "link", "href"]).unwrap_or_default();
-                    if url.is_empty() {
-                        json!({"error": "fallback web_fetch: missing url"})
-                    } else {
-                        fallback_web_fetch(client, &url, request_id, debug).await
-                    }
-                }
-                _ => json!({"error": format!("tool HTTP error: {body}")}),
-            };
-        }
-
         return json!({
             "error": format!("tool HTTP error: {body}")
         });
