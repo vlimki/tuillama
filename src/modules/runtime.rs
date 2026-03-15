@@ -392,9 +392,10 @@ async fn handle_key(
                     return Ok(());
                 }
 
-                let chat_id = app.current_chat_id.clone().unwrap_or_default();
-                if app.active_streams.contains_key(&chat_id) {
-                    return Ok(());
+                if let Some(chat_id) = app.current_chat_id.as_ref() {
+                    if app.active_streams.contains_key(chat_id) {
+                        return Ok(());
+                    }
                 }
 
                 app.input.clear();
@@ -408,6 +409,10 @@ async fn handle_key(
                 });
                 app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
                 persist_current_chat(app)?;
+                let chat_id = app
+                    .current_chat_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("missing current chat id after persist"))?;
 
                 let mut convo = app.messages.clone();
                 convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
