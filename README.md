@@ -16,6 +16,12 @@ Finally, a minimalist yet competent Ollama interface.
 
 ![Preview 3](media/preview3.png)
 
+## Agentic web search
+
+Toggle on agentic web search at any time via Ctrl-W. Note that you will have to configure an Ollama API key first in the configuration file.
+
+![Preview 4](media/preview4.png)
+
 ## No LaTeX on the terminal? No problem
 
 Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, select a message, and press `Enter`.
