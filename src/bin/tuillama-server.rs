@@ -1,10 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
-use std::{env, sync::Arc};
-
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
+use std::{env, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
@@ -28,6 +27,41 @@ struct Message {
 include!("../modules/protocol.rs");
 include!("../modules/ollama_payloads.rs");
 
+const MAX_TOOL_ITERS: usize = 8;
+const TOOL_RESULT_LIMIT: usize = 8_000;
+
+#[derive(Debug, Deserialize)]
+struct OllamaChatResponse {
+    #[serde(default)]
+    message: Option<OllamaChatMessageWithTools>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaChatMessageWithTools {
+    #[allow(dead_code)]
+    role: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    thinking: String,
+    #[serde(default)]
+    tool_calls: Vec<OllamaToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaToolCall {
+    function: OllamaToolFunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaToolFunctionCall {
+    name: String,
+    #[serde(default)]
+    arguments: JsonValue,
+}
+
 async fn send_server_event(writer: &Arc<Mutex<OwnedWriteHalf>>, ev: &ServerEvent) -> Result<()> {
     let payload = serde_json::to_string(ev)?;
     let mut guard = writer.lock().await;
@@ -37,7 +71,195 @@ async fn send_server_event(writer: &Arc<Mutex<OwnedWriteHalf>>, ev: &ServerEvent
     Ok(())
 }
 
-async fn process_stream_request(
+fn build_auth_headers(ollama_api_key: Option<&str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(key) = ollama_api_key {
+        if let Ok(mut val) = HeaderValue::from_str(&format!("Bearer {key}")) {
+            val.set_sensitive(true);
+            headers.insert(AUTHORIZATION, val);
+        }
+    }
+    headers
+}
+
+fn api_base_from_chat_url(api_url: &str) -> String {
+    if let Some((base, _)) = api_url.rsplit_once("/api/chat") {
+        base.to_string()
+    } else {
+        api_url.trim_end_matches('/').to_string()
+    }
+}
+
+fn role_to_wire(role: &Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+fn truncate_for_context(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+async fn run_tool_call(
+    client: &reqwest::Client,
+    api_base: &str,
+    headers: &HeaderMap,
+    tool_name: &str,
+    args: JsonValue,
+) -> Result<String> {
+    let endpoint = match tool_name {
+        "web_search" => format!("{api_base}/api/web_search"),
+        "web_fetch" => format!("{api_base}/api/web_fetch"),
+        other => return Ok(format!("Tool {other} not found")),
+    };
+
+    let payload = if args.is_object() {
+        args
+    } else {
+        json!({ "query": args })
+    };
+
+    let resp = client
+        .post(endpoint)
+        .headers(headers.clone())
+        .json(&payload)
+        .send()
+        .await
+        .context("tool request failed")?;
+
+    if !resp.status().is_success() {
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(anyhow!("tool HTTP error: {body}"));
+    }
+
+    let body = resp.text().await.context("failed to read tool response")?;
+    Ok(truncate_for_context(&body, TOOL_RESULT_LIMIT))
+}
+
+async fn process_agentic_web_search(
+    api_url: String,
+    model: String,
+    options: Option<JsonValue>,
+    ollama_api_key: Option<String>,
+    messages: Vec<Message>,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+    let headers = build_auth_headers(ollama_api_key.as_deref());
+    let api_base = api_base_from_chat_url(&api_url);
+
+    let tools = vec![
+        json!({ "type": "function", "function": { "name": "web_search" } }),
+        json!({ "type": "function", "function": { "name": "web_fetch" } }),
+    ];
+
+    let mut convo: Vec<JsonValue> = messages
+        .iter()
+        .map(|m| {
+            json!({
+                "role": role_to_wire(&m.role),
+                "content": m.content,
+            })
+        })
+        .collect();
+
+    let mut final_answer = String::new();
+
+    for _ in 0..MAX_TOOL_ITERS {
+        let req = json!({
+            "model": &model,
+            "messages": &convo,
+            "stream": false,
+            "think": true,
+            "options": options.clone(),
+            "tools": &tools,
+        });
+
+        let resp = client
+            .post(&api_url)
+            .headers(headers.clone())
+            .json(&req)
+            .send()
+            .await
+            .context("chat request failed")?;
+
+        if !resp.status().is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".to_string());
+            return Err(anyhow!("HTTP error: {body}"));
+        }
+
+        let parsed: OllamaChatResponse = resp.json().await.context("invalid chat response")?;
+        if let Some(err) = parsed.error {
+            return Err(anyhow!(err));
+        }
+        let msg = parsed
+            .message
+            .ok_or_else(|| anyhow!("chat response missing message"))?;
+
+        if !msg.content.is_empty() {
+            final_answer = msg.content.clone();
+        }
+
+        if !msg.thinking.is_empty() {
+            convo.push(json!({
+                "role": "assistant",
+                "content": msg.content,
+                "thinking": msg.thinking,
+            }));
+        } else {
+            convo.push(json!({
+                "role": "assistant",
+                "content": msg.content,
+            }));
+        }
+
+        if msg.tool_calls.is_empty() {
+            if final_answer.is_empty() {
+                final_answer = "No response content returned by model.".to_string();
+            }
+            return Ok(final_answer);
+        }
+
+        for tc in msg.tool_calls {
+            let tool_name = tc.function.name;
+            let tool_result = match run_tool_call(
+                &client,
+                &api_base,
+                &headers,
+                &tool_name,
+                tc.function.arguments,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => format!("Tool {tool_name} failed: {e}"),
+            };
+
+            convo.push(json!({
+                "role": "tool",
+                "tool_name": tool_name,
+                "content": tool_result,
+            }));
+        }
+    }
+
+    if final_answer.is_empty() {
+        Err(anyhow!(
+            "agentic search exceeded iteration limit without final content"
+        ))
+    } else {
+        Ok(final_answer)
+    }
+}
+
+async fn process_normal_stream(
     writer: Arc<Mutex<OwnedWriteHalf>>,
     request_id: String,
     chat_id: String,
@@ -45,33 +267,17 @@ async fn process_stream_request(
     model: String,
     options: Option<JsonValue>,
     ollama_api_key: Option<String>,
-    web_search: bool,
     messages: Vec<Message>,
 ) {
-    let web_search_tools = [OllamaTool {
-        kind: "function",
-        function: OllamaToolFunction { name: "web_search" },
-    }];
     let req = OllamaChatRequest {
         model: &model,
         messages: &messages,
         stream: true,
         options: options.as_ref(),
-        tools: if web_search {
-            Some(&web_search_tools)
-        } else {
-            None
-        },
+        tools: None,
     };
 
-    let mut headers = HeaderMap::new();
-    if let Some(key) = ollama_api_key.as_deref() {
-        if let Ok(mut val) = HeaderValue::from_str(&format!("Bearer {key}")) {
-            val.set_sensitive(true);
-            headers.insert(AUTHORIZATION, val);
-        }
-    }
-
+    let headers = build_auth_headers(ollama_api_key.as_deref());
     let client = reqwest::Client::new();
     let resp = match client
         .post(api_url)
@@ -105,7 +311,7 @@ async fn process_stream_request(
             &ServerEvent::Error {
                 request_id,
                 chat_id,
-                message: format!("HTTP error: {}", text),
+                message: format!("HTTP error: {text}"),
             },
         )
         .await;
@@ -179,6 +385,66 @@ async fn process_stream_request(
     }
 }
 
+async fn process_stream_request(
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    request_id: String,
+    chat_id: String,
+    api_url: String,
+    model: String,
+    options: Option<JsonValue>,
+    ollama_api_key: Option<String>,
+    web_search: bool,
+    messages: Vec<Message>,
+) {
+    if web_search {
+        match process_agentic_web_search(api_url, model, options, ollama_api_key, messages).await {
+            Ok(answer) => {
+                let _ = send_server_event(
+                    &writer,
+                    &ServerEvent::Chunk {
+                        request_id: request_id.clone(),
+                        chat_id: chat_id.clone(),
+                        delta: answer,
+                    },
+                )
+                .await;
+                let _ = send_server_event(
+                    &writer,
+                    &ServerEvent::Done {
+                        request_id,
+                        chat_id,
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                let _ = send_server_event(
+                    &writer,
+                    &ServerEvent::Error {
+                        request_id,
+                        chat_id,
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+        return;
+    }
+
+    process_normal_stream(
+        writer,
+        request_id,
+        chat_id,
+        api_url,
+        model,
+        options,
+        ollama_api_key,
+        messages,
+    )
+    .await;
+}
+
 async fn handle_client(stream: TcpStream) -> Result<()> {
     let (reader_half, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
@@ -228,7 +494,7 @@ async fn main() -> Result<()> {
     let server_addr =
         env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
     let listener = TcpListener::bind(&server_addr).await?;
-    eprintln!("tuillama-server listening on {}", server_addr);
+    eprintln!("tuillama-server listening on {server_addr}");
 
     loop {
         let (stream, _) = listener.accept().await?;

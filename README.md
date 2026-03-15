@@ -8,7 +8,7 @@ Finally, a minimalist yet competent Ollama interface.
 * Vim keys
 * Beautiful markdown formatting and syntax highlighting on the terminal
 * Dynamic compilation of messages to PDF or HTML (with LaTeX support!)
-* Toggleable web search tool forwarding (`Ctrl+W`) for Ollama-compatible providers
+* Toggleable agentic web search mode (`Ctrl+W`) for Ollama-compatible providers
 
 ## Preview
 
@@ -81,7 +81,7 @@ All keys under `[options]` are forwarded to Ollama's `options` field.
 
 You can set `ollama_api_key` in config (or `OLLAMA_API_KEY` in env) for hosted providers that require bearer auth.
 
-Press `Ctrl+W` in the client UI to toggle web search tool support per request.
+Press `Ctrl+W` in the client UI to toggle server-side agentic web search per request. In this mode the server loops over `web_search`/`web_fetch` tool calls and returns the final answer to the client.
 
 You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
 
