@@ -16,7 +16,6 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use directories::ProjectDirs;
-use futures_util::StreamExt;
 use rand::random;
 use ratatui::{
     Terminal,
@@ -53,7 +52,6 @@ include!("modules/protocol.rs");
 include!("modules/theme.rs");
 include!("modules/config.rs");
 include!("modules/storage.rs");
-include!("modules/ollama_payloads.rs");
 include!("modules/app_state.rs");
 include!("modules/events.rs");
 include!("modules/ollama_streaming.rs");

@@ -63,7 +63,8 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) = unbounded_channel();
-    let server_tx = spawn_client_server(tx.clone()).await?;
+    let server_addr = std::env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+    let server_tx = connect_server(tx.clone(), &server_addr).await?;
 
     // Blocking input reader thread with configurable poll period
     let tx_input = tx.clone();
@@ -135,7 +136,12 @@ async fn main() -> Result<()> {
                             app.selected_msg = Some(app.messages.len().saturating_sub(1));
                         }
                         } else if !content.is_empty() {
-                            append_assistant_to_chat(&chat_id, content)?;
+                            if let Err(e) = append_assistant_to_chat(&chat_id, content) {
+                                app.messages.push(Message {
+                                    role: Role::System,
+                                    content: format!("Error: {}", e),
+                                });
+                            }
                             app.chats = list_chats().unwrap_or_default();
                         }
                     }
@@ -160,7 +166,12 @@ async fn main() -> Result<()> {
                                 content: formatted,
                             });
                         } else {
-                            append_system_to_chat(&chat_id, formatted)?;
+                            if let Err(e) = append_system_to_chat(&chat_id, formatted) {
+                                app.messages.push(Message {
+                                    role: Role::System,
+                                    content: format!("Error: {}", e),
+                                });
+                            }
                             app.chats = list_chats().unwrap_or_default();
                         }
                     }
@@ -209,7 +220,10 @@ fn refresh_current_stream_state(app: &mut App) {
 }
 
 fn append_assistant_to_chat(chat_id: &str, content: String) -> Result<()> {
-    let mut chat = load_chat(chat_id)?;
+    let mut chat = match load_chat(chat_id) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
     chat.messages.push(Message {
         role: Role::Assistant,
         content,
@@ -219,7 +233,10 @@ fn append_assistant_to_chat(chat_id: &str, content: String) -> Result<()> {
 }
 
 fn append_system_to_chat(chat_id: &str, content: String) -> Result<()> {
-    let mut chat = load_chat(chat_id)?;
+    let mut chat = match load_chat(chat_id) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
     chat.messages.push(Message {
         role: Role::System,
         content,

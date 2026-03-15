@@ -24,12 +24,12 @@ Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, s
 
 ## Architecture
 
-`tuillama` now uses an internal client/server split:
+`tuillama` now uses a client/server split with separate executables:
 
-* **Client (TUI):** handles rendering, input, navigation, and stream presentation.
-* **Server worker:** owns Ollama HTTP streaming, emits structured events, and tags every stream with `chat_id` + `request_id`.
+* **Client (`tuillama`):** handles rendering, input, navigation, and stream presentation.
+* **Server (`tuillama-server`):** owns all Ollama HTTP streaming, emits structured events, and tags every stream with `chat_id` + `request_id`.
 
-This prevents streamed tokens from spilling into a different chat if you switch views mid-response, and makes it easier to grow into a remote/multi-client design later.
+This prevents streamed tokens from spilling into a different chat when switching views and supports multiple chats generating concurrently.
 
 ## Requirements
 
@@ -52,8 +52,11 @@ cargo build --release
 ollama pull llama3
 # or: ollama run llama3
 
-# run the app
-cargo run
+# run server (separate terminal)
+cargo run --bin tuillama-server
+
+# run client
+cargo run --bin tuillama
 ```
 
 Environment overrides (take precedence over config):
@@ -61,6 +64,7 @@ Environment overrides (take precedence over config):
 ```bash
 export OLLAMA_MODEL=llama3
 export OLLAMA_CHAT_URL=http://localhost:11434/api/chat
+export TUILLAMA_SERVER_ADDR=127.0.0.1:7878
 ```
 
 ## Configuration
