@@ -30,38 +30,6 @@ include!("../modules/ollama_payloads.rs");
 const MAX_TOOL_ITERS: usize = 8;
 const TOOL_RESULT_LIMIT: usize = 8_000;
 
-#[derive(Debug, Deserialize)]
-struct OllamaChatResponse {
-    #[serde(default)]
-    message: Option<OllamaChatMessageWithTools>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaChatMessageWithTools {
-    #[allow(dead_code)]
-    role: String,
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    thinking: String,
-    #[serde(default)]
-    tool_calls: Vec<OllamaToolCall>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaToolCall {
-    function: OllamaToolFunctionCall,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaToolFunctionCall {
-    name: String,
-    #[serde(default)]
-    arguments: JsonValue,
-}
-
 async fn send_server_event(writer: &Arc<Mutex<OwnedWriteHalf>>, ev: &ServerEvent) -> Result<()> {
     let payload = serde_json::to_string(ev)?;
     let mut guard = writer.lock().await;
@@ -102,17 +70,30 @@ fn truncate_for_context(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+fn normalize_tool_name(name: &str) -> &str {
+    match name {
+        "webfetch" => "web_fetch",
+        "websearch" => "web_search",
+        other => other,
+    }
+}
+
 async fn run_tool_call(
     client: &reqwest::Client,
     api_base: &str,
     headers: &HeaderMap,
     tool_name: &str,
     args: JsonValue,
-) -> Result<String> {
-    let endpoint = match tool_name {
+) -> JsonValue {
+    let normalized = normalize_tool_name(tool_name);
+    let endpoint = match normalized {
         "web_search" => format!("{api_base}/api/web_search"),
         "web_fetch" => format!("{api_base}/api/web_fetch"),
-        other => return Ok(format!("Tool {other} not found")),
+        other => {
+            return json!({
+                "error": format!("Tool {other} not found")
+            });
+        }
     };
 
     let payload = if args.is_object() {
@@ -121,24 +102,42 @@ async fn run_tool_call(
         json!({ "query": args })
     };
 
-    let resp = client
+    let resp = match client
         .post(endpoint)
         .headers(headers.clone())
         .json(&payload)
         .send()
         .await
-        .context("tool request failed")?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return json!({
+                "error": format!("tool request failed: {e}")
+            });
+        }
+    };
 
     if !resp.status().is_success() {
         let body = resp
             .text()
             .await
             .unwrap_or_else(|_| "unknown error".to_string());
-        return Err(anyhow!("tool HTTP error: {body}"));
+        return json!({
+            "error": format!("tool HTTP error: {body}")
+        });
     }
 
-    let body = resp.text().await.context("failed to read tool response")?;
-    Ok(truncate_for_context(&body, TOOL_RESULT_LIMIT))
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            return json!({
+                "error": format!("failed to read tool response: {e}")
+            });
+        }
+    };
+
+    let trimmed = truncate_for_context(&body, TOOL_RESULT_LIMIT);
+    serde_json::from_str::<JsonValue>(&trimmed).unwrap_or_else(|_| json!({ "text": trimmed }))
 }
 
 async fn process_agentic_web_search(
@@ -195,57 +194,59 @@ async fn process_agentic_web_search(
             return Err(anyhow!("HTTP error: {body}"));
         }
 
-        let parsed: OllamaChatResponse = resp.json().await.context("invalid chat response")?;
-        if let Some(err) = parsed.error {
-            return Err(anyhow!(err));
+        let parsed: JsonValue = resp.json().await.context("invalid chat response")?;
+
+        if let Some(err) = parsed.get("error").and_then(|v| v.as_str()) {
+            return Err(anyhow!(err.to_string()));
         }
+
         let msg = parsed
-            .message
+            .get("message")
+            .cloned()
             .ok_or_else(|| anyhow!("chat response missing message"))?;
 
-        if !msg.content.is_empty() {
-            final_answer = msg.content.clone();
+        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+            if !content.is_empty() {
+                final_answer = content.to_string();
+            }
         }
 
-        if !msg.thinking.is_empty() {
-            convo.push(json!({
-                "role": "assistant",
-                "content": msg.content,
-                "thinking": msg.thinking,
-            }));
-        } else {
-            convo.push(json!({
-                "role": "assistant",
-                "content": msg.content,
-            }));
-        }
+        // Keep the assistant message exactly as returned (including tool_calls/thinking metadata)
+        // so Ollama can correctly associate subsequent tool outputs.
+        convo.push(msg.clone());
 
-        if msg.tool_calls.is_empty() {
+        let tool_calls = msg
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if tool_calls.is_empty() {
             if final_answer.is_empty() {
                 final_answer = "No response content returned by model.".to_string();
             }
             return Ok(final_answer);
         }
 
-        for tc in msg.tool_calls {
-            let tool_name = tc.function.name;
-            let tool_result = match run_tool_call(
-                &client,
-                &api_base,
-                &headers,
-                &tool_name,
-                tc.function.arguments,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => format!("Tool {tool_name} failed: {e}"),
-            };
+        for tc in tool_calls {
+            let fn_obj = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+            let tool_name = fn_obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tool");
+            let args = fn_obj
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            let tool_result = run_tool_call(&client, &api_base, &headers, tool_name, args).await;
+            let tool_content = serde_json::to_string(&tool_result)
+                .unwrap_or_else(|_| "{\"error\":\"tool serialization failed\"}".to_string());
 
             convo.push(json!({
                 "role": "tool",
                 "tool_name": tool_name,
-                "content": tool_result,
+                "content": tool_content,
             }));
         }
     }
