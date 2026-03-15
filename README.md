@@ -81,10 +81,13 @@ Precedence: environment variables > config file > built-ins.
 
 All keys under `[options]` are forwarded to Ollama's `options` field.
 
+Note: `TUILLAMA_DEBUG_WEB` is an environment variable for the server process (not a config file key).
+
 You can set `ollama_api_key` in config (or `OLLAMA_API_KEY` in env) for hosted providers that require bearer auth.
 
 Press `Ctrl+W` in the client UI to toggle server-side agentic web search per request. In this mode the server loops over `web_search`/`web_fetch` tool calls and returns the final answer to the client.
 When debugging WEB mode, run the server with `TUILLAMA_DEBUG_WEB=1` to print per-request traces (tool calls, endpoints, statuses, extracted URLs) to stderr.
+If your Ollama server returns `404` for `/api/web_search` or `/api/web_fetch`, tuillama now falls back to an internal web retriever (search + fetch) so `WEB ON` still performs live web lookups.
 
 You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
 
