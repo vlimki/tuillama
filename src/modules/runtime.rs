@@ -98,31 +98,45 @@ async fn main() -> Result<()> {
                     chat_id,
                     delta,
                 } => {
-                    if app.pending_request_id.as_deref() == Some(request_id.as_str())
-                        && app.current_chat_id.as_deref() == Some(chat_id.as_str())
-                    {
-                        app.pending_assistant.push_str(&delta);
-                        app.pending_cache = None;
-                        if app.last_draw.elapsed() < app.stream_throttle {
-                            should_draw = false;
+                    if let Some(active) = app.active_streams.get_mut(&chat_id) {
+                        if active.request_id == request_id {
+                            active.buffer.push_str(&delta);
+                            if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                                app.pending_assistant.push_str(&delta);
+                                app.pending_cache = None;
+                                if app.last_draw.elapsed() < app.stream_throttle {
+                                    should_draw = false;
+                                }
+                            }
                         }
                     }
                 }
                 ServerEvent::Done { request_id, chat_id } => {
-                    if app.pending_request_id.as_deref() == Some(request_id.as_str())
-                        && app.current_chat_id.as_deref() == Some(chat_id.as_str())
-                    {
-                        let content = std::mem::take(&mut app.pending_assistant);
-                        app.pending_request_id = None;
-                        app.pending_cache = None;
+                    let matches_active = app
+                        .active_streams
+                        .get(&chat_id)
+                        .map(|a| a.request_id == request_id)
+                        .unwrap_or(false);
+                    if matches_active {
+                        let content = app
+                            .active_streams
+                            .remove(&chat_id)
+                            .map(|s| s.buffer)
+                            .unwrap_or_default();
+
+                        if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
                         app.messages.push(Message {
                             role: Role::Assistant,
                             content: content.clone(),
                         });
+                        refresh_current_stream_state(&mut app);
                         persist_current_chat(&mut app)?;
-                        app.sending = false;
                         if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
                             app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                        }
+                        } else if !content.is_empty() {
+                            append_assistant_to_chat(&chat_id, content)?;
+                            app.chats = list_chats().unwrap_or_default();
                         }
                     }
                 }
@@ -131,17 +145,24 @@ async fn main() -> Result<()> {
                     chat_id,
                     message,
                 } => {
-                    if app.pending_request_id.as_deref() == Some(request_id.as_str())
-                        && app.current_chat_id.as_deref() == Some(chat_id.as_str())
-                    {
-                        app.pending_assistant.clear();
-                        app.pending_request_id = None;
-                        app.pending_cache = None;
-                        app.sending = false;
-                        app.messages.push(Message {
-                            role: Role::System,
-                            content: format!("Error: {}", message),
-                        });
+                    let matches_active = app
+                        .active_streams
+                        .get(&chat_id)
+                        .map(|a| a.request_id == request_id)
+                        .unwrap_or(false);
+                    if matches_active {
+                        app.active_streams.remove(&chat_id);
+                        let formatted = format!("Error: {}", message);
+                        if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                            refresh_current_stream_state(&mut app);
+                            app.messages.push(Message {
+                                role: Role::System,
+                                content: formatted,
+                            });
+                        } else {
+                            append_system_to_chat(&chat_id, formatted)?;
+                            app.chats = list_chats().unwrap_or_default();
+                        }
                     }
                 }
             },
@@ -165,6 +186,48 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+
+fn refresh_current_stream_state(app: &mut App) {
+    let Some(chat_id) = app.current_chat_id.as_ref() else {
+        app.pending_request_id = None;
+        app.pending_assistant.clear();
+        app.sending = false;
+        app.pending_cache = None;
+        return;
+    };
+
+    if let Some(active) = app.active_streams.get(chat_id) {
+        app.pending_request_id = Some(active.request_id.clone());
+        app.pending_assistant = active.buffer.clone();
+        app.sending = true;
+    } else {
+        app.pending_request_id = None;
+        app.pending_assistant.clear();
+        app.sending = false;
+    }
+    app.pending_cache = None;
+}
+
+fn append_assistant_to_chat(chat_id: &str, content: String) -> Result<()> {
+    let mut chat = load_chat(chat_id)?;
+    chat.messages.push(Message {
+        role: Role::Assistant,
+        content,
+    });
+    chat.updated_ts = now_sec();
+    save_chat(&chat)
+}
+
+fn append_system_to_chat(chat_id: &str, content: String) -> Result<()> {
+    let mut chat = load_chat(chat_id)?;
+    chat.messages.push(Message {
+        role: Role::System,
+        content,
+    });
+    chat.updated_ts = now_sec();
+    save_chat(&chat)
+}
+
 fn now_sec() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -180,6 +243,8 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.current_created_ts = Some(now);
     app.messages.clear();
     app.pending_assistant.clear();
+    app.pending_request_id = None;
+    app.sending = false;
     app.selected_msg = None;
     app.chat_scroll = 0;
     app.chat_inner_height = 0;
@@ -197,6 +262,7 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     if let Some(idx) = app.chats.iter().position(|c| c.id == id) {
         app.sidebar_idx = idx;
     }
+    refresh_current_stream_state(app);
     Ok(())
 }
 
@@ -222,6 +288,7 @@ fn persist_current_chat(app: &mut App) -> Result<()> {
     if let Some(idx) = app.chats.iter().position(|c| c.id == id) {
         app.sidebar_idx = idx;
     }
+    refresh_current_stream_state(app);
     Ok(())
 }
 
@@ -237,15 +304,15 @@ async fn handle_key(
             KeyCode::Char('y') => {
                 let del_id = id.clone();
                 delete_chat_file(&del_id)?;
+                app.active_streams.remove(&del_id);
                 if app.current_chat_id.as_deref() == Some(&del_id) {
                     app.current_chat_id = None;
                     app.current_created_ts = None;
                     app.messages.clear();
-                    app.pending_assistant.clear();
                     app.selected_msg = None;
                     app.chat_scroll = 0;
                     app.render_cache.clear();
-                    app.pending_cache = None;
+                    refresh_current_stream_state(app);
                 }
                 app.popup = Popup::None;
                 app.chats = list_chats().unwrap_or_default();
@@ -303,13 +370,16 @@ async fn handle_key(
             }
             // Send with Ctrl+S
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if app.sending {
-                    return Ok(());
-                }
                 let input = app.input.trim().to_string();
                 if input.is_empty() {
                     return Ok(());
                 }
+
+                let chat_id = app.current_chat_id.clone().unwrap_or_default();
+                if app.active_streams.contains_key(&chat_id) {
+                    return Ok(());
+                }
+
                 app.input.clear();
                 app.input_cursor_line = 0;
                 app.input_cursor_col = 0;
@@ -317,11 +387,10 @@ async fn handle_key(
 
                 app.messages.push(Message {
                     role: Role::User,
-                    content: input.clone(),
+                    content: input,
                 });
                 app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
                 persist_current_chat(app)?;
-                app.sending = true;
 
                 let mut convo = app.messages.clone();
                 convo.retain(|m| !matches!(m.role, Role::System) || !m.content.starts_with("Error:"));
@@ -336,20 +405,28 @@ async fn handle_key(
                         );
                     }
                 }
+
+                let request_id = gen_chat_id();
                 let req = ClientRequest::StartStream {
-                    request_id: gen_chat_id(),
-                    chat_id: app.current_chat_id.clone().unwrap_or_default(),
+                    request_id: request_id.clone(),
+                    chat_id: chat_id.clone(),
                     created_ts: app.current_created_ts.unwrap_or_else(now_sec),
                     api_url: app.api_url.clone(),
                     model: app.model.clone(),
                     options: app.options.clone(),
                     messages: convo,
                 };
-                let ClientRequest::StartStream { request_id, .. } = &req;
-                app.pending_request_id = Some(request_id.clone());
+                app.active_streams.insert(
+                    chat_id,
+                    ActiveStream {
+                        request_id: request_id.clone(),
+                        buffer: String::new(),
+                    },
+                );
+                refresh_current_stream_state(app);
                 if server_tx.send(req).is_err() {
-                    app.pending_request_id = None;
-                    app.sending = false;
+                    app.active_streams.retain(|_, v| v.request_id != request_id);
+                    refresh_current_stream_state(app);
                     app.messages.push(Message {
                         role: Role::System,
                         content: "Error: background server is unavailable".to_string(),
@@ -612,11 +689,8 @@ async fn handle_key(
                                 app.current_chat_id = Some(chat.id.clone());
                                 app.current_created_ts = Some(chat.created_ts);
                                 app.messages = chat.messages;
-                                app.pending_assistant.clear();
-                                app.pending_request_id = None;
-                                app.sending = false;
                                 app.render_cache.clear();
-                                app.pending_cache = None;
+                                refresh_current_stream_state(app);
                                 let total = content_total_height(&app.messages, None);
                                 app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                                 app.focus = Focus::Chat;
@@ -724,11 +798,8 @@ async fn handle_key(
                             app.current_chat_id = Some(chat.id.clone());
                             app.current_created_ts = Some(chat.created_ts);
                             app.messages = chat.messages;
-                            app.pending_assistant.clear();
-                            app.pending_request_id = None;
-                            app.sending = false;
                             app.render_cache.clear();
-                            app.pending_cache = None;
+                            refresh_current_stream_state(app);
                             app.selected_msg = Some(app.messages.len().saturating_sub(1));
                             app.chat_scroll =
                                 offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));

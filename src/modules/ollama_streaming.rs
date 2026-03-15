@@ -1,51 +1,29 @@
+use std::sync::Arc;
+
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
+    sync::Mutex,
 };
 
-async fn run_server_once(listener: TcpListener) -> Result<()> {
-    let (socket, _) = listener.accept().await?;
-    let (reader_half, mut writer_half) = socket.into_split();
-    let mut reader = BufReader::new(reader_half);
-    let mut line = String::new();
-
-    while reader.read_line(&mut line).await? > 0 {
-        let req: ClientRequest = serde_json::from_str(line.trim_end())?;
-        line.clear();
-
-        match req {
-            ClientRequest::StartStream {
-                request_id,
-                chat_id,
-                api_url,
-                model,
-                options,
-                messages,
-                ..
-            } => {
-                let response = run_stream_request(request_id, chat_id, api_url, model, options, messages).await;
-                for ev in response {
-                    let payload = serde_json::to_string(&ev)?;
-                    writer_half.write_all(payload.as_bytes()).await?;
-                    writer_half.write_all(b"\n").await?;
-                    writer_half.flush().await?;
-                }
-            }
-        }
-    }
-
+async fn send_server_event(writer: &Arc<Mutex<OwnedWriteHalf>>, ev: &ServerEvent) -> Result<()> {
+    let payload = serde_json::to_string(ev)?;
+    let mut guard = writer.lock().await;
+    guard.write_all(payload.as_bytes()).await?;
+    guard.write_all(b"\n").await?;
+    guard.flush().await?;
     Ok(())
 }
 
-async fn run_stream_request(
+async fn process_stream_request(
+    writer: Arc<Mutex<OwnedWriteHalf>>,
     request_id: String,
     chat_id: String,
     api_url: String,
     model: String,
     options: Option<JsonValue>,
     messages: Vec<Message>,
-) -> Vec<ServerEvent> {
-    let mut out = Vec::new();
+) {
     let req = OllamaChatRequest {
         model: &model,
         messages: &messages,
@@ -57,12 +35,16 @@ async fn run_stream_request(
     let resp = match client.post(api_url).json(&req).send().await {
         Ok(r) => r,
         Err(e) => {
-            out.push(ServerEvent::Error {
-                request_id,
-                chat_id,
-                message: e.to_string(),
-            });
-            return out;
+            let _ = send_server_event(
+                &writer,
+                &ServerEvent::Error {
+                    request_id,
+                    chat_id,
+                    message: e.to_string(),
+                },
+            )
+            .await;
+            return;
         }
     };
 
@@ -71,12 +53,16 @@ async fn run_stream_request(
             .text()
             .await
             .unwrap_or_else(|_| "unknown error".to_string());
-        out.push(ServerEvent::Error {
-            request_id,
-            chat_id,
-            message: format!("HTTP error: {}", text),
-        });
-        return out;
+        let _ = send_server_event(
+            &writer,
+            &ServerEvent::Error {
+                request_id,
+                chat_id,
+                message: format!("HTTP error: {}", text),
+            },
+        )
+        .await;
+        return;
     }
 
     let mut stream = resp.bytes_stream();
@@ -94,41 +80,88 @@ async fn run_stream_request(
                     }
                     if let Ok(obj) = serde_json::from_slice::<OllamaChatStreamChunk>(line) {
                         if let Some(err) = obj.error {
-                            out.push(ServerEvent::Error {
-                                request_id: request_id.clone(),
-                                chat_id: chat_id.clone(),
-                                message: err,
-                            });
-                            return out;
+                            let _ = send_server_event(
+                                &writer,
+                                &ServerEvent::Error {
+                                    request_id,
+                                    chat_id,
+                                    message: err,
+                                },
+                            )
+                            .await;
+                            return;
                         }
                         if let Some(msg) = obj.message {
-                            out.push(ServerEvent::Chunk {
-                                request_id: request_id.clone(),
-                                chat_id: chat_id.clone(),
-                                delta: msg.content,
-                            });
+                            let _ = send_server_event(
+                                &writer,
+                                &ServerEvent::Chunk {
+                                    request_id: request_id.clone(),
+                                    chat_id: chat_id.clone(),
+                                    delta: msg.content,
+                                },
+                            )
+                            .await;
                         }
                         if obj.done {
-                            out.push(ServerEvent::Done {
-                                request_id: request_id.clone(),
-                                chat_id: chat_id.clone(),
-                            });
+                            let _ = send_server_event(
+                                &writer,
+                                &ServerEvent::Done {
+                                    request_id: request_id.clone(),
+                                    chat_id: chat_id.clone(),
+                                },
+                            )
+                            .await;
+                            return;
                         }
                     }
                 }
             }
             Err(e) => {
-                out.push(ServerEvent::Error {
-                    request_id: request_id.clone(),
-                    chat_id: chat_id.clone(),
-                    message: e.to_string(),
+                let _ = send_server_event(
+                    &writer,
+                    &ServerEvent::Error {
+                        request_id,
+                        chat_id,
+                        message: e.to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn run_server(listener: TcpListener) -> Result<()> {
+    let (socket, _) = listener.accept().await?;
+    let (reader_half, writer_half) = socket.into_split();
+    let writer = Arc::new(Mutex::new(writer_half));
+    let mut reader = BufReader::new(reader_half);
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).await? > 0 {
+        let req: ClientRequest = serde_json::from_str(line.trim_end())?;
+        line.clear();
+
+        match req {
+            ClientRequest::StartStream {
+                request_id,
+                chat_id,
+                api_url,
+                model,
+                options,
+                messages,
+                ..
+            } => {
+                let writer2 = writer.clone();
+                tokio::spawn(async move {
+                    process_stream_request(writer2, request_id, chat_id, api_url, model, options, messages).await;
                 });
-                return out;
             }
         }
     }
 
-    out
+    Ok(())
 }
 
 async fn spawn_client_server(tx: UnboundedSender<AppEvent>) -> Result<UnboundedSender<ClientRequest>> {
@@ -136,7 +169,7 @@ async fn spawn_client_server(tx: UnboundedSender<AppEvent>) -> Result<UnboundedS
     let addr = listener.local_addr()?;
 
     tokio::spawn(async move {
-        if let Err(e) = run_server_once(listener).await {
+        if let Err(e) = run_server(listener).await {
             eprintln!("server error: {e}");
         }
     });
