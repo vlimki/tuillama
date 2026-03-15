@@ -144,6 +144,16 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
+                    "Ctrl+W ",
+                    Style::default()
+                        .fg(app.theme.popup_accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Toggle web search"),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
                     "q / Ctrl+C ",
                     Style::default()
                         .fg(app.theme.popup_accent)
@@ -418,6 +428,12 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    title_spans.push(Span::styled(
+        if app.web_search { " [WEB ON]" } else { " [WEB OFF]" },
+        Style::default()
+            .fg(if app.web_search { app.theme.mode_insert } else { app.theme.status_hint })
+            .add_modifier(Modifier::BOLD),
+    ));
     let chat_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_chat))

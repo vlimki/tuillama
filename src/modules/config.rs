@@ -21,6 +21,7 @@ struct PreviewCfg {
 struct AppConfig {
     model: Option<String>,
     api_url: Option<String>,
+    ollama_api_key: Option<String>,
     server_addr: Option<String>,
     options: Option<toml::value::Table>,
     system_prompt: Option<String>,
@@ -46,4 +47,3 @@ fn load_config(path: &PathBuf) -> Result<AppConfig> {
     let cfg: AppConfig = toml::from_str(&s).with_context(|| "parse TOML".to_string())?;
     Ok(cfg)
 }
-

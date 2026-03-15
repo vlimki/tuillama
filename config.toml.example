@@ -1,5 +1,7 @@
 model = "llama3"
 api_url = "http://localhost:11434/api/chat"
+# Optional for hosted Ollama-compatible providers
+ollama_api_key = ""
 server_addr = "127.0.0.1:7878"
 system_prompt = "You are a helpful assistant."
 

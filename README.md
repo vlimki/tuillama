@@ -8,6 +8,7 @@ Finally, a minimalist yet competent Ollama interface.
 * Vim keys
 * Beautiful markdown formatting and syntax highlighting on the terminal
 * Dynamic compilation of messages to PDF or HTML (with LaTeX support!)
+* Toggleable agentic web search mode (`Ctrl+W`) for Ollama-compatible providers
 
 ## Preview
 
@@ -65,6 +66,9 @@ Environment overrides (take precedence over config):
 export OLLAMA_MODEL=llama3
 export OLLAMA_CHAT_URL=http://localhost:11434/api/chat
 export TUILLAMA_SERVER_ADDR=127.0.0.1:7878
+export OLLAMA_API_KEY=<optional_api_key>
+# optional: enable server debug traces for WEB mode
+export TUILLAMA_DEBUG_WEB=1
 ```
 
 ## Configuration
@@ -76,6 +80,11 @@ Config file path (XDG):
 Precedence: environment variables > config file > built-ins.
 
 All keys under `[options]` are forwarded to Ollama's `options` field.
+
+You can set `ollama_api_key` in config (or `OLLAMA_API_KEY` in env) for hosted providers that require bearer auth.
+
+Press `Ctrl+W` in the client UI to toggle server-side agentic web search per request. In this mode the server loops over `web_search`/`web_fetch` tool calls and returns the final answer to the client.
+When debugging WEB mode, run the server with `TUILLAMA_DEBUG_WEB=1` to print per-request traces (tool calls, endpoints, statuses, extracted URLs) to stderr.
 
 You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
 

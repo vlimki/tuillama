@@ -1,0 +1,3 @@
+- Web search
+- Proper model picker menu
+- UI shouldn't break when terminal is resized

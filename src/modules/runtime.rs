@@ -11,6 +11,10 @@ async fn main() -> Result<()> {
         .or_else(|| cfg.api_url.clone())
         .unwrap_or_else(|| "http://localhost:11434/api/chat".to_string());
     let options: Option<JsonValue> = cfg.options.as_ref().and_then(|t| serde_json::to_value(t).ok());
+    let ollama_api_key = std::env::var("OLLAMA_API_KEY")
+        .ok()
+        .or_else(|| cfg.ollama_api_key.clone());
+    let web_search = false;
     let system_prompt = cfg.system_prompt.clone();
     let bold_selection = cfg.bold_selection.unwrap_or(false);
     let theme = Theme::from_config(cfg.colors.as_ref());
@@ -45,6 +49,8 @@ async fn main() -> Result<()> {
         model,
         api_url,
         options,
+        ollama_api_key,
+        web_search,
         system_prompt,
         bold_selection,
         theme,
@@ -383,6 +389,12 @@ async fn handle_key(
         return Ok(());
     }
 
+    // Global: toggle web search with Ctrl+W
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
+        app.web_search = !app.web_search;
+        return Ok(());
+    }
+
     match app.mode {
         Mode::Insert => match key.code {
             KeyCode::Esc => {
@@ -439,6 +451,8 @@ async fn handle_key(
                     api_url: app.api_url.clone(),
                     model: app.model.clone(),
                     options: app.options.clone(),
+                    ollama_api_key: app.ollama_api_key.clone(),
+                    web_search: app.web_search,
                     messages: convo,
                 };
                 app.active_streams.insert(
