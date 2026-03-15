@@ -30,6 +30,19 @@ include!("../modules/ollama_payloads.rs");
 const MAX_TOOL_ITERS: usize = 8;
 const TOOL_RESULT_LIMIT: usize = 8_000;
 
+fn debug_enabled() -> bool {
+    matches!(
+        env::var("TUILLAMA_DEBUG_WEB").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn debug_log(enabled: bool, request_id: &str, message: impl AsRef<str>) {
+    if enabled {
+        eprintln!("[tuillama-server][{request_id}] {}", message.as_ref());
+    }
+}
+
 async fn send_server_event(writer: &Arc<Mutex<OwnedWriteHalf>>, ev: &ServerEvent) -> Result<()> {
     let payload = serde_json::to_string(ev)?;
     let mut guard = writer.lock().await;
@@ -115,6 +128,8 @@ async fn run_tool_call(
     client: &reqwest::Client,
     api_base: &str,
     headers: &HeaderMap,
+    request_id: &str,
+    debug: bool,
     tool_name: &str,
     args: JsonValue,
 ) -> JsonValue {
@@ -135,6 +150,12 @@ async fn run_tool_call(
         json!({ "query": args })
     };
 
+    debug_log(
+        debug,
+        request_id,
+        format!("tool call start: name={normalized} endpoint={endpoint} payload={payload}"),
+    );
+
     let resp = match client
         .post(endpoint)
         .headers(headers.clone())
@@ -142,8 +163,23 @@ async fn run_tool_call(
         .send()
         .await
     {
-        Ok(r) => r,
+        Ok(r) => {
+            debug_log(
+                debug,
+                request_id,
+                format!(
+                    "tool call http status: name={normalized} status={}",
+                    r.status()
+                ),
+            );
+            r
+        }
         Err(e) => {
+            debug_log(
+                debug,
+                request_id,
+                format!("tool call network error: name={normalized} err={e}"),
+            );
             return json!({
                 "error": format!("tool request failed: {e}")
             });
@@ -155,6 +191,11 @@ async fn run_tool_call(
             .text()
             .await
             .unwrap_or_else(|_| "unknown error".to_string());
+        debug_log(
+            debug,
+            request_id,
+            format!("tool call http error body: name={normalized} body={body}"),
+        );
         return json!({
             "error": format!("tool HTTP error: {body}")
         });
@@ -163,6 +204,11 @@ async fn run_tool_call(
     let body = match resp.text().await {
         Ok(b) => b,
         Err(e) => {
+            debug_log(
+                debug,
+                request_id,
+                format!("tool call read body error: name={normalized} err={e}"),
+            );
             return json!({
                 "error": format!("failed to read tool response: {e}")
             });
@@ -170,19 +216,36 @@ async fn run_tool_call(
     };
 
     let trimmed = truncate_for_context(&body, TOOL_RESULT_LIMIT);
-    serde_json::from_str::<JsonValue>(&trimmed).unwrap_or_else(|_| json!({ "text": trimmed }))
+    let parsed =
+        serde_json::from_str::<JsonValue>(&trimmed).unwrap_or_else(|_| json!({ "text": trimmed }));
+    debug_log(
+        debug,
+        request_id,
+        format!("tool call parsed response: name={normalized} parsed={parsed}"),
+    );
+    parsed
 }
 
 async fn process_agentic_web_search(
+    request_id: &str,
     api_url: String,
     model: String,
     options: Option<JsonValue>,
     ollama_api_key: Option<String>,
     messages: Vec<Message>,
+    debug: bool,
 ) -> Result<String> {
     let client = reqwest::Client::new();
     let headers = build_auth_headers(ollama_api_key.as_deref());
     let api_base = api_base_from_chat_url(&api_url);
+    debug_log(
+        debug,
+        request_id,
+        format!(
+            "agentic mode start: model={model} api_url={api_url} api_base={api_base} message_count={}",
+            messages.len()
+        ),
+    );
 
     let tools = vec![
         json!({ "type": "function", "function": { "name": "web_search" } }),
@@ -202,10 +265,17 @@ async fn process_agentic_web_search(
     // Force at least one real web retrieval in WEB ON mode, so providers/models
     // that don't autonomously emit tool calls still get fresh context.
     if let Some(query) = latest_user_query(&messages) {
+        debug_log(
+            debug,
+            request_id,
+            format!("preflight web_search query={query}"),
+        );
         let search_result = run_tool_call(
             &client,
             &api_base,
             &headers,
+            request_id,
+            debug,
             "web_search",
             json!({ "query": query }),
         )
@@ -214,6 +284,11 @@ async fn process_agentic_web_search(
         let mut urls = Vec::new();
         collect_urls(&search_result, &mut urls);
         urls.truncate(3);
+        debug_log(
+            debug,
+            request_id,
+            format!("preflight extracted urls: {:?}", urls),
+        );
 
         let mut fetches: Vec<JsonValue> = Vec::new();
         for url in urls {
@@ -221,6 +296,8 @@ async fn process_agentic_web_search(
                 &client,
                 &api_base,
                 &headers,
+                request_id,
+                debug,
                 "web_fetch",
                 json!({ "url": url }),
             )
@@ -234,6 +311,11 @@ async fn process_agentic_web_search(
         });
 
         let web_context_text = truncate_for_context(&web_context.to_string(), TOOL_RESULT_LIMIT);
+        debug_log(
+            debug,
+            request_id,
+            format!("preflight web context bytes={}", web_context_text.len()),
+        );
         convo.push(json!({
             "role": "system",
             "content": format!(
@@ -245,7 +327,16 @@ async fn process_agentic_web_search(
 
     let mut final_answer = String::new();
 
-    for _ in 0..MAX_TOOL_ITERS {
+    for iter in 0..MAX_TOOL_ITERS {
+        debug_log(
+            debug,
+            request_id,
+            format!(
+                "agent loop iteration={} convo_len={}",
+                iter + 1,
+                convo.len()
+            ),
+        );
         let req = json!({
             "model": &model,
             "messages": &convo,
@@ -274,6 +365,11 @@ async fn process_agentic_web_search(
         let parsed: JsonValue = resp.json().await.context("invalid chat response")?;
 
         if let Some(err) = parsed.get("error").and_then(|v| v.as_str()) {
+            debug_log(
+                debug,
+                request_id,
+                format!("chat response error field: {err}"),
+            );
             return Err(anyhow!(err.to_string()));
         }
 
@@ -297,6 +393,11 @@ async fn process_agentic_web_search(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        debug_log(
+            debug,
+            request_id,
+            format!("model tool_calls count={}", tool_calls.len()),
+        );
 
         if tool_calls.is_empty() {
             if final_answer.is_empty() {
@@ -316,7 +417,10 @@ async fn process_agentic_web_search(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
-            let tool_result = run_tool_call(&client, &api_base, &headers, tool_name, args).await;
+            let tool_result = run_tool_call(
+                &client, &api_base, &headers, request_id, debug, tool_name, args,
+            )
+            .await;
             let tool_content = serde_json::to_string(&tool_result)
                 .unwrap_or_else(|_| "{\"error\":\"tool serialization failed\"}".to_string());
 
@@ -474,8 +578,24 @@ async fn process_stream_request(
     web_search: bool,
     messages: Vec<Message>,
 ) {
+    let debug = debug_enabled();
+    debug_log(
+        debug,
+        &request_id,
+        format!("start stream: chat_id={chat_id} web_search={web_search} model={model}"),
+    );
     if web_search {
-        match process_agentic_web_search(api_url, model, options, ollama_api_key, messages).await {
+        match process_agentic_web_search(
+            &request_id,
+            api_url,
+            model,
+            options,
+            ollama_api_key,
+            messages,
+            debug,
+        )
+        .await
+        {
             Ok(answer) => {
                 let _ = send_server_event(
                     &writer,
