@@ -70,6 +70,39 @@ fn truncate_for_context(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+fn latest_user_query(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User) && !m.content.trim().is_empty())
+        .map(|m| m.content.trim().to_string())
+}
+
+fn collect_urls(value: &JsonValue, out: &mut Vec<String>) {
+    match value {
+        JsonValue::Object(map) => {
+            for key in ["url", "link", "href"] {
+                if let Some(v) = map.get(key).and_then(|x| x.as_str()) {
+                    if (v.starts_with("http://") || v.starts_with("https://"))
+                        && !out.iter().any(|u| u == v)
+                    {
+                        out.push(v.to_string());
+                    }
+                }
+            }
+            for v in map.values() {
+                collect_urls(v, out);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr {
+                collect_urls(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn normalize_tool_name(name: &str) -> &str {
     match name {
         "webfetch" => "web_fetch",
@@ -165,6 +198,50 @@ async fn process_agentic_web_search(
             })
         })
         .collect();
+
+    // Force at least one real web retrieval in WEB ON mode, so providers/models
+    // that don't autonomously emit tool calls still get fresh context.
+    if let Some(query) = latest_user_query(&messages) {
+        let search_result = run_tool_call(
+            &client,
+            &api_base,
+            &headers,
+            "web_search",
+            json!({ "query": query }),
+        )
+        .await;
+
+        let mut urls = Vec::new();
+        collect_urls(&search_result, &mut urls);
+        urls.truncate(3);
+
+        let mut fetches: Vec<JsonValue> = Vec::new();
+        for url in urls {
+            let fetched = run_tool_call(
+                &client,
+                &api_base,
+                &headers,
+                "web_fetch",
+                json!({ "url": url }),
+            )
+            .await;
+            fetches.push(fetched);
+        }
+
+        let web_context = json!({
+            "search": search_result,
+            "fetch": fetches,
+        });
+
+        let web_context_text = truncate_for_context(&web_context.to_string(), TOOL_RESULT_LIMIT);
+        convo.push(json!({
+            "role": "system",
+            "content": format!(
+                "Use the following live web retrieval data to answer with citations (URLs): {}",
+                web_context_text
+            ),
+        }));
+    }
 
     let mut final_answer = String::new();
 
