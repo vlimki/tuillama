@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) = unbounded_channel();
+    let server_tx = spawn_client_server(tx.clone()).await?;
 
     // Blocking input reader thread with configurable poll period
     let tx_input = tx.clone();
@@ -83,36 +84,67 @@ async fn main() -> Result<()> {
         let mut should_draw = true;
 
         match ev {
-            AppEvent::Input(key) => handle_key(key, &mut app, &tx).await?,
-            AppEvent::OllamaChunk(delta) => {
-                app.pending_assistant.push_str(&delta);
-                app.pending_cache = None;
-                if app.last_draw.elapsed() < app.stream_throttle {
-                    should_draw = false;
-                }
-            }
-            AppEvent::OllamaDone => {
-                let content = std::mem::take(&mut app.pending_assistant);
-                app.pending_cache = None;
-                app.messages.push(Message {
-                    role: Role::Assistant,
-                    content: content.clone(),
-                });
-                persist_current_chat(&mut app)?;
-                app.sending = false;
-                if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
-                    app.selected_msg = Some(app.messages.len().saturating_sub(1));
-                }
-            }
+            AppEvent::Input(key) => handle_key(key, &mut app, &tx, &server_tx).await?,
             AppEvent::OllamaError(e) => {
-                app.pending_assistant.clear();
-                app.pending_cache = None;
-                app.sending = false;
                 app.messages.push(Message {
                     role: Role::System,
                     content: format!("Error: {}", e),
                 });
+                app.render_cache.clear();
             }
+            AppEvent::ServerEvent(sev) => match sev {
+                ServerEvent::Chunk {
+                    request_id,
+                    chat_id,
+                    delta,
+                } => {
+                    if app.pending_request_id.as_deref() == Some(request_id.as_str())
+                        && app.current_chat_id.as_deref() == Some(chat_id.as_str())
+                    {
+                        app.pending_assistant.push_str(&delta);
+                        app.pending_cache = None;
+                        if app.last_draw.elapsed() < app.stream_throttle {
+                            should_draw = false;
+                        }
+                    }
+                }
+                ServerEvent::Done { request_id, chat_id } => {
+                    if app.pending_request_id.as_deref() == Some(request_id.as_str())
+                        && app.current_chat_id.as_deref() == Some(chat_id.as_str())
+                    {
+                        let content = std::mem::take(&mut app.pending_assistant);
+                        app.pending_request_id = None;
+                        app.pending_cache = None;
+                        app.messages.push(Message {
+                            role: Role::Assistant,
+                            content: content.clone(),
+                        });
+                        persist_current_chat(&mut app)?;
+                        app.sending = false;
+                        if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
+                            app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                        }
+                    }
+                }
+                ServerEvent::Error {
+                    request_id,
+                    chat_id,
+                    message,
+                } => {
+                    if app.pending_request_id.as_deref() == Some(request_id.as_str())
+                        && app.current_chat_id.as_deref() == Some(chat_id.as_str())
+                    {
+                        app.pending_assistant.clear();
+                        app.pending_request_id = None;
+                        app.pending_cache = None;
+                        app.sending = false;
+                        app.messages.push(Message {
+                            role: Role::System,
+                            content: format!("Error: {}", message),
+                        });
+                    }
+                }
+            },
         }
 
         if should_draw {
@@ -193,7 +225,12 @@ fn persist_current_chat(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) -> Result<()> {
+async fn handle_key(
+    key: KeyEvent,
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    server_tx: &UnboundedSender<ClientRequest>,
+) -> Result<()> {
     // Popups
     match &app.popup {
         Popup::ConfirmDelete { id, .. } => match key.code {
@@ -299,11 +336,25 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                         );
                     }
                 }
-                let api_url = app.api_url.clone();
-                let model = app.model.clone();
-                let options = app.options.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move { stream_ollama(api_url, model, options, convo, tx2).await; });
+                let req = ClientRequest::StartStream {
+                    request_id: gen_chat_id(),
+                    chat_id: app.current_chat_id.clone().unwrap_or_default(),
+                    created_ts: app.current_created_ts.unwrap_or_else(now_sec),
+                    api_url: app.api_url.clone(),
+                    model: app.model.clone(),
+                    options: app.options.clone(),
+                    messages: convo,
+                };
+                let ClientRequest::StartStream { request_id, .. } = &req;
+                app.pending_request_id = Some(request_id.clone());
+                if server_tx.send(req).is_err() {
+                    app.pending_request_id = None;
+                    app.sending = false;
+                    app.messages.push(Message {
+                        role: Role::System,
+                        content: "Error: background server is unavailable".to_string(),
+                    });
+                }
             }
             // Enter inserts newline (multiline)
             KeyCode::Enter => {
@@ -561,6 +612,9 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                                 app.current_chat_id = Some(chat.id.clone());
                                 app.current_created_ts = Some(chat.created_ts);
                                 app.messages = chat.messages;
+                                app.pending_assistant.clear();
+                                app.pending_request_id = None;
+                                app.sending = false;
                                 app.render_cache.clear();
                                 app.pending_cache = None;
                                 let total = content_total_height(&app.messages, None);
@@ -670,6 +724,9 @@ async fn handle_key(key: KeyEvent, app: &mut App, tx: &UnboundedSender<AppEvent>
                             app.current_chat_id = Some(chat.id.clone());
                             app.current_created_ts = Some(chat.created_ts);
                             app.messages = chat.messages;
+                            app.pending_assistant.clear();
+                            app.pending_request_id = None;
+                            app.sending = false;
                             app.render_cache.clear();
                             app.pending_cache = None;
                             app.selected_msg = Some(app.messages.len().saturating_sub(1));

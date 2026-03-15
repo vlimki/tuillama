@@ -4,6 +4,7 @@ struct App {
     current_created_ts: Option<i64>,
     messages: Vec<Message>,
     pending_assistant: String,
+    pending_request_id: Option<String>,
 
     // sidebar
     chats: Vec<ChatMeta>,
@@ -74,6 +75,7 @@ impl App {
             current_created_ts: None,
             messages: Vec::new(),
             pending_assistant: String::new(),
+            pending_request_id: None,
             chats,
             sidebar_idx: 0,
             show_sidebar: true,

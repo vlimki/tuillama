@@ -22,6 +22,15 @@ Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, s
 ![Preview 2](media/preview2.png)
 
 
+## Architecture
+
+`tuillama` now uses an internal client/server split:
+
+* **Client (TUI):** handles rendering, input, navigation, and stream presentation.
+* **Server worker:** owns Ollama HTTP streaming, emits structured events, and tags every stream with `chat_id` + `request_id`.
+
+This prevents streamed tokens from spilling into a different chat if you switch views mid-response, and makes it easier to grow into a remote/multi-client design later.
+
 ## Requirements
 
 * Rust toolchain
@@ -67,6 +76,6 @@ All keys under `[options]` are forwarded to Ollama's `options` field.
 ## Limitations (for now)
 
 * Models and custom options require manually editing the config file and restarting the app
-* The UI is clumsy at times + you must have the proper chat open at all times whilst the LLM is typing
+* The UI is still minimal and rough around the edges
 * No image support (this should be relatively easy to fix)
 * A bunch of other stuff, probably, since the app is so minimal

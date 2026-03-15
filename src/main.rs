@@ -49,6 +49,7 @@ use syntect::{
 };
 
 include!("modules/data_models.rs");
+include!("modules/protocol.rs");
 include!("modules/theme.rs");
 include!("modules/config.rs");
 include!("modules/storage.rs");

@@ -1,23 +1,68 @@
-async fn stream_ollama(
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::{TcpListener, TcpStream},
+};
+
+async fn run_server_once(listener: TcpListener) -> Result<()> {
+    let (socket, _) = listener.accept().await?;
+    let (reader_half, mut writer_half) = socket.into_split();
+    let mut reader = BufReader::new(reader_half);
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).await? > 0 {
+        let req: ClientRequest = serde_json::from_str(line.trim_end())?;
+        line.clear();
+
+        match req {
+            ClientRequest::StartStream {
+                request_id,
+                chat_id,
+                api_url,
+                model,
+                options,
+                messages,
+                ..
+            } => {
+                let response = run_stream_request(request_id, chat_id, api_url, model, options, messages).await;
+                for ev in response {
+                    let payload = serde_json::to_string(&ev)?;
+                    writer_half.write_all(payload.as_bytes()).await?;
+                    writer_half.write_all(b"\n").await?;
+                    writer_half.flush().await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_stream_request(
+    request_id: String,
+    chat_id: String,
     api_url: String,
     model: String,
     options: Option<JsonValue>,
     messages: Vec<Message>,
-    tx: UnboundedSender<AppEvent>,
-) {
+) -> Vec<ServerEvent> {
+    let mut out = Vec::new();
     let req = OllamaChatRequest {
         model: &model,
         messages: &messages,
         stream: true,
         options: options.as_ref(),
     };
-    let client = reqwest::Client::new();
 
+    let client = reqwest::Client::new();
     let resp = match client.post(api_url).json(&req).send().await {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(AppEvent::OllamaError(e.to_string()));
-            return;
+            out.push(ServerEvent::Error {
+                request_id,
+                chat_id,
+                message: e.to_string(),
+            });
+            return out;
         }
     };
 
@@ -26,8 +71,12 @@ async fn stream_ollama(
             .text()
             .await
             .unwrap_or_else(|_| "unknown error".to_string());
-        let _ = tx.send(AppEvent::OllamaError(format!("HTTP error: {}", text)));
-        return;
+        out.push(ServerEvent::Error {
+            request_id,
+            chat_id,
+            message: format!("HTTP error: {}", text),
+        });
+        return out;
     }
 
     let mut stream = resp.bytes_stream();
@@ -43,27 +92,92 @@ async fn stream_ollama(
                     if line.is_empty() {
                         continue;
                     }
-                    match serde_json::from_slice::<OllamaChatStreamChunk>(line) {
-                        Ok(obj) => {
-                            if let Some(err) = obj.error {
-                                let _ = tx.send(AppEvent::OllamaError(err));
-                            }
-                            if let Some(msg) = obj.message {
-                                let _ = tx.send(AppEvent::OllamaChunk(msg.content));
-                            }
-                            if obj.done {
-                                let _ = tx.send(AppEvent::OllamaDone);
-                            }
+                    if let Ok(obj) = serde_json::from_slice::<OllamaChatStreamChunk>(line) {
+                        if let Some(err) = obj.error {
+                            out.push(ServerEvent::Error {
+                                request_id: request_id.clone(),
+                                chat_id: chat_id.clone(),
+                                message: err,
+                            });
+                            return out;
                         }
-                        Err(_) => {}
+                        if let Some(msg) = obj.message {
+                            out.push(ServerEvent::Chunk {
+                                request_id: request_id.clone(),
+                                chat_id: chat_id.clone(),
+                                delta: msg.content,
+                            });
+                        }
+                        if obj.done {
+                            out.push(ServerEvent::Done {
+                                request_id: request_id.clone(),
+                                chat_id: chat_id.clone(),
+                            });
+                        }
                     }
                 }
             }
             Err(e) => {
-                let _ = tx.send(AppEvent::OllamaError(e.to_string()));
-                break;
+                out.push(ServerEvent::Error {
+                    request_id: request_id.clone(),
+                    chat_id: chat_id.clone(),
+                    message: e.to_string(),
+                });
+                return out;
             }
         }
     }
+
+    out
 }
 
+async fn spawn_client_server(tx: UnboundedSender<AppEvent>) -> Result<UnboundedSender<ClientRequest>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        if let Err(e) = run_server_once(listener).await {
+            eprintln!("server error: {e}");
+        }
+    });
+
+    let stream = TcpStream::connect(addr).await?;
+    let (read_half, mut write_half) = stream.into_split();
+
+    let (req_tx, mut req_rx) = unbounded_channel::<ClientRequest>();
+    tokio::spawn(async move {
+        while let Some(req) = req_rx.recv().await {
+            match serde_json::to_string(&req) {
+                Ok(s) => {
+                    if write_half.write_all(s.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if write_half.write_all(b"\n").await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let tx_read = tx.clone();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(ev) = serde_json::from_str::<ServerEvent>(line.trim_end()) {
+                        let _ = tx_read.send(AppEvent::ServerEvent(ev));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(req_tx)
+}
