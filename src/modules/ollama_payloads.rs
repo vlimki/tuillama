@@ -5,6 +5,20 @@ struct OllamaChatRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<&'a JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [OllamaTool]>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: OllamaToolFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaToolFunction {
+    name: &'static str,
 }
 
 #[derive(Debug, Deserialize)]

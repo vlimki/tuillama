@@ -3,6 +3,8 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{env, sync::Arc};
+
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
@@ -42,17 +44,42 @@ async fn process_stream_request(
     api_url: String,
     model: String,
     options: Option<JsonValue>,
+    ollama_api_key: Option<String>,
+    web_search: bool,
     messages: Vec<Message>,
 ) {
+    let web_search_tools = [OllamaTool {
+        kind: "function",
+        function: OllamaToolFunction { name: "web_search" },
+    }];
     let req = OllamaChatRequest {
         model: &model,
         messages: &messages,
         stream: true,
         options: options.as_ref(),
+        tools: if web_search {
+            Some(&web_search_tools)
+        } else {
+            None
+        },
     };
 
+    let mut headers = HeaderMap::new();
+    if let Some(key) = ollama_api_key.as_deref() {
+        if let Ok(mut val) = HeaderValue::from_str(&format!("Bearer {key}")) {
+            val.set_sensitive(true);
+            headers.insert(AUTHORIZATION, val);
+        }
+    }
+
     let client = reqwest::Client::new();
-    let resp = match client.post(api_url).json(&req).send().await {
+    let resp = match client
+        .post(api_url)
+        .headers(headers)
+        .json(&req)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let _ = send_server_event(
@@ -169,13 +196,23 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                 api_url,
                 model,
                 options,
+                ollama_api_key,
+                web_search,
                 messages,
                 ..
             } => {
                 let writer2 = writer.clone();
                 tokio::spawn(async move {
                     process_stream_request(
-                        writer2, request_id, chat_id, api_url, model, options, messages,
+                        writer2,
+                        request_id,
+                        chat_id,
+                        api_url,
+                        model,
+                        options,
+                        ollama_api_key,
+                        web_search,
+                        messages,
                     )
                     .await;
                 });

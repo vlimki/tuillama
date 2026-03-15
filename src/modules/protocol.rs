@@ -8,6 +8,8 @@ enum ClientRequest {
         api_url: String,
         model: String,
         options: Option<JsonValue>,
+        ollama_api_key: Option<String>,
+        web_search: bool,
         messages: Vec<Message>,
     },
 }
