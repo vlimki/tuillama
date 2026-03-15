@@ -22,6 +22,15 @@ Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, s
 ![Preview 2](media/preview2.png)
 
 
+## Architecture
+
+`tuillama` now uses a client/server split with separate executables:
+
+* **Client (`tuillama`):** handles rendering, input, navigation, and stream presentation.
+* **Server (`tuillama-server`):** owns all Ollama HTTP streaming, emits structured events, and tags every stream with `chat_id` + `request_id`.
+
+This prevents streamed tokens from spilling into a different chat when switching views and supports multiple chats generating concurrently.
+
 ## Requirements
 
 * Rust toolchain
@@ -43,8 +52,11 @@ cargo build --release
 ollama pull llama3
 # or: ollama run llama3
 
-# run the app
-cargo run
+# run server (separate terminal)
+cargo run --bin tuillama-server
+
+# run client
+cargo run --bin tuillama
 ```
 
 Environment overrides (take precedence over config):
@@ -52,6 +64,7 @@ Environment overrides (take precedence over config):
 ```bash
 export OLLAMA_MODEL=llama3
 export OLLAMA_CHAT_URL=http://localhost:11434/api/chat
+export TUILLAMA_SERVER_ADDR=127.0.0.1:7878
 ```
 
 ## Configuration
@@ -64,9 +77,11 @@ Precedence: environment variables > config file > built-ins.
 
 All keys under `[options]` are forwarded to Ollama's `options` field.
 
+You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
+
 ## Limitations (for now)
 
 * Models and custom options require manually editing the config file and restarting the app
-* The UI is clumsy at times + you must have the proper chat open at all times whilst the LLM is typing
+* The UI is still minimal and rough around the edges
 * No image support (this should be relatively easy to fix)
 * A bunch of other stuff, probably, since the app is so minimal

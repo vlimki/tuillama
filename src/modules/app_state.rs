@@ -1,9 +1,18 @@
+
+#[derive(Clone, Debug)]
+struct ActiveStream {
+    request_id: String,
+    buffer: String,
+}
+
 struct App {
     // current chat
     current_chat_id: Option<String>,
     current_created_ts: Option<i64>,
     messages: Vec<Message>,
     pending_assistant: String,
+    pending_request_id: Option<String>,
+    active_streams: HashMap<String, ActiveStream>,
 
     // sidebar
     chats: Vec<ChatMeta>,
@@ -74,6 +83,8 @@ impl App {
             current_created_ts: None,
             messages: Vec::new(),
             pending_assistant: String::new(),
+            pending_request_id: None,
+            active_streams: HashMap::new(),
             chats,
             sidebar_idx: 0,
             show_sidebar: true,
