@@ -1,0 +1,4 @@
+- Web search
+- Proper model picker menu
+- UI shouldn't break when terminal is resized
+- Make it a proper client-server model. It is currently way too clumsy as a client-only app. If you happen to open a new chat whilst there is text generating in the previous one, the text will spill over to the new chat. A client-server model fixes this.

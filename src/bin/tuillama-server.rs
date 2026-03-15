@@ -27,7 +27,7 @@ struct Message {
 include!("../modules/protocol.rs");
 include!("../modules/ollama_payloads.rs");
 
-const MAX_TOOL_ITERS: usize = 8;
+const MAX_TOOL_ITERS: usize = 7;
 const TOOL_RESULT_LIMIT: usize = 8_000;
 
 fn debug_enabled() -> bool {
@@ -135,8 +135,9 @@ async fn run_tool_call(
 ) -> JsonValue {
     let normalized = normalize_tool_name(tool_name);
     let endpoint = match normalized {
-        "web_search" => format!("{api_base}/api/web_search"),
-        "web_fetch" => format!("{api_base}/api/web_fetch"),
+        // Use ollama.com instead of local API for these
+        "web_search" => format!("https://ollama.com/api/web_search"),
+        "web_fetch" => format!("https://ollama.com/api/web_fetch"),
         other => {
             return json!({
                 "error": format!("Tool {other} not found")
