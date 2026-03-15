@@ -77,6 +77,8 @@ Precedence: environment variables > config file > built-ins.
 
 All keys under `[options]` are forwarded to Ollama's `options` field.
 
+You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
+
 ## Limitations (for now)
 
 * Models and custom options require manually editing the config file and restarting the app

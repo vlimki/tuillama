@@ -1,5 +1,6 @@
 model = "llama3"
 api_url = "http://localhost:11434/api/chat"
+server_addr = "127.0.0.1:7878"
 system_prompt = "You are a helpful assistant."
 
 # in visual mode, the selected message will be typed out as bold instead of recoloring the background

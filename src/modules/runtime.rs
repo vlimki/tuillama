@@ -63,7 +63,10 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) = unbounded_channel();
-    let server_addr = std::env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+    let server_addr = std::env::var("TUILLAMA_SERVER_ADDR")
+        .ok()
+        .or_else(|| cfg.server_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
     let server_tx = connect_server(tx.clone(), &server_addr).await?;
 
     // Blocking input reader thread with configurable poll period

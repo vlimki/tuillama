@@ -21,6 +21,7 @@ struct PreviewCfg {
 struct AppConfig {
     model: Option<String>,
     api_url: Option<String>,
+    server_addr: Option<String>,
     options: Option<toml::value::Table>,
     system_prompt: Option<String>,
     bold_selection: Option<bool>,
