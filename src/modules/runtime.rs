@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
                 app.messages.push(Message {
                     role: Role::System,
                     content: format!("Error: {}", e),
+                    created_ts: now_sec(),
                     thinking: None,
                 });
                 app.render_cache.clear();
@@ -160,6 +161,7 @@ async fn main() -> Result<()> {
                             app.messages.push(Message {
                                 role: Role::Assistant,
                                 content: content.clone(),
+                                created_ts: now_sec(),
                                 thinking,
                             });
                             if app.chat_at_bottom {
@@ -175,6 +177,7 @@ async fn main() -> Result<()> {
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Error: {}", e),
+                                    created_ts: now_sec(),
                                     thinking: None,
                                 });
                             }
@@ -200,6 +203,7 @@ async fn main() -> Result<()> {
                             app.messages.push(Message {
                                 role: Role::System,
                                 content: formatted,
+                                created_ts: now_sec(),
                                 thinking: None,
                             });
                         } else {
@@ -207,6 +211,7 @@ async fn main() -> Result<()> {
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Error: {}", e),
+                                    created_ts: now_sec(),
                                     thinking: None,
                                 });
                             }
@@ -305,6 +310,7 @@ fn append_assistant_to_chat(chat_id: &str, content: String, thinking: Option<Str
     chat.messages.push(Message {
         role: Role::Assistant,
         content,
+        created_ts: now_sec(),
         thinking,
     });
     chat.updated_ts = now_sec();
@@ -319,6 +325,7 @@ fn append_system_to_chat(chat_id: &str, content: String) -> Result<()> {
     chat.messages.push(Message {
         role: Role::System,
         content,
+        created_ts: now_sec(),
         thinking: None,
     });
     chat.updated_ts = now_sec();
@@ -504,6 +511,12 @@ async fn handle_key(
         return Ok(());
     }
 
+    // Global: toggle stats panel with Ctrl+P
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('p')) {
+        app.show_stats_panel = !app.show_stats_panel;
+        return Ok(());
+    }
+
     // Global: toggle thinking visibility with Ctrl+Y
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('y')) {
         app.show_thinking = !app.show_thinking;
@@ -536,6 +549,7 @@ async fn handle_key(
                 app.messages.push(Message {
                     role: Role::User,
                     content: input,
+                    created_ts: now_sec(),
                     thinking: None,
                 });
                 app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
@@ -554,6 +568,7 @@ async fn handle_key(
                             Message {
                                 role: Role::System,
                                 content: sp,
+                                created_ts: now_sec(),
                                 thinking: None,
                             },
                         );
@@ -591,6 +606,7 @@ async fn handle_key(
                     app.messages.push(Message {
                         role: Role::System,
                         content: "Error: background server is unavailable".to_string(),
+                        created_ts: now_sec(),
                         thinking: None,
                     });
                 }
@@ -784,6 +800,7 @@ async fn handle_key(
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Clipboard paste failed: {}", e),
+                                    created_ts: now_sec(),
                                     thinking: None,
                                 });
                                 app.render_cache.clear();
@@ -883,6 +900,7 @@ async fn handle_key(
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Clipboard copy failed: {}", e),
+                                    created_ts: now_sec(),
                                     thinking: None,
                                 });
                                 app.render_cache.clear();
