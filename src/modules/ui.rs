@@ -293,6 +293,12 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     app.chat_inner_width = v_chunks[0].width.saturating_sub(2);
     let inner_w = app.chat_inner_width;
 
+    if app.scroll_to_bottom_on_draw {
+        let total = content_total_height(app, inner_w.max(1));
+        app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+        app.scroll_to_bottom_on_draw = false;
+    }
+
     let mut text = Text::default();
     let sel = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
 

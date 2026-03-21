@@ -339,6 +339,7 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.chat_scroll = 0;
     app.chat_inner_height = 0;
     app.chat_inner_width = 0;
+    app.scroll_to_bottom_on_draw = false;
     app.render_cache.clear();
     app.pending_cache = None;
     let chat = Chat {
@@ -791,8 +792,7 @@ async fn handle_key(
                 }
                 KeyCode::Char('G') => {
                     if app.focus == Focus::Chat {
-                        let total = content_total_height(app, app.chat_inner_width.max(1));
-                        app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+                        app.scroll_to_bottom_on_draw = true;
                     }
                 }
                 KeyCode::Enter => match app.focus {
@@ -805,8 +805,7 @@ async fn handle_key(
                                 app.messages = chat.messages;
                                 app.render_cache.clear();
                                 refresh_current_stream_state(app);
-                                let total = content_total_height(app, app.chat_inner_width.max(1));
-                                app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+                                app.scroll_to_bottom_on_draw = true;
                                 app.focus = Focus::Chat;
                             }
                         }
