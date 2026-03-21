@@ -124,9 +124,99 @@ fn normalize_tool_name(name: &str) -> &str {
     }
 }
 
+fn web_tools() -> Vec<JsonValue> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for up-to-date information. Always pass the user's search text in the required `query` string field.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query to send to the web search API."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch the contents of a specific web page. Always pass the target page in the required `url` string field.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The absolute http or https URL to fetch."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+    ]
+}
+
+fn normalize_tool_payload(tool_name: &str, raw_args: JsonValue) -> JsonValue {
+    let normalized_name = normalize_tool_name(tool_name);
+    let args = match raw_args {
+        JsonValue::String(s) => {
+            serde_json::from_str::<JsonValue>(&s).unwrap_or_else(|_| match normalized_name {
+                "web_fetch" => json!({ "url": s }),
+                _ => json!({ "query": s }),
+            })
+        }
+        other => other,
+    };
+
+    match normalized_name {
+        "web_search" => match args {
+            JsonValue::Object(map) => {
+                if let Some(query) = map
+                    .get("query")
+                    .or_else(|| map.get("text"))
+                    .or_else(|| map.get("q"))
+                    .and_then(|v| v.as_str())
+                {
+                    json!({ "query": query.trim() })
+                } else {
+                    JsonValue::Object(map)
+                }
+            }
+            JsonValue::String(s) => json!({ "query": s.trim() }),
+            other => json!({ "query": other }),
+        },
+        "web_fetch" => match args {
+            JsonValue::Object(map) => {
+                if let Some(url) = map
+                    .get("url")
+                    .or_else(|| map.get("href"))
+                    .or_else(|| map.get("link"))
+                    .and_then(|v| v.as_str())
+                {
+                    json!({ "url": url.trim() })
+                } else {
+                    JsonValue::Object(map)
+                }
+            }
+            JsonValue::String(s) => json!({ "url": s.trim() }),
+            other => json!({ "url": other }),
+        },
+        _ => args,
+    }
+}
+
 async fn run_tool_call(
     client: &reqwest::Client,
-    api_base: &str,
+    _api_base: &str,
     headers: &HeaderMap,
     request_id: &str,
     debug: bool,
@@ -145,11 +235,7 @@ async fn run_tool_call(
         }
     };
 
-    let payload = if args.is_object() {
-        args
-    } else {
-        json!({ "query": args })
-    };
+    let payload = normalize_tool_payload(normalized, args);
 
     debug_log(
         debug,
@@ -248,10 +334,7 @@ async fn process_agentic_web_search(
         ),
     );
 
-    let tools = vec![
-        json!({ "type": "function", "function": { "name": "web_search" } }),
-        json!({ "type": "function", "function": { "name": "web_fetch" } }),
-    ];
+    let tools = web_tools();
 
     let mut convo: Vec<JsonValue> = messages
         .iter()
@@ -439,6 +522,53 @@ async fn process_agentic_web_search(
         ))
     } else {
         Ok(final_answer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_web_search_argument_aliases() {
+        assert_eq!(
+            normalize_tool_payload("web_search", json!({ "text": "latest rust news" })),
+            json!({ "query": "latest rust news" })
+        );
+        assert_eq!(
+            normalize_tool_payload("websearch", JsonValue::String("weather sf".into())),
+            json!({ "query": "weather sf" })
+        );
+        assert_eq!(
+            normalize_tool_payload("web_search", JsonValue::String("{\"q\":\"mars\"}".into())),
+            json!({ "query": "mars" })
+        );
+    }
+
+    #[test]
+    fn normalizes_web_fetch_argument_aliases() {
+        assert_eq!(
+            normalize_tool_payload("web_fetch", json!({ "href": "https://example.com" })),
+            json!({ "url": "https://example.com" })
+        );
+        assert_eq!(
+            normalize_tool_payload("webfetch", JsonValue::String("https://example.com".into())),
+            json!({ "url": "https://example.com" })
+        );
+    }
+
+    #[test]
+    fn advertises_required_tool_parameters() {
+        let tools = web_tools();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"],
+            json!(["query"])
+        );
+        assert_eq!(
+            tools[1]["function"]["parameters"]["required"],
+            json!(["url"])
+        );
     }
 }
 
