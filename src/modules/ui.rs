@@ -379,7 +379,10 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         text.push_line(Line::from(""));
     }
 
-    if !app.pending_assistant.is_empty() {
+    let has_pending_stream = app.sending
+        || !app.pending_assistant.trim().is_empty()
+        || !app.pending_thinking.trim().is_empty();
+    if has_pending_stream {
         let selected = app.focus == Focus::Chat && app.mode == Mode::Visual && app.messages.len() == sel;
         let mut hdr_style = Style::default()
             .fg(app.theme.assistant_prefix)
@@ -409,42 +412,44 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             text.push_line(Line::from(""));
         }
 
-        // Cached pending render
-        let pending_h = str_hash(&app.pending_assistant);
-        let pending_text: Text<'static> = match &app.pending_cache {
-            Some((w, h, t)) if *w == inner_w && *h == pending_h => t.clone(),
-            _ => {
-                let t = render_markdown_to_text(
-                    &app.pending_assistant,
-                    &app.theme,
-                    inner_w,
-                    &app.syn_ss,
-                    &app.syn_theme,
-                    app.syntax_enabled,
-                );
-                app.pending_cache = Some((inner_w, pending_h, t.clone()));
-                t
-            }
-        };
-
-        let mut md = pending_text.clone();
-        if let Some(last) = md.lines.last_mut() {
-            last.spans.push(Span::raw("▌"));
-        } else {
-            md.lines.push(Line::from("▌"));
-        }
-        if selected {
-            let m = if app.bold_selection {
-                Modifier::BOLD
-            } else {
-                Modifier::REVERSED
+        if !app.pending_assistant.is_empty() {
+            // Cached pending render
+            let pending_h = str_hash(&app.pending_assistant);
+            let pending_text: Text<'static> = match &app.pending_cache {
+                Some((w, h, t)) if *w == inner_w && *h == pending_h => t.clone(),
+                _ => {
+                    let t = render_markdown_to_text(
+                        &app.pending_assistant,
+                        &app.theme,
+                        inner_w,
+                        &app.syn_ss,
+                        &app.syn_theme,
+                        app.syntax_enabled,
+                    );
+                    app.pending_cache = Some((inner_w, pending_h, t.clone()));
+                    t
+                }
             };
-            md = clone_with_modifier(md, m);
+
+            let mut md = pending_text.clone();
+            if let Some(last) = md.lines.last_mut() {
+                last.spans.push(Span::raw("▌"));
+            } else {
+                md.lines.push(Line::from("▌"));
+            }
+            if selected {
+                let m = if app.bold_selection {
+                    Modifier::BOLD
+                } else {
+                    Modifier::REVERSED
+                };
+                md = clone_with_modifier(md, m);
+            }
+            for line in md.lines {
+                text.push_line(line);
+            }
+            text.push_line(Line::from(""));
         }
-        for line in md.lines {
-            text.push_line(line);
-        }
-        text.push_line(Line::from(""));
     }
 
     let mode_span = match app.mode {
