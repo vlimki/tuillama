@@ -93,6 +93,14 @@ fn wrapped_text_height(text: &Text, width: u16) -> u16 {
         .sum()
 }
 
+fn section_block<'a>(title: impl Into<Line<'a>>, bg: Color, border: Color, borders: Borders) -> Block<'a> {
+    Block::default()
+        .style(Style::default().bg(bg))
+        .borders(borders)
+        .border_style(Style::default().fg(border))
+        .title(title)
+}
+
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(Block::default().style(Style::default().bg(app.theme.app_bg)), frame.size());
 
@@ -184,14 +192,17 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .style(Style::default().bg(app.theme.panel_bg))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.border_sidebar))
-        .title(Span::styled(
+    let block = section_block(
+        Line::from(Span::styled(
             " Conversations ",
-            Style::default().fg(app.theme.sidebar_title).add_modifier(Modifier::BOLD),
-        ));
+            Style::default()
+                .fg(app.theme.sidebar_title)
+                .add_modifier(Modifier::BOLD),
+        )),
+        app.theme.panel_bg,
+        app.theme.border_sidebar,
+        Borders::RIGHT | Borders::BOTTOM,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -246,14 +257,17 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     cards.push(("stream", status_value, if app.sending { app.theme.assistant_prefix } else { app.theme.status_hint }));
     cards.push(("mode", mode_value, app.theme.stats_value));
 
-    let outer = Block::default()
-        .style(Style::default().bg(app.theme.panel_bg))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.border_chat))
-        .title(Span::styled(
+    let outer = section_block(
+        Line::from(Span::styled(
             " Statistics ",
-            Style::default().fg(app.theme.title_chat).add_modifier(Modifier::BOLD),
-        ));
+            Style::default()
+                .fg(app.theme.title_chat)
+                .add_modifier(Modifier::BOLD),
+        )),
+        app.theme.panel_bg,
+        app.theme.border_chat,
+        Borders::LEFT,
+    );
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -261,7 +275,7 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(9),
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(10),
         ])
         .split(inner);
@@ -279,12 +293,12 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         Span::styled(app.model.clone(), Style::default().fg(app.theme.stats_value)),
     ]));
     frame.render_widget(
-        Paragraph::new(Text::from(top_lines)).block(
-            Block::default()
-                .style(Style::default().bg(app.theme.panel_alt_bg))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.message_rule)),
-        ),
+        Paragraph::new(Text::from(top_lines)).block(section_block(
+            Line::default(),
+            app.theme.panel_alt_bg,
+            app.theme.message_rule,
+            Borders::BOTTOM,
+        )),
         rows[0],
     );
 
@@ -293,6 +307,10 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .last()
         .map(|m| message_timestamp(m, app.current_created_ts))
         .unwrap_or_else(|| format_timestamp(app.current_created_ts.unwrap_or_default()));
+    let active_stream = app
+        .current_chat_id
+        .as_ref()
+        .and_then(|chat_id| app.active_streams.get(chat_id));
     let metrics = vec![
         Line::from(vec![
             Span::styled("messages: ", Style::default().fg(app.theme.stats_label)),
@@ -306,15 +324,28 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled("last activity: ", Style::default().fg(app.theme.stats_label)),
             Span::styled(last_activity, Style::default().fg(app.theme.stats_value)),
         ]),
+        Line::from(vec![
+            Span::styled("streams live: ", Style::default().fg(app.theme.stats_label)),
+            Span::styled(
+                app.active_streams.len().to_string(),
+                Style::default()
+                    .fg(app.theme.stats_value)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
     ];
     frame.render_widget(
-        Paragraph::new(Text::from(metrics)).block(
-            Block::default()
-                .title(Span::styled(" Session ", Style::default().fg(app.theme.assistant_prefix).add_modifier(Modifier::BOLD)))
-                .style(Style::default().bg(app.theme.panel_bg))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.message_rule)),
-        ),
+        Paragraph::new(Text::from(metrics)).block(section_block(
+            Line::from(Span::styled(
+                " Session ",
+                Style::default()
+                    .fg(app.theme.assistant_prefix)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            app.theme.panel_bg,
+            app.theme.message_rule,
+            Borders::BOTTOM,
+        )),
         rows[1],
     );
 
@@ -341,17 +372,92 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::raw(": "),
             Span::styled(app.current_chat_id.clone().unwrap_or_else(|| "new chat".to_string()), Style::default().fg(app.theme.stats_value)),
         ]),
+        Line::from(vec![
+            Span::styled("request", Style::default().fg(app.theme.stats_label)),
+            Span::raw(": "),
+            Span::styled(
+                app.pending_request_id
+                    .clone()
+                    .or_else(|| active_stream.map(|s| s.request_id.clone()))
+                    .unwrap_or_else(|| "none".to_string()),
+                Style::default().fg(app.theme.stats_value),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("status", Style::default().fg(app.theme.stats_label)),
+            Span::raw(": "),
+            Span::styled(
+                app.status_message
+                    .clone()
+                    .or_else(|| active_stream.and_then(|s| s.status.clone()))
+                    .unwrap_or_else(|| "waiting".to_string()),
+                Style::default().fg(app.theme.stats_value),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("pending", Style::default().fg(app.theme.stats_label)),
+            Span::raw(": "),
+            Span::styled(
+                format!(
+                    "{} chars answer / {} chars thinking",
+                    app.pending_assistant.chars().count(),
+                    app.pending_thinking.chars().count()
+                ),
+                Style::default().fg(app.theme.stats_value),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("viewport", Style::default().fg(app.theme.stats_label)),
+            Span::raw(": "),
+            Span::styled(
+                format!(
+                    "scroll {} • inner {}x{}",
+                    app.chat_scroll, app.chat_inner_width, app.chat_inner_height
+                ),
+                Style::default().fg(app.theme.stats_value),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("selection", Style::default().fg(app.theme.stats_label)),
+            Span::raw(": "),
+            Span::styled(
+                format!(
+                    "focus {:?} • selected {:?}",
+                    app.focus, app.selected_msg
+                ),
+                Style::default().fg(app.theme.stats_value),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("input", Style::default().fg(app.theme.stats_label)),
+            Span::raw(": "),
+            Span::styled(
+                format!(
+                    "{} chars • line {} col {}",
+                    app.input.chars().count(),
+                    app.input_cursor_line + 1,
+                    app.input_cursor_col + 1
+                ),
+                Style::default().fg(app.theme.stats_value),
+            ),
+        ]),
         Line::from(""),
         Line::from(Span::styled("Ctrl+P toggles this panel.", Style::default().fg(app.theme.status_hint))),
     ];
     frame.render_widget(
-        Paragraph::new(Text::from(trace)).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(Span::styled(" Debug ", Style::default().fg(app.theme.user_prefix).add_modifier(Modifier::BOLD)))
-                .style(Style::default().bg(app.theme.panel_alt_bg))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.message_rule)),
-        ),
+        Paragraph::new(Text::from(trace))
+            .wrap(Wrap { trim: false })
+            .block(section_block(
+                Line::from(Span::styled(
+                    " Debug ",
+                    Style::default()
+                        .fg(app.theme.user_prefix)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                app.theme.panel_alt_bg,
+                app.theme.message_rule,
+                Borders::NONE,
+            )),
         rows[2],
     );
 }
@@ -452,15 +558,23 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .unwrap_or_else(|| "Untitled chat".to_string());
 
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(current_title, Style::default().fg(app.theme.title_chat).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" • {}", app.model), Style::default().fg(app.theme.message_meta)),
+        Span::styled(
+            current_title,
+            Style::default()
+                .fg(app.theme.title_chat)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" • {}", app.model),
+            Style::default().fg(app.theme.message_meta),
+        ),
     ]))
-    .block(
-        Block::default()
-            .style(Style::default().bg(app.theme.title_bar_bg))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_chat)),
-    );
+    .block(section_block(
+        Line::default(),
+        app.theme.title_bar_bg,
+        app.theme.border_chat,
+        Borders::BOTTOM,
+    ));
     frame.render_widget(header, left[0]);
 
     app.chat_inner_height = left[1].height.saturating_sub(2);
@@ -499,13 +613,17 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     frame.render_widget(
         Paragraph::new(text)
-            .block(
-                Block::default()
-                    .style(Style::default().bg(app.theme.app_bg))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(app.theme.border_chat))
-                    .title(Span::styled(" Thread ", Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD))),
-            )
+            .block(section_block(
+                Line::from(Span::styled(
+                    " Thread ",
+                    Style::default()
+                        .fg(app.theme.title_input)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                app.theme.app_bg,
+                app.theme.border_chat,
+                Borders::BOTTOM,
+            ))
             .wrap(Wrap { trim: false })
             .scroll((app.chat_scroll, 0)),
         left[1],
@@ -559,13 +677,12 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 
     frame.render_widget(
-        Paragraph::new(input_text).block(
-            Block::default()
-                .style(Style::default().bg(app.theme.panel_bg))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.border_input))
-                .title(input_title_line),
-        ),
+        Paragraph::new(input_text).block(section_block(
+            input_title_line,
+            app.theme.panel_bg,
+            app.theme.border_input,
+            Borders::TOP,
+        )),
         left[2],
     );
 
