@@ -635,7 +635,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Paragraph::new(text)
             .block(section_block(
                 Line::from(Span::styled(
-                    " Thread ",
+                    " ",
                     Style::default()
                         .fg(app.theme.title_input)
                         .add_modifier(Modifier::BOLD),
