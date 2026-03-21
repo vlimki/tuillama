@@ -2,22 +2,23 @@
 # Every value below is shown with the current default or an example default-like value.
 # You can uncomment and tweak anything you want.
 
-model = "llama3"
-api_url = "http://localhost:11434/api/chat"
-# Optional for hosted Ollama-compatible providers
-ollama_api_key = ""
+model = "gpt-oss:20b"
+api_url = "http://127.0.0.1:11434/api/chat"
 server_addr = "127.0.0.1:7878"
 system_prompt = "You are a helpful assistant."
 
+# Needed for web search functionality
+ollama_api_key = ""
+
 # In visual mode, render the selected message in bold instead of reversing the background.
-bold_selection = false
+bold_selection = true
 
 # Legacy syntax theme key; prefer [syntax].theme_name for new configs.
 # syntax_theme = "base16-ocean.dark"
 
 [preview]
-preview_fmt = "html"
-preview_open = "xdg-open"
+preview_fmt = "pdf"
+preview_open = "zathura"
 
 [performance]
 stream_fps = 30
@@ -32,28 +33,28 @@ input_poll_ms = 250
 
 # Names or #RRGGBB values.
 [colors]
-app_bg = "#0d0f14"
-panel_bg = "#16181e"
-panel_alt_bg = "#1c1f26"
-input_bg = "#16181e"
+app_bg = "black"
+panel_bg = "black"
+panel_alt_bg = "black"
+input_bg = "black"
 
-sidebar_title = "#7ed3ff"
-sidebar_timestamp = "#7d818a"
-sidebar_item = "#e8eaee"
-sidebar_item_bg = "#0d0f14"
-sidebar_selected_bg = "#2f3640"
+sidebar_title = "blue"
+sidebar_timestamp = "dark_gray"
+sidebar_item = "white"
+sidebar_item_bg = "black"
+sidebar_selected_bg = "blue"
 
-title_chat = "#7ed3ff"
-title_input = "#e3e4e8"
-title_bar_bg = "#1f2229"
+title_chat = "blue"
+title_input = "white"
+title_bar_bg = "black"
 
-user_prefix = "#7ed3ff"
-assistant_prefix = "#f1d77a"
-system_prefix = "#ffc36e"
-message_meta = "#8c909a"
+user_prefix = "magenta"
+assistant_prefix = "magenta"
+system_prefix = "red"
+message_meta = "dark_gray"
 message_rule = "#444953"
 
-heading1 = "#f1d77a"
+heading1 = "cyan"
 heading2 = "light_yellow"
 heading3 = "cyan"
 heading4 = "light_cyan"
@@ -61,9 +62,9 @@ blockquote_bar = "dark_gray"
 list_bullet = "green"
 ordered_number = "green"
 inline_code = "yellow"
-inline_code_bg = "dark_gray"
+inline_code_bg = "#050505"
 code_block_fg = "gray"
-code_block_bg = "black"
+code_block_bg = "#050505"
 hr = "dark_gray"
 
 status_hint = "gray"
@@ -72,17 +73,17 @@ mode_normal = "yellow"
 mode_visual = "light_magenta"
 mode_focus = "blue"
 
-border_sidebar = "gray"
-border_chat = "gray"
-border_input = "gray"
+border_sidebar = "dark_gray"
+border_chat = "dark_gray"
+border_input = "dark_gray"
 
 popup_title = "light_red"
-popup_accent = "#f1d77a"
-popup_text = "#dcdfe4"
+popup_accent = "yellow"
+popup_text = "white"
 
-stats_label = "#aaaeb6"
-stats_value = "#e6e8ec"
-stats_accent = "#6fdb7b"
+stats_label = "dark_gray"
+stats_value = "white"
+stats_accent = "green"
 
 [syntax]
 enabled = true
@@ -90,12 +91,12 @@ theme_name = "base16-ocean.dark"
 
 # Custom syntax palette (takes precedence over theme_name when present)
 [syntax.custom]
-keyword = "#CC99CD"
-string = "#7EC699"
-comment = "#999999"
-type = "#5FB4B4"
-function = "#6699CC"
-number = "#F2777A"
-operator = "#F99157"
+keyword = "blue"
+string = "green"
+comment = "dark_gray"
+type = "yellow"
+function = "magenta"
+number = "magenta"
+operator = "white"
 punct = "light_gray"
 text = "white"
