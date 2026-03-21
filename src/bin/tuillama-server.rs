@@ -22,6 +22,8 @@ enum Role {
 struct Message {
     role: Role,
     content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
 }
 
 include!("../modules/protocol.rs");
@@ -50,6 +52,40 @@ async fn send_server_event(writer: &Arc<Mutex<OwnedWriteHalf>>, ev: &ServerEvent
     guard.write_all(b"\n").await?;
     guard.flush().await?;
     Ok(())
+}
+
+async fn send_status(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: &str,
+    chat_id: &str,
+    message: impl Into<String>,
+) -> Result<()> {
+    send_server_event(
+        writer,
+        &ServerEvent::Status {
+            request_id: request_id.to_string(),
+            chat_id: chat_id.to_string(),
+            message: message.into(),
+        },
+    )
+    .await
+}
+
+async fn send_thinking(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: &str,
+    chat_id: &str,
+    delta: impl Into<String>,
+) -> Result<()> {
+    send_server_event(
+        writer,
+        &ServerEvent::Thinking {
+            request_id: request_id.to_string(),
+            chat_id: chat_id.to_string(),
+            delta: delta.into(),
+        },
+    )
+    .await
 }
 
 fn build_auth_headers(ollama_api_key: Option<&str>) -> HeaderMap {
@@ -314,7 +350,9 @@ async fn run_tool_call(
 }
 
 async fn process_agentic_web_search(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: &str,
+    chat_id: &str,
     api_url: String,
     model: String,
     options: Option<JsonValue>,
@@ -349,6 +387,13 @@ async fn process_agentic_web_search(
     // Force at least one real web retrieval in WEB ON mode, so providers/models
     // that don't autonomously emit tool calls still get fresh context.
     if let Some(query) = latest_user_query(&messages) {
+        let _ = send_status(
+            writer,
+            request_id,
+            chat_id,
+            format!("Searching the web for: {query}"),
+        )
+        .await;
         debug_log(
             debug,
             request_id,
@@ -376,6 +421,13 @@ async fn process_agentic_web_search(
 
         let mut fetches: Vec<JsonValue> = Vec::new();
         for url in urls {
+            let _ = send_status(
+                writer,
+                request_id,
+                chat_id,
+                format!("Parsing website {url}"),
+            )
+            .await;
             let fetched = run_tool_call(
                 &client,
                 &api_base,
@@ -412,6 +464,17 @@ async fn process_agentic_web_search(
     let mut final_answer = String::new();
 
     for iter in 0..MAX_TOOL_ITERS {
+        let _ = send_status(
+            writer,
+            request_id,
+            chat_id,
+            format!(
+                "Reasoning over retrieved context (step {} of {})",
+                iter + 1,
+                MAX_TOOL_ITERS
+            ),
+        )
+        .await;
         debug_log(
             debug,
             request_id,
@@ -462,6 +525,12 @@ async fn process_agentic_web_search(
             .cloned()
             .ok_or_else(|| anyhow!("chat response missing message"))?;
 
+        if let Some(thinking) = msg.get("thinking").and_then(|v| v.as_str()) {
+            if !thinking.is_empty() {
+                let _ = send_thinking(writer, request_id, chat_id, thinking).await;
+            }
+        }
+
         if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
             if !content.is_empty() {
                 final_answer = content.to_string();
@@ -500,6 +569,16 @@ async fn process_agentic_web_search(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let status = match normalize_tool_name(tool_name) {
+                "web_search" => "Running a web search".to_string(),
+                "web_fetch" => normalize_tool_payload(tool_name, args.clone())
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(|u| format!("Parsing website {u}"))
+                    .unwrap_or_else(|| "Parsing website".to_string()),
+                other => format!("Running tool {other}"),
+            };
+            let _ = send_status(writer, request_id, chat_id, status).await;
 
             let tool_result = run_tool_call(
                 &client, &api_base, &headers, request_id, debug, tool_name, args,
@@ -586,6 +665,7 @@ async fn process_normal_stream(
         model: &model,
         messages: &messages,
         stream: true,
+        think: Some(true),
         options: options.as_ref(),
         tools: None,
     };
@@ -658,6 +738,17 @@ async fn process_normal_stream(
                             return;
                         }
                         if let Some(msg) = obj.message {
+                            if !msg.thinking.is_empty() {
+                                let _ = send_server_event(
+                                    &writer,
+                                    &ServerEvent::Thinking {
+                                        request_id: request_id.clone(),
+                                        chat_id: chat_id.clone(),
+                                        delta: msg.thinking,
+                                    },
+                                )
+                                .await;
+                            }
                             let _ = send_server_event(
                                 &writer,
                                 &ServerEvent::Chunk {
@@ -717,7 +808,9 @@ async fn process_stream_request(
     );
     if web_search {
         match process_agentic_web_search(
+            &writer,
             &request_id,
+            &chat_id,
             api_url,
             model,
             options,

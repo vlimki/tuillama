@@ -4,6 +4,8 @@ struct OllamaChatRequest<'a> {
     messages: &'a [Message],
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<&'a JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [OllamaTool]>,
@@ -33,6 +35,7 @@ struct OllamaChatStreamChunk {
 struct OllamaChatMessage {
     #[allow(dead_code)]
     role: String,
+    #[serde(default)]
+    thinking: String,
     content: String,
 }
-
