@@ -290,7 +290,8 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .split(area);
 
     app.chat_inner_height = v_chunks[0].height.saturating_sub(2);
-    let inner_w = v_chunks[0].width.saturating_sub(2);
+    app.chat_inner_width = v_chunks[0].width.saturating_sub(2);
+    let inner_w = app.chat_inner_width;
 
     let mut text = Text::default();
     let sel = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
@@ -654,27 +655,92 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 }
 
 // visual height estimate helpers
-fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
+fn rendered_message_height(app: &App, inner_w: u16, m: &Message) -> u16 {
     let mut y: u16 = 0;
-    for m in messages {
+
+    y = y.saturating_add(1);
+
+    if app.show_thinking {
+        if let Some(thinking) = m.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
+            y = y.saturating_add(1);
+            let rendered_thinking = render_markdown_to_text(
+                thinking,
+                &app.theme,
+                inner_w.saturating_sub(2),
+                &app.syn_ss,
+                &app.syn_theme,
+                app.syntax_enabled,
+            );
+            y = y.saturating_add(rendered_thinking.lines.len() as u16);
+            y = y.saturating_add(1);
+        }
+    }
+
+    let rendered_body = render_markdown_to_text(
+        &m.content,
+        &app.theme,
+        inner_w,
+        &app.syn_ss,
+        &app.syn_theme,
+        app.syntax_enabled,
+    );
+    y = y.saturating_add(rendered_body.lines.len() as u16);
+
+    y.saturating_add(1)
+}
+
+fn pending_stream_height(app: &App, inner_w: u16) -> u16 {
+    let has_pending_stream = app.sending
+        || !app.pending_assistant.trim().is_empty()
+        || !app.pending_thinking.trim().is_empty();
+    if !has_pending_stream {
+        return 0;
+    }
+
+    let mut y: u16 = 1;
+
+    if app.show_thinking && !app.pending_thinking.trim().is_empty() {
         y = y.saturating_add(1);
-        y = y.saturating_add(m.content.lines().count() as u16);
+        let rendered_thinking = render_markdown_to_text(
+            &app.pending_thinking,
+            &app.theme,
+            inner_w.saturating_sub(2),
+            &app.syn_ss,
+            &app.syn_theme,
+            app.syntax_enabled,
+        );
+        y = y.saturating_add(rendered_thinking.lines.len() as u16);
         y = y.saturating_add(1);
     }
-    if let Some(p) = pending {
-        y = y.saturating_add(1);
-        y = y.saturating_add(p.lines().count() as u16);
+
+    if !app.pending_assistant.is_empty() {
+        let rendered_body = render_markdown_to_text(
+            &app.pending_assistant,
+            &app.theme,
+            inner_w,
+            &app.syn_ss,
+            &app.syn_theme,
+            app.syntax_enabled,
+        );
+        y = y.saturating_add(rendered_body.lines.len() as u16);
         y = y.saturating_add(1);
     }
+
     y
 }
 
-fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
+fn content_total_height(app: &App, inner_w: u16) -> u16 {
     let mut y: u16 = 0;
-    for m in &messages[..idx.min(messages.len())] {
-        y = y.saturating_add(1);
-        y = y.saturating_add(m.content.lines().count() as u16);
-        y = y.saturating_add(1);
+    for m in &app.messages {
+        y = y.saturating_add(rendered_message_height(app, inner_w, m));
+    }
+    y.saturating_add(pending_stream_height(app, inner_w))
+}
+
+fn offset_for_message(app: &App, inner_w: u16, idx: usize) -> u16 {
+    let mut y: u16 = 0;
+    for m in &app.messages[..idx.min(app.messages.len())] {
+        y = y.saturating_add(rendered_message_height(app, inner_w, m));
     }
     y
 }

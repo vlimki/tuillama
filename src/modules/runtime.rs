@@ -338,6 +338,7 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.selected_msg = None;
     app.chat_scroll = 0;
     app.chat_inner_height = 0;
+    app.chat_inner_width = 0;
     app.render_cache.clear();
     app.pending_cache = None;
     let chat = Chat {
@@ -785,14 +786,7 @@ async fn handle_key(
                 }
                 KeyCode::Char('G') => {
                     if app.focus == Focus::Chat {
-                        let total = content_total_height(
-                            &app.messages,
-                            if app.pending_assistant.is_empty() {
-                                None
-                            } else {
-                                Some(app.pending_assistant.as_str())
-                            },
-                        );
+                        let total = content_total_height(app, app.chat_inner_width.max(1));
                         app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                     }
                 }
@@ -806,7 +800,7 @@ async fn handle_key(
                                 app.messages = chat.messages;
                                 app.render_cache.clear();
                                 refresh_current_stream_state(app);
-                                let total = content_total_height(&app.messages, None);
+                                let total = content_total_height(app, app.chat_inner_width.max(1));
                                 app.chat_scroll = total.saturating_sub(app.chat_inner_height);
                                 app.focus = Focus::Chat;
                             }
@@ -875,7 +869,7 @@ async fn handle_key(
                         .unwrap_or_else(|| app.messages.len().saturating_sub(1));
                     let next = (cur + 1).min(app.messages.len().saturating_sub(1));
                     app.selected_msg = Some(next);
-                    let target_y = offset_for_message(&app.messages, next);
+                    let target_y = offset_for_message(app, app.chat_inner_width.max(1), next);
                     let top = app.chat_scroll;
                     let bottom = top.saturating_add(app.chat_inner_height.max(1));
                     if target_y < top || target_y >= bottom {
@@ -898,7 +892,7 @@ async fn handle_key(
                         .unwrap_or_else(|| app.messages.len().saturating_sub(1));
                     let next = cur.saturating_sub(1);
                     app.selected_msg = Some(next);
-                    let target_y = offset_for_message(&app.messages, next);
+                    let target_y = offset_for_message(app, app.chat_inner_width.max(1), next);
                     let top = app.chat_scroll;
                     let bottom = top.saturating_add(app.chat_inner_height.max(1));
                     if target_y < top || target_y >= bottom {
@@ -918,7 +912,7 @@ async fn handle_key(
                             refresh_current_stream_state(app);
                             app.selected_msg = Some(app.messages.len().saturating_sub(1));
                             app.chat_scroll =
-                                offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));
+                                offset_for_message(app, app.chat_inner_width.max(1), app.selected_msg.unwrap_or(0));
                             app.focus = Focus::Chat;
                         }
                     }

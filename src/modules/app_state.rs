@@ -31,6 +31,7 @@ struct App {
     input_top_line: usize,    // first visible line in input viewport
     chat_scroll: u16,
     chat_inner_height: u16,
+    chat_inner_width: u16,
     sending: bool,
     model: String,
     api_url: String,
@@ -106,6 +107,7 @@ impl App {
             input_top_line: 0,
             chat_scroll: 0,
             chat_inner_height: 0,
+            chat_inner_width: 0,
             sending: false,
             model,
             api_url,
