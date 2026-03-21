@@ -520,6 +520,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     } else {
         app.chat_scroll = app.chat_scroll.min(max_chat_scroll);
     }
+    app.chat_at_bottom = app.chat_scroll >= max_chat_scroll;
 
     let chat_block = Block::default()
         .borders(Borders::ALL)

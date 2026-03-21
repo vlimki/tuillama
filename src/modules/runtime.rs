@@ -127,6 +127,9 @@ async fn main() -> Result<()> {
                             if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
                                 app.pending_assistant.push_str(&delta);
                                 app.pending_cache = None;
+                                if app.chat_at_bottom {
+                                    app.scroll_to_bottom_on_draw = true;
+                                }
                                 if app.last_draw.elapsed() < app.stream_throttle {
                                     should_draw = false;
                                 }
@@ -159,6 +162,9 @@ async fn main() -> Result<()> {
                                 content: content.clone(),
                                 thinking,
                             });
+                            if app.chat_at_bottom {
+                                app.scroll_to_bottom_on_draw = true;
+                            }
                             refresh_current_stream_state(&mut app);
                             persist_current_chat(&mut app)?;
                             if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
@@ -218,6 +224,9 @@ async fn main() -> Result<()> {
                             active.thinking.push_str(&delta);
                             if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
                                 app.pending_thinking.push_str(&delta);
+                                if app.chat_at_bottom {
+                                    app.scroll_to_bottom_on_draw = true;
+                                }
                                 if app.last_draw.elapsed() < app.stream_throttle {
                                     should_draw = false;
                                 }
@@ -340,6 +349,7 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.chat_inner_height = 0;
     app.chat_inner_width = 0;
     app.scroll_to_bottom_on_draw = false;
+    app.chat_at_bottom = true;
     app.render_cache.clear();
     app.pending_cache = None;
     let chat = Chat {
