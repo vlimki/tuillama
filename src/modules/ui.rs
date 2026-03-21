@@ -232,7 +232,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         let style = if selected {
             Style::default().bg(app.theme.sidebar_selected_bg)
         } else {
-            Style::default().bg(app.theme.app_bg)
+            Style::default().bg(app.theme.sidebar_item_bg)
         };
         items.push(
             ListItem::new(vec![
@@ -661,7 +661,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     let input_block = section_block(
         input_title_line,
-        app.theme.panel_bg,
+        app.theme.input_bg,
         app.theme.border_input,
         Borders::ALL,
     );

@@ -35,10 +35,12 @@ input_poll_ms = 250
 app_bg = "#0d0f14"
 panel_bg = "#16181e"
 panel_alt_bg = "#1c1f26"
+input_bg = "#16181e"
 
 sidebar_title = "#7ed3ff"
 sidebar_timestamp = "#7d818a"
 sidebar_item = "#e8eaee"
+sidebar_item_bg = "#0d0f14"
 sidebar_selected_bg = "#2f3640"
 
 title_chat = "#7ed3ff"

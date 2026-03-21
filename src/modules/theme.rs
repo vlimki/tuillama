@@ -4,11 +4,13 @@ struct Theme {
     app_bg: Color,
     panel_bg: Color,
     panel_alt_bg: Color,
+    input_bg: Color,
 
     // sidebar
     sidebar_title: Color,
     sidebar_timestamp: Color,
     sidebar_item: Color,
+    sidebar_item_bg: Color,
     sidebar_selected_bg: Color,
 
     // titles
@@ -66,10 +68,12 @@ impl Default for Theme {
             app_bg: Color::Rgb(13, 15, 20),
             panel_bg: Color::Rgb(22, 24, 30),
             panel_alt_bg: Color::Rgb(28, 31, 38),
+            input_bg: Color::Rgb(22, 24, 30),
 
             sidebar_title: Color::Rgb(126, 211, 255),
             sidebar_timestamp: Color::Rgb(125, 129, 138),
             sidebar_item: Color::Rgb(232, 234, 238),
+            sidebar_item_bg: Color::Rgb(13, 15, 20),
             sidebar_selected_bg: Color::Rgb(47, 54, 64),
 
             title_chat: Color::Rgb(126, 211, 255),
@@ -167,10 +171,12 @@ impl Theme {
             t.app_bg = color_from_cfg(map, "app_bg", t.app_bg);
             t.panel_bg = color_from_cfg(map, "panel_bg", t.panel_bg);
             t.panel_alt_bg = color_from_cfg(map, "panel_alt_bg", t.panel_alt_bg);
+            t.input_bg = color_from_cfg(map, "input_bg", t.input_bg);
 
             t.sidebar_title = color_from_cfg(map, "sidebar_title", t.sidebar_title);
             t.sidebar_timestamp = color_from_cfg(map, "sidebar_timestamp", t.sidebar_timestamp);
             t.sidebar_item = color_from_cfg(map, "sidebar_item", t.sidebar_item);
+            t.sidebar_item_bg = color_from_cfg(map, "sidebar_item_bg", t.sidebar_item_bg);
             t.sidebar_selected_bg = color_from_cfg(map, "sidebar_selected_bg", t.sidebar_selected_bg);
 
             t.title_chat = color_from_cfg(map, "title_chat", t.title_chat);
