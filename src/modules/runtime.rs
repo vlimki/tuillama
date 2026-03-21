@@ -358,6 +358,34 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn delete_prev_input_grapheme(app: &mut App) {
+    if app.input_cursor_line == 0 && app.input_cursor_col == 0 {
+        return;
+    }
+
+    let mut lines: Vec<String> = app.input.split('\n').map(|s| s.to_string()).collect();
+    if app.input_cursor_col > 0 {
+        let cur = &mut lines[app.input_cursor_line];
+        let grs: Vec<&str> = UnicodeSegmentation::graphemes(cur.as_str(), true).collect();
+        let mut start_byte = 0usize;
+        for i in 0..app.input_cursor_col - 1 {
+            start_byte += grs[i].len();
+        }
+        let end_byte = start_byte + grs[app.input_cursor_col - 1].len();
+        cur.replace_range(start_byte..end_byte, "");
+        app.input_cursor_col -= 1;
+    } else {
+        let prev_len_gr =
+            UnicodeSegmentation::graphemes(lines[app.input_cursor_line - 1].as_str(), true).count();
+        let cur_line = lines.remove(app.input_cursor_line);
+        let prev = &mut lines[app.input_cursor_line - 1];
+        prev.push_str(&cur_line);
+        app.input_cursor_line -= 1;
+        app.input_cursor_col = prev_len_gr;
+    }
+    app.input = lines.join("\n");
+}
+
 fn persist_current_chat(app: &mut App) -> Result<()> {
     let now = now_sec();
     if app.current_chat_id.is_none() {
@@ -574,33 +602,7 @@ async fn handle_key(
                 // input_top_line adjust with headroom (handled in draw)
             }
             KeyCode::Backspace => {
-                // Delete previous grapheme, merging lines if at col 0
-                if app.input_cursor_line == 0 && app.input_cursor_col == 0 {
-                    // nothing
-                } else {
-                    let mut lines: Vec<String> = app.input.split('\n').map(|s| s.to_string()).collect();
-                    if app.input_cursor_col > 0 {
-                        // delete grapheme in current line
-                        let cur = &mut lines[app.input_cursor_line];
-                        let grs: Vec<&str> = UnicodeSegmentation::graphemes(cur.as_str(), true).collect();
-                        let mut start_byte = 0usize;
-                        for i in 0..app.input_cursor_col - 1 {
-                            start_byte += grs[i].len();
-                        }
-                        let end_byte = start_byte + grs[app.input_cursor_col - 1].len();
-                        cur.replace_range(start_byte..end_byte, "");
-                        app.input_cursor_col -= 1;
-                    } else {
-                        // merge with previous line
-                        let prev_len_gr = UnicodeSegmentation::graphemes(lines[app.input_cursor_line - 1].as_str(), true).count();
-                        let cur_line = lines.remove(app.input_cursor_line);
-                        let prev = &mut lines[app.input_cursor_line - 1];
-                        prev.push_str(&cur_line);
-                        app.input_cursor_line -= 1;
-                        app.input_cursor_col = prev_len_gr;
-                    }
-                    app.input = lines.join("\n");
-                }
+                delete_prev_input_grapheme(app);
             }
             KeyCode::Left => {
                 if app.input_cursor_col > 0 {
@@ -644,7 +646,17 @@ async fn handle_key(
                     }
                 }
             }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                delete_prev_input_grapheme(app);
+            }
             KeyCode::Char(c) => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    return Ok(());
+                }
+
                 // insert at cursor
                 let lines: Vec<&str> = app.input.split('\n').collect();
                 let cur = lines.get(app.input_cursor_line).copied().unwrap_or("");
