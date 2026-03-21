@@ -469,13 +469,23 @@ fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: 
         Role::Assistant => (app.model.as_str(), app.theme.assistant_prefix),
         Role::System => ("System", app.theme.system_prefix),
     };
+    let label_text = format!("{}:", label);
+    let label_width = UnicodeWidthStr::width(label_text.as_str());
+    let timestamp_width = UnicodeWidthStr::width(timestamp.as_str());
+    let spacer_width = 2usize;
+    let rule_len = (inner_w as usize)
+        .saturating_sub(label_width + timestamp_width + spacer_width)
+        .max(1);
+    let rule = "─".repeat(rule_len);
     let mut header_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     header_style = apply_selection(header_style, selected, app.bold_selection);
     let meta_style = apply_selection(Style::default().fg(app.theme.message_meta), selected, app.bold_selection);
     let rule_style = apply_selection(Style::default().fg(app.theme.message_rule), selected, app.bold_selection);
     text.push_line(Line::from(vec![
-        Span::styled(format!("{}:", label), header_style),
-        Span::styled(" ───────── ", rule_style),
+        Span::styled(label_text, header_style),
+        Span::raw(" "),
+        Span::styled(rule, rule_style),
+        Span::raw(" "),
         Span::styled(timestamp, meta_style),
     ]));
 
