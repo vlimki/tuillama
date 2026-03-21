@@ -201,7 +201,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         )),
         app.theme.panel_bg,
         app.theme.border_sidebar,
-        Borders::RIGHT | Borders::BOTTOM,
+        Borders::RIGHT,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -691,7 +691,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             input_title_line,
             app.theme.panel_bg,
             app.theme.border_input,
-            Borders::TOP,
+            Borders::ALL,
         )),
         left[2],
     );
