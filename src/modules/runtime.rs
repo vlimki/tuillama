@@ -396,6 +396,11 @@ fn delete_prev_input_grapheme(app: &mut App) {
     app.input = lines.join("\n");
 }
 
+fn stop_following_stream(app: &mut App) {
+    app.scroll_to_bottom_on_draw = false;
+    app.chat_at_bottom = false;
+}
+
 fn persist_current_chat(app: &mut App) -> Result<()> {
     let now = now_sec();
     if app.current_chat_id.is_none() {
@@ -577,6 +582,9 @@ async fn handle_key(
                     },
                 );
                 refresh_current_stream_state(app);
+                if app.chat_at_bottom {
+                    app.scroll_to_bottom_on_draw = true;
+                }
                 if server_tx.send(req).is_err() {
                     app.active_streams.retain(|_, v| v.request_id != request_id);
                     refresh_current_stream_state(app);
@@ -707,6 +715,7 @@ async fn handle_key(
             }
             // manual chat scroll while typing
             KeyCode::PageUp => {
+                stop_following_stream(app);
                 app.chat_scroll = app.chat_scroll.saturating_sub(app.chat_inner_height.max(1));
             }
             KeyCode::PageDown => {
@@ -799,6 +808,7 @@ async fn handle_key(
                         }
                     }
                     Focus::Chat => {
+                        stop_following_stream(app);
                         app.chat_scroll = app.chat_scroll.saturating_sub(1);
                     }
                 },
@@ -807,6 +817,7 @@ async fn handle_key(
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             app.scroll_to_bottom_on_draw = true;
                         } else {
+                            stop_following_stream(app);
                             app.chat_scroll = 0;
                         }
                     }
@@ -834,6 +845,7 @@ async fn handle_key(
                     Focus::Chat => {}
                 },
                 KeyCode::Up => {
+                    stop_following_stream(app);
                     app.chat_scroll = app.chat_scroll.saturating_sub(1);
                 }
                 KeyCode::Down => {
@@ -921,6 +933,7 @@ async fn handle_key(
                     let top = app.chat_scroll;
                     let bottom = top.saturating_add(app.chat_inner_height.max(1));
                     if target_y < top || target_y >= bottom {
+                        stop_following_stream(app);
                         app.chat_scroll = target_y;
                     }
                 }
@@ -962,6 +975,7 @@ async fn handle_key(
                 }
             },
             KeyCode::Up => {
+                stop_following_stream(app);
                 app.chat_scroll = app.chat_scroll.saturating_sub(1);
             }
             KeyCode::Down => {
