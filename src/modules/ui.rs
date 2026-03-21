@@ -102,6 +102,14 @@ fn section_block<'a>(title: impl Into<Line<'a>>, bg: Color, border: Color, borde
         .title(title)
 }
 
+fn panel_block(bg: Color, border: Color, borders: Borders) -> Block<'static> {
+    Block::default()
+        .style(Style::default().bg(bg))
+        .borders(borders)
+        .border_style(Style::default().fg(border))
+        .padding(Padding::horizontal(1))
+}
+
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(Block::default().style(Style::default().bg(app.theme.app_bg)), frame.size());
 
@@ -261,7 +269,7 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     cards.push(("stream", status_value, if app.sending { app.theme.assistant_prefix } else { app.theme.status_hint }));
     cards.push(("mode", mode_value, app.theme.stats_value));
 
-    let outer = section_block(Line::default(), app.theme.panel_bg, app.theme.border_chat, Borders::LEFT);
+    let outer = panel_block(app.theme.panel_bg, app.theme.border_chat, Borders::LEFT);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -293,8 +301,7 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         Span::styled(app.model.clone(), Style::default().fg(app.theme.stats_value)),
     ]));
     frame.render_widget(
-        Paragraph::new(Text::from(top_lines)).block(section_block(
-            Line::default(),
+        Paragraph::new(Text::from(top_lines)).block(panel_block(
             app.theme.panel_alt_bg,
             app.theme.message_rule,
             Borders::BOTTOM,
