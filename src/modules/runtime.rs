@@ -79,8 +79,15 @@ async fn main() -> Result<()> {
     let tx_input = tx.clone();
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(input_poll_ms)).unwrap_or(false) {
-            if let Ok(CEvent::Key(key)) = event::read() {
-                let _ = tx_input.send(AppEvent::Input(key));
+            match event::read() {
+                Ok(CEvent::Key(key)) => {
+                    let _ = tx_input.send(AppEvent::Input(key));
+                }
+                Ok(CEvent::Resize(_, _)) => {
+                    let _ = tx_input.send(AppEvent::Resize);
+                }
+                Ok(_) => {}
+                Err(_) => {}
             }
         }
     });
@@ -95,6 +102,11 @@ async fn main() -> Result<()> {
 
         match ev {
             AppEvent::Input(key) => handle_key(key, &mut app, &tx, &server_tx).await?,
+            AppEvent::Resize => {
+                app.render_cache.clear();
+                app.pending_cache = None;
+                terminal.clear()?;
+            }
             AppEvent::OllamaError(e) => {
                 app.messages.push(Message {
                     role: Role::System,
