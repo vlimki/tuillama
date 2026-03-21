@@ -154,6 +154,16 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
+                    "Ctrl+Y ",
+                    Style::default()
+                        .fg(app.theme.popup_accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Hide/Show thinking blocks"),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
                     "q / Ctrl+C ",
                     Style::default()
                         .fg(app.theme.popup_accent)
@@ -299,6 +309,30 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         pstyle = apply_selection(pstyle, selected, app.bold_selection);
         text.push_line(Line::styled(prefix_text, pstyle));
 
+        if app.show_thinking {
+            if let Some(thinking) = m.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
+                let thinking_style = Style::default().fg(app.theme.status_hint);
+                text.push_line(Line::styled("Thinking:", thinking_style.add_modifier(Modifier::ITALIC)));
+                let rendered_thinking = render_markdown_to_text(
+                    thinking,
+                    &app.theme,
+                    inner_w.saturating_sub(2),
+                    &app.syn_ss,
+                    &app.syn_theme,
+                    app.syntax_enabled,
+                );
+                for line in rendered_thinking.lines {
+                    let spans = std::iter::once(Span::styled("▏ ", thinking_style))
+                        .chain(line.spans.into_iter().map(|span| {
+                            Span::styled(span.content.to_string(), thinking_style.patch(span.style))
+                        }))
+                        .collect::<Vec<_>>();
+                    text.push_line(Line::from(spans));
+                }
+                text.push_line(Line::from(""));
+            }
+        }
+
         // Cached body render
         let msg_h = message_hash(m);
         let key = (i, inner_w);
@@ -352,6 +386,28 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             .add_modifier(Modifier::BOLD);
         hdr_style = apply_selection(hdr_style, selected, app.bold_selection);
         text.push_line(Line::styled(format!("{}:", app.model), hdr_style));
+
+        if app.show_thinking && !app.pending_thinking.trim().is_empty() {
+            let thinking_style = Style::default().fg(app.theme.status_hint);
+            text.push_line(Line::styled("Thinking:", thinking_style.add_modifier(Modifier::ITALIC)));
+            let rendered_thinking = render_markdown_to_text(
+                &app.pending_thinking,
+                &app.theme,
+                inner_w.saturating_sub(2),
+                &app.syn_ss,
+                &app.syn_theme,
+                app.syntax_enabled,
+            );
+            for line in rendered_thinking.lines {
+                let spans = std::iter::once(Span::styled("▏ ", thinking_style))
+                    .chain(line.spans.into_iter().map(|span| {
+                        Span::styled(span.content.to_string(), thinking_style.patch(span.style))
+                    }))
+                    .collect::<Vec<_>>();
+                text.push_line(Line::from(spans));
+            }
+            text.push_line(Line::from(""));
+        }
 
         // Cached pending render
         let pending_h = str_hash(&app.pending_assistant);
@@ -434,6 +490,22 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             .fg(if app.web_search { app.theme.mode_insert } else { app.theme.status_hint })
             .add_modifier(Modifier::BOLD),
     ));
+    title_spans.push(Span::styled(
+        if app.show_thinking { " [THINK ON]" } else { " [THINK OFF]" },
+        Style::default()
+            .fg(if app.show_thinking {
+                app.theme.mode_visual
+            } else {
+                app.theme.status_hint
+            })
+            .add_modifier(Modifier::BOLD),
+    ));
+    if let Some(status) = app.status_message.as_deref() {
+        title_spans.push(Span::styled(
+            format!(" — {status}"),
+            Style::default().fg(app.theme.status_hint),
+        ));
+    }
     let chat_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_chat))
@@ -601,4 +673,3 @@ fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
     }
     y
 }
-

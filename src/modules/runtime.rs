@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
                 app.messages.push(Message {
                     role: Role::System,
                     content: format!("Error: {}", e),
+                    thinking: None,
                 });
                 app.render_cache.clear();
             }
@@ -128,27 +129,35 @@ async fn main() -> Result<()> {
                         .map(|a| a.request_id == request_id)
                         .unwrap_or(false);
                     if matches_active {
-                        let content = app
+                        let active = app
                             .active_streams
                             .remove(&chat_id)
-                            .map(|s| s.buffer)
-                            .unwrap_or_default();
+                            .unwrap_or(ActiveStream {
+                                request_id: request_id.clone(),
+                                buffer: String::new(),
+                                thinking: String::new(),
+                                status: None,
+                            });
+                        let content = active.buffer;
+                        let thinking = (!active.thinking.is_empty()).then_some(active.thinking);
 
                         if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
-                        app.messages.push(Message {
-                            role: Role::Assistant,
-                            content: content.clone(),
-                        });
-                        refresh_current_stream_state(&mut app);
-                        persist_current_chat(&mut app)?;
-                        if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
-                            app.selected_msg = Some(app.messages.len().saturating_sub(1));
-                        }
+                            app.messages.push(Message {
+                                role: Role::Assistant,
+                                content: content.clone(),
+                                thinking,
+                            });
+                            refresh_current_stream_state(&mut app);
+                            persist_current_chat(&mut app)?;
+                            if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
+                                app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                            }
                         } else if !content.is_empty() {
-                            if let Err(e) = append_assistant_to_chat(&chat_id, content) {
+                            if let Err(e) = append_assistant_to_chat(&chat_id, content, thinking) {
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Error: {}", e),
+                                    thinking: None,
                                 });
                             }
                             app.chats = list_chats().unwrap_or_default();
@@ -173,15 +182,48 @@ async fn main() -> Result<()> {
                             app.messages.push(Message {
                                 role: Role::System,
                                 content: formatted,
+                                thinking: None,
                             });
                         } else {
                             if let Err(e) = append_system_to_chat(&chat_id, formatted) {
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Error: {}", e),
+                                    thinking: None,
                                 });
                             }
                             app.chats = list_chats().unwrap_or_default();
+                        }
+                    }
+                }
+                ServerEvent::Thinking {
+                    request_id,
+                    chat_id,
+                    delta,
+                } => {
+                    if let Some(active) = app.active_streams.get_mut(&chat_id) {
+                        if active.request_id == request_id {
+                            active.thinking.push_str(&delta);
+                            if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                                app.pending_thinking.push_str(&delta);
+                                if app.last_draw.elapsed() < app.stream_throttle {
+                                    should_draw = false;
+                                }
+                            }
+                        }
+                    }
+                }
+                ServerEvent::Status {
+                    request_id,
+                    chat_id,
+                    message,
+                } => {
+                    if let Some(active) = app.active_streams.get_mut(&chat_id) {
+                        if active.request_id == request_id {
+                            active.status = Some(message.clone());
+                            if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                                app.status_message = Some(message);
+                            }
                         }
                     }
                 }
@@ -211,6 +253,8 @@ fn refresh_current_stream_state(app: &mut App) {
     let Some(chat_id) = app.current_chat_id.as_ref() else {
         app.pending_request_id = None;
         app.pending_assistant.clear();
+        app.pending_thinking.clear();
+        app.status_message = None;
         app.sending = false;
         app.pending_cache = None;
         return;
@@ -219,16 +263,20 @@ fn refresh_current_stream_state(app: &mut App) {
     if let Some(active) = app.active_streams.get(chat_id) {
         app.pending_request_id = Some(active.request_id.clone());
         app.pending_assistant = active.buffer.clone();
+        app.pending_thinking = active.thinking.clone();
+        app.status_message = active.status.clone();
         app.sending = true;
     } else {
         app.pending_request_id = None;
         app.pending_assistant.clear();
+        app.pending_thinking.clear();
+        app.status_message = None;
         app.sending = false;
     }
     app.pending_cache = None;
 }
 
-fn append_assistant_to_chat(chat_id: &str, content: String) -> Result<()> {
+fn append_assistant_to_chat(chat_id: &str, content: String, thinking: Option<String>) -> Result<()> {
     let mut chat = match load_chat(chat_id) {
         Ok(c) => c,
         Err(_) => return Ok(()),
@@ -236,6 +284,7 @@ fn append_assistant_to_chat(chat_id: &str, content: String) -> Result<()> {
     chat.messages.push(Message {
         role: Role::Assistant,
         content,
+        thinking,
     });
     chat.updated_ts = now_sec();
     save_chat(&chat)
@@ -249,6 +298,7 @@ fn append_system_to_chat(chat_id: &str, content: String) -> Result<()> {
     chat.messages.push(Message {
         role: Role::System,
         content,
+        thinking: None,
     });
     chat.updated_ts = now_sec();
     save_chat(&chat)
@@ -269,6 +319,8 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.current_created_ts = Some(now);
     app.messages.clear();
     app.pending_assistant.clear();
+    app.pending_thinking.clear();
+    app.status_message = None;
     app.pending_request_id = None;
     app.sending = false;
     app.selected_msg = None;
@@ -395,6 +447,12 @@ async fn handle_key(
         return Ok(());
     }
 
+    // Global: toggle thinking visibility with Ctrl+Y
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('y')) {
+        app.show_thinking = !app.show_thinking;
+        return Ok(());
+    }
+
     match app.mode {
         Mode::Insert => match key.code {
             KeyCode::Esc => {
@@ -421,6 +479,7 @@ async fn handle_key(
                 app.messages.push(Message {
                     role: Role::User,
                     content: input,
+                    thinking: None,
                 });
                 app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
                 persist_current_chat(app)?;
@@ -438,6 +497,7 @@ async fn handle_key(
                             Message {
                                 role: Role::System,
                                 content: sp,
+                                thinking: None,
                             },
                         );
                     }
@@ -460,6 +520,8 @@ async fn handle_key(
                     ActiveStream {
                         request_id: request_id.clone(),
                         buffer: String::new(),
+                        thinking: String::new(),
+                        status: None,
                     },
                 );
                 refresh_current_stream_state(app);
@@ -469,6 +531,7 @@ async fn handle_key(
                     app.messages.push(Message {
                         role: Role::System,
                         content: "Error: background server is unavailable".to_string(),
+                        thinking: None,
                     });
                 }
             }
@@ -676,6 +739,7 @@ async fn handle_key(
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Clipboard paste failed: {}", e),
+                                    thinking: None,
                                 });
                                 app.render_cache.clear();
                             }
@@ -776,6 +840,7 @@ async fn handle_key(
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Clipboard copy failed: {}", e),
+                                    thinking: None,
                                 });
                                 app.render_cache.clear();
                             }

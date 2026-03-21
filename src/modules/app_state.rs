@@ -3,6 +3,8 @@
 struct ActiveStream {
     request_id: String,
     buffer: String,
+    thinking: String,
+    status: Option<String>,
 }
 
 struct App {
@@ -11,6 +13,9 @@ struct App {
     current_created_ts: Option<i64>,
     messages: Vec<Message>,
     pending_assistant: String,
+    pending_thinking: String,
+    status_message: Option<String>,
+    show_thinking: bool,
     pending_request_id: Option<String>,
     active_streams: HashMap<String, ActiveStream>,
 
@@ -87,6 +92,9 @@ impl App {
             current_created_ts: None,
             messages: Vec::new(),
             pending_assistant: String::new(),
+            pending_thinking: String::new(),
+            status_message: None,
+            show_thinking: true,
             pending_request_id: None,
             active_streams: HashMap::new(),
             chats,
@@ -124,4 +132,3 @@ impl App {
         }
     }
 }
-

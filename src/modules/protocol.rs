@@ -22,6 +22,16 @@ enum ServerEvent {
         chat_id: String,
         delta: String,
     },
+    Thinking {
+        request_id: String,
+        chat_id: String,
+        delta: String,
+    },
+    Status {
+        request_id: String,
+        chat_id: String,
+        message: String,
+    },
     Done {
         request_id: String,
         chat_id: String,

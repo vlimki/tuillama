@@ -10,6 +10,8 @@ enum Role {
 struct Message {
     role: Role,
     content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,4 +49,3 @@ enum Popup {
     ConfirmDelete { id: String, title: String },
     Help,
 }
-
