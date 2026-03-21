@@ -10,6 +10,8 @@ enum Role {
 struct Message {
     role: Role,
     content: String,
+    #[serde(default)]
+    created_ts: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
 }
