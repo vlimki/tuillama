@@ -213,7 +213,10 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         Span::raw(" "),
         Span::styled("[+]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
     ])).style(Style::default().bg(app.theme.panel_alt_bg)));
-    items.push(ListItem::new(Line::from(" ")));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "─".repeat(inner.width.saturating_sub(2) as usize),
+        Style::default().fg(app.theme.message_rule),
+    ))));
 
     for (i, c) in app.chats.iter().enumerate() {
         let selected = app.focus == Focus::Sidebar && i == app.sidebar_idx;
@@ -251,24 +254,14 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let mut cards = Vec::new();
     cards.push(("web", if app.web_search { "on" } else { "off" }, app.theme.stats_accent));
     cards.push((
-        "reasoning",
+        "show reasoning",
         if app.show_thinking { "on" } else { "off" },
         if app.show_thinking { app.theme.stats_accent } else { app.theme.status_hint },
     ));
     cards.push(("stream", status_value, if app.sending { app.theme.assistant_prefix } else { app.theme.status_hint }));
     cards.push(("mode", mode_value, app.theme.stats_value));
 
-    let outer = section_block(
-        Line::from(Span::styled(
-            " Statistics ",
-            Style::default()
-                .fg(app.theme.title_chat)
-                .add_modifier(Modifier::BOLD),
-        )),
-        app.theme.panel_bg,
-        app.theme.border_chat,
-        Borders::LEFT,
-    );
+    let outer = section_block(Line::default(), app.theme.panel_bg, app.theme.border_chat, Borders::LEFT);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -282,6 +275,12 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .split(inner);
 
     let mut top_lines = vec![];
+    top_lines.push(Line::from(Span::styled(
+        "Statistics",
+        Style::default()
+            .fg(app.theme.title_chat)
+            .add_modifier(Modifier::BOLD),
+    )));
     for (label, value, color) in cards {
         top_lines.push(Line::from(vec![
             Span::styled(format!("{}: ", label), Style::default().fg(app.theme.stats_label)),
@@ -323,6 +322,9 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("last activity: ", Style::default().fg(app.theme.stats_label)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ", Style::default().fg(app.theme.stats_label)),
             Span::styled(last_activity, Style::default().fg(app.theme.stats_value)),
         ]),
         Line::from(vec![
