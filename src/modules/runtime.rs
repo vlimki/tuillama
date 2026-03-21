@@ -79,8 +79,15 @@ async fn main() -> Result<()> {
     let tx_input = tx.clone();
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(input_poll_ms)).unwrap_or(false) {
-            if let Ok(CEvent::Key(key)) = event::read() {
-                let _ = tx_input.send(AppEvent::Input(key));
+            match event::read() {
+                Ok(CEvent::Key(key)) => {
+                    let _ = tx_input.send(AppEvent::Input(key));
+                }
+                Ok(CEvent::Resize(_, _)) => {
+                    let _ = tx_input.send(AppEvent::Resize);
+                }
+                Ok(_) => {}
+                Err(_) => {}
             }
         }
     });
@@ -95,6 +102,11 @@ async fn main() -> Result<()> {
 
         match ev {
             AppEvent::Input(key) => handle_key(key, &mut app, &tx, &server_tx).await?,
+            AppEvent::Resize => {
+                app.render_cache.clear();
+                app.pending_cache = None;
+                terminal.clear()?;
+            }
             AppEvent::OllamaError(e) => {
                 app.messages.push(Message {
                     role: Role::System,
@@ -115,6 +127,9 @@ async fn main() -> Result<()> {
                             if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
                                 app.pending_assistant.push_str(&delta);
                                 app.pending_cache = None;
+                                if app.chat_at_bottom {
+                                    app.scroll_to_bottom_on_draw = true;
+                                }
                                 if app.last_draw.elapsed() < app.stream_throttle {
                                     should_draw = false;
                                 }
@@ -147,6 +162,9 @@ async fn main() -> Result<()> {
                                 content: content.clone(),
                                 thinking,
                             });
+                            if app.chat_at_bottom {
+                                app.scroll_to_bottom_on_draw = true;
+                            }
                             refresh_current_stream_state(&mut app);
                             persist_current_chat(&mut app)?;
                             if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
@@ -206,6 +224,9 @@ async fn main() -> Result<()> {
                             active.thinking.push_str(&delta);
                             if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
                                 app.pending_thinking.push_str(&delta);
+                                if app.chat_at_bottom {
+                                    app.scroll_to_bottom_on_draw = true;
+                                }
                                 if app.last_draw.elapsed() < app.stream_throttle {
                                     should_draw = false;
                                 }
@@ -326,6 +347,9 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.selected_msg = None;
     app.chat_scroll = 0;
     app.chat_inner_height = 0;
+    app.chat_inner_width = 0;
+    app.scroll_to_bottom_on_draw = false;
+    app.chat_at_bottom = true;
     app.render_cache.clear();
     app.pending_cache = None;
     let chat = Chat {
@@ -342,6 +366,39 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     }
     refresh_current_stream_state(app);
     Ok(())
+}
+
+fn delete_prev_input_grapheme(app: &mut App) {
+    if app.input_cursor_line == 0 && app.input_cursor_col == 0 {
+        return;
+    }
+
+    let mut lines: Vec<String> = app.input.split('\n').map(|s| s.to_string()).collect();
+    if app.input_cursor_col > 0 {
+        let cur = &mut lines[app.input_cursor_line];
+        let grs: Vec<&str> = UnicodeSegmentation::graphemes(cur.as_str(), true).collect();
+        let mut start_byte = 0usize;
+        for i in 0..app.input_cursor_col - 1 {
+            start_byte += grs[i].len();
+        }
+        let end_byte = start_byte + grs[app.input_cursor_col - 1].len();
+        cur.replace_range(start_byte..end_byte, "");
+        app.input_cursor_col -= 1;
+    } else {
+        let prev_len_gr =
+            UnicodeSegmentation::graphemes(lines[app.input_cursor_line - 1].as_str(), true).count();
+        let cur_line = lines.remove(app.input_cursor_line);
+        let prev = &mut lines[app.input_cursor_line - 1];
+        prev.push_str(&cur_line);
+        app.input_cursor_line -= 1;
+        app.input_cursor_col = prev_len_gr;
+    }
+    app.input = lines.join("\n");
+}
+
+fn stop_following_stream(app: &mut App) {
+    app.scroll_to_bottom_on_draw = false;
+    app.chat_at_bottom = false;
 }
 
 fn persist_current_chat(app: &mut App) -> Result<()> {
@@ -525,6 +582,9 @@ async fn handle_key(
                     },
                 );
                 refresh_current_stream_state(app);
+                if app.chat_at_bottom {
+                    app.scroll_to_bottom_on_draw = true;
+                }
                 if server_tx.send(req).is_err() {
                     app.active_streams.retain(|_, v| v.request_id != request_id);
                     refresh_current_stream_state(app);
@@ -560,33 +620,7 @@ async fn handle_key(
                 // input_top_line adjust with headroom (handled in draw)
             }
             KeyCode::Backspace => {
-                // Delete previous grapheme, merging lines if at col 0
-                if app.input_cursor_line == 0 && app.input_cursor_col == 0 {
-                    // nothing
-                } else {
-                    let mut lines: Vec<String> = app.input.split('\n').map(|s| s.to_string()).collect();
-                    if app.input_cursor_col > 0 {
-                        // delete grapheme in current line
-                        let cur = &mut lines[app.input_cursor_line];
-                        let grs: Vec<&str> = UnicodeSegmentation::graphemes(cur.as_str(), true).collect();
-                        let mut start_byte = 0usize;
-                        for i in 0..app.input_cursor_col - 1 {
-                            start_byte += grs[i].len();
-                        }
-                        let end_byte = start_byte + grs[app.input_cursor_col - 1].len();
-                        cur.replace_range(start_byte..end_byte, "");
-                        app.input_cursor_col -= 1;
-                    } else {
-                        // merge with previous line
-                        let prev_len_gr = UnicodeSegmentation::graphemes(lines[app.input_cursor_line - 1].as_str(), true).count();
-                        let cur_line = lines.remove(app.input_cursor_line);
-                        let prev = &mut lines[app.input_cursor_line - 1];
-                        prev.push_str(&cur_line);
-                        app.input_cursor_line -= 1;
-                        app.input_cursor_col = prev_len_gr;
-                    }
-                    app.input = lines.join("\n");
-                }
+                delete_prev_input_grapheme(app);
             }
             KeyCode::Left => {
                 if app.input_cursor_col > 0 {
@@ -630,7 +664,17 @@ async fn handle_key(
                     }
                 }
             }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                delete_prev_input_grapheme(app);
+            }
             KeyCode::Char(c) => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    return Ok(());
+                }
+
                 // insert at cursor
                 let lines: Vec<&str> = app.input.split('\n').collect();
                 let cur = lines.get(app.input_cursor_line).copied().unwrap_or("");
@@ -671,6 +715,7 @@ async fn handle_key(
             }
             // manual chat scroll while typing
             KeyCode::PageUp => {
+                stop_following_stream(app);
                 app.chat_scroll = app.chat_scroll.saturating_sub(app.chat_inner_height.max(1));
             }
             KeyCode::PageDown => {
@@ -763,25 +808,23 @@ async fn handle_key(
                         }
                     }
                     Focus::Chat => {
+                        stop_following_stream(app);
                         app.chat_scroll = app.chat_scroll.saturating_sub(1);
                     }
                 },
                 KeyCode::Char('g') => {
                     if app.focus == Focus::Chat {
-                        app.chat_scroll = 0;
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.scroll_to_bottom_on_draw = true;
+                        } else {
+                            stop_following_stream(app);
+                            app.chat_scroll = 0;
+                        }
                     }
                 }
                 KeyCode::Char('G') => {
                     if app.focus == Focus::Chat {
-                        let total = content_total_height(
-                            &app.messages,
-                            if app.pending_assistant.is_empty() {
-                                None
-                            } else {
-                                Some(app.pending_assistant.as_str())
-                            },
-                        );
-                        app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+                        app.scroll_to_bottom_on_draw = true;
                     }
                 }
                 KeyCode::Enter => match app.focus {
@@ -794,8 +837,7 @@ async fn handle_key(
                                 app.messages = chat.messages;
                                 app.render_cache.clear();
                                 refresh_current_stream_state(app);
-                                let total = content_total_height(&app.messages, None);
-                                app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+                                app.scroll_to_bottom_on_draw = true;
                                 app.focus = Focus::Chat;
                             }
                         }
@@ -803,6 +845,7 @@ async fn handle_key(
                     Focus::Chat => {}
                 },
                 KeyCode::Up => {
+                    stop_following_stream(app);
                     app.chat_scroll = app.chat_scroll.saturating_sub(1);
                 }
                 KeyCode::Down => {
@@ -863,7 +906,7 @@ async fn handle_key(
                         .unwrap_or_else(|| app.messages.len().saturating_sub(1));
                     let next = (cur + 1).min(app.messages.len().saturating_sub(1));
                     app.selected_msg = Some(next);
-                    let target_y = offset_for_message(&app.messages, next);
+                    let target_y = offset_for_message(app, app.chat_inner_width.max(1), next);
                     let top = app.chat_scroll;
                     let bottom = top.saturating_add(app.chat_inner_height.max(1));
                     if target_y < top || target_y >= bottom {
@@ -886,10 +929,11 @@ async fn handle_key(
                         .unwrap_or_else(|| app.messages.len().saturating_sub(1));
                     let next = cur.saturating_sub(1);
                     app.selected_msg = Some(next);
-                    let target_y = offset_for_message(&app.messages, next);
+                    let target_y = offset_for_message(app, app.chat_inner_width.max(1), next);
                     let top = app.chat_scroll;
                     let bottom = top.saturating_add(app.chat_inner_height.max(1));
                     if target_y < top || target_y >= bottom {
+                        stop_following_stream(app);
                         app.chat_scroll = target_y;
                     }
                 }
@@ -906,7 +950,7 @@ async fn handle_key(
                             refresh_current_stream_state(app);
                             app.selected_msg = Some(app.messages.len().saturating_sub(1));
                             app.chat_scroll =
-                                offset_for_message(&app.messages, app.selected_msg.unwrap_or(0));
+                                offset_for_message(app, app.chat_inner_width.max(1), app.selected_msg.unwrap_or(0));
                             app.focus = Focus::Chat;
                         }
                     }
@@ -931,6 +975,7 @@ async fn handle_key(
                 }
             },
             KeyCode::Up => {
+                stop_following_stream(app);
                 app.chat_scroll = app.chat_scroll.saturating_sub(1);
             }
             KeyCode::Down => {

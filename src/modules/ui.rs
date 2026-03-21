@@ -290,7 +290,8 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .split(area);
 
     app.chat_inner_height = v_chunks[0].height.saturating_sub(2);
-    let inner_w = v_chunks[0].width.saturating_sub(2);
+    app.chat_inner_width = v_chunks[0].width.saturating_sub(2);
+    let inner_w = app.chat_inner_width;
 
     let mut text = Text::default();
     let sel = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
@@ -379,7 +380,10 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         text.push_line(Line::from(""));
     }
 
-    if !app.pending_assistant.is_empty() {
+    let has_pending_stream = app.sending
+        || !app.pending_assistant.trim().is_empty()
+        || !app.pending_thinking.trim().is_empty();
+    if has_pending_stream {
         let selected = app.focus == Focus::Chat && app.mode == Mode::Visual && app.messages.len() == sel;
         let mut hdr_style = Style::default()
             .fg(app.theme.assistant_prefix)
@@ -409,42 +413,44 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             text.push_line(Line::from(""));
         }
 
-        // Cached pending render
-        let pending_h = str_hash(&app.pending_assistant);
-        let pending_text: Text<'static> = match &app.pending_cache {
-            Some((w, h, t)) if *w == inner_w && *h == pending_h => t.clone(),
-            _ => {
-                let t = render_markdown_to_text(
-                    &app.pending_assistant,
-                    &app.theme,
-                    inner_w,
-                    &app.syn_ss,
-                    &app.syn_theme,
-                    app.syntax_enabled,
-                );
-                app.pending_cache = Some((inner_w, pending_h, t.clone()));
-                t
-            }
-        };
-
-        let mut md = pending_text.clone();
-        if let Some(last) = md.lines.last_mut() {
-            last.spans.push(Span::raw("▌"));
-        } else {
-            md.lines.push(Line::from("▌"));
-        }
-        if selected {
-            let m = if app.bold_selection {
-                Modifier::BOLD
-            } else {
-                Modifier::REVERSED
+        if !app.pending_assistant.is_empty() {
+            // Cached pending render
+            let pending_h = str_hash(&app.pending_assistant);
+            let pending_text: Text<'static> = match &app.pending_cache {
+                Some((w, h, t)) if *w == inner_w && *h == pending_h => t.clone(),
+                _ => {
+                    let t = render_markdown_to_text(
+                        &app.pending_assistant,
+                        &app.theme,
+                        inner_w,
+                        &app.syn_ss,
+                        &app.syn_theme,
+                        app.syntax_enabled,
+                    );
+                    app.pending_cache = Some((inner_w, pending_h, t.clone()));
+                    t
+                }
             };
-            md = clone_with_modifier(md, m);
+
+            let mut md = pending_text.clone();
+            if let Some(last) = md.lines.last_mut() {
+                last.spans.push(Span::raw("▌"));
+            } else {
+                md.lines.push(Line::from("▌"));
+            }
+            if selected {
+                let m = if app.bold_selection {
+                    Modifier::BOLD
+                } else {
+                    Modifier::REVERSED
+                };
+                md = clone_with_modifier(md, m);
+            }
+            for line in md.lines {
+                text.push_line(line);
+            }
+            text.push_line(Line::from(""));
         }
-        for line in md.lines {
-            text.push_line(line);
-        }
-        text.push_line(Line::from(""));
     }
 
     let mode_span = match app.mode {
@@ -506,6 +512,16 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             Style::default().fg(app.theme.status_hint),
         ));
     }
+    let wrapped_line_count = wrapped_text_height(&text, inner_w.max(1));
+    let max_chat_scroll = wrapped_line_count.saturating_sub(app.chat_inner_height);
+    if app.scroll_to_bottom_on_draw {
+        app.chat_scroll = max_chat_scroll;
+        app.scroll_to_bottom_on_draw = false;
+    } else {
+        app.chat_scroll = app.chat_scroll.min(max_chat_scroll);
+    }
+    app.chat_at_bottom = app.chat_scroll >= max_chat_scroll;
+
     let chat_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_chat))
@@ -648,28 +664,61 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 }
 
-// visual height estimate helpers
-fn content_total_height(messages: &[Message], pending: Option<&str>) -> u16 {
-    let mut y: u16 = 0;
-    for m in messages {
-        y = y.saturating_add(1);
-        y = y.saturating_add(m.content.lines().count() as u16);
-        y = y.saturating_add(1);
-    }
-    if let Some(p) = pending {
-        y = y.saturating_add(1);
-        y = y.saturating_add(p.lines().count() as u16);
-        y = y.saturating_add(1);
-    }
-    y
+fn wrapped_text_height(text: &Text, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    text.lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            std::cmp::max(1, line_width.div_ceil(width)) as u16
+        })
+        .sum()
 }
 
-fn offset_for_message(messages: &[Message], idx: usize) -> u16 {
+// visual height estimate helpers
+fn rendered_message_height(app: &App, inner_w: u16, m: &Message) -> u16 {
     let mut y: u16 = 0;
-    for m in &messages[..idx.min(messages.len())] {
-        y = y.saturating_add(1);
-        y = y.saturating_add(m.content.lines().count() as u16);
-        y = y.saturating_add(1);
+
+    y = y.saturating_add(1);
+
+    if app.show_thinking {
+        if let Some(thinking) = m.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
+            y = y.saturating_add(1);
+            let rendered_thinking = render_markdown_to_text(
+                thinking,
+                &app.theme,
+                inner_w.saturating_sub(2),
+                &app.syn_ss,
+                &app.syn_theme,
+                app.syntax_enabled,
+            );
+            y = y.saturating_add(rendered_thinking.lines.len() as u16);
+            y = y.saturating_add(1);
+        }
+    }
+
+    let rendered_body = render_markdown_to_text(
+        &m.content,
+        &app.theme,
+        inner_w,
+        &app.syn_ss,
+        &app.syn_theme,
+        app.syntax_enabled,
+    );
+    y = y.saturating_add(rendered_body.lines.len() as u16);
+
+    y.saturating_add(1)
+}
+
+
+fn offset_for_message(app: &App, inner_w: u16, idx: usize) -> u16 {
+    let mut y: u16 = 0;
+    for m in &app.messages[..idx.min(app.messages.len())] {
+        y = y.saturating_add(rendered_message_height(app, inner_w, m));
     }
     y
 }
