@@ -783,8 +783,7 @@ async fn handle_key(
                 KeyCode::Char('g') => {
                     if app.focus == Focus::Chat {
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            let total = content_total_height(app, app.chat_inner_width.max(1));
-                            app.chat_scroll = total.saturating_sub(app.chat_inner_height);
+                            app.scroll_to_bottom_on_draw = true;
                         } else {
                             app.chat_scroll = 0;
                         }

@@ -293,12 +293,6 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     app.chat_inner_width = v_chunks[0].width.saturating_sub(2);
     let inner_w = app.chat_inner_width;
 
-    if app.scroll_to_bottom_on_draw {
-        let total = content_total_height(app, inner_w.max(1));
-        app.chat_scroll = total.saturating_sub(app.chat_inner_height);
-        app.scroll_to_bottom_on_draw = false;
-    }
-
     let mut text = Text::default();
     let sel = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
 
@@ -518,6 +512,15 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             Style::default().fg(app.theme.status_hint),
         ));
     }
+    let wrapped_line_count = wrapped_text_height(&text, inner_w.max(1));
+    let max_chat_scroll = wrapped_line_count.saturating_sub(app.chat_inner_height);
+    if app.scroll_to_bottom_on_draw {
+        app.chat_scroll = max_chat_scroll;
+        app.scroll_to_bottom_on_draw = false;
+    } else {
+        app.chat_scroll = app.chat_scroll.min(max_chat_scroll);
+    }
+
     let chat_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_chat))
@@ -660,6 +663,21 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 }
 
+fn wrapped_text_height(text: &Text, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    text.lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            std::cmp::max(1, line_width.div_ceil(width)) as u16
+        })
+        .sum()
+}
+
 // visual height estimate helpers
 fn rendered_message_height(app: &App, inner_w: u16, m: &Message) -> u16 {
     let mut y: u16 = 0;
@@ -695,53 +713,6 @@ fn rendered_message_height(app: &App, inner_w: u16, m: &Message) -> u16 {
     y.saturating_add(1)
 }
 
-fn pending_stream_height(app: &App, inner_w: u16) -> u16 {
-    let has_pending_stream = app.sending
-        || !app.pending_assistant.trim().is_empty()
-        || !app.pending_thinking.trim().is_empty();
-    if !has_pending_stream {
-        return 0;
-    }
-
-    let mut y: u16 = 1;
-
-    if app.show_thinking && !app.pending_thinking.trim().is_empty() {
-        y = y.saturating_add(1);
-        let rendered_thinking = render_markdown_to_text(
-            &app.pending_thinking,
-            &app.theme,
-            inner_w.saturating_sub(2),
-            &app.syn_ss,
-            &app.syn_theme,
-            app.syntax_enabled,
-        );
-        y = y.saturating_add(rendered_thinking.lines.len() as u16);
-        y = y.saturating_add(1);
-    }
-
-    if !app.pending_assistant.is_empty() {
-        let rendered_body = render_markdown_to_text(
-            &app.pending_assistant,
-            &app.theme,
-            inner_w,
-            &app.syn_ss,
-            &app.syn_theme,
-            app.syntax_enabled,
-        );
-        y = y.saturating_add(rendered_body.lines.len() as u16);
-        y = y.saturating_add(1);
-    }
-
-    y
-}
-
-fn content_total_height(app: &App, inner_w: u16) -> u16 {
-    let mut y: u16 = 0;
-    for m in &app.messages {
-        y = y.saturating_add(rendered_message_height(app, inner_w, m));
-    }
-    y.saturating_add(pending_stream_height(app, inner_w))
-}
 
 fn offset_for_message(app: &App, inner_w: u16, idx: usize) -> u16 {
     let mut y: u16 = 0;
