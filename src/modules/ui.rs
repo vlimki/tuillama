@@ -98,6 +98,7 @@ fn section_block<'a>(title: impl Into<Line<'a>>, bg: Color, border: Color, borde
         .style(Style::default().bg(bg))
         .borders(borders)
         .border_style(Style::default().fg(border))
+        .padding(Padding::horizontal(1))
         .title(title)
 }
 
@@ -649,7 +650,14 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         help_hint,
     ]);
 
-    let input_inner_w = left[2].width.saturating_sub(2) as usize;
+    let input_block = section_block(
+        input_title_line,
+        app.theme.panel_bg,
+        app.theme.border_input,
+        Borders::ALL,
+    );
+    let input_inner = input_block.inner(left[2]);
+    let input_inner_w = input_inner.width as usize;
     let lines: Vec<&str> = app.input.split('\n').collect();
     let total_lines = lines.len();
     if app.input_cursor_line >= total_lines { app.input_cursor_line = total_lines.saturating_sub(1); }
@@ -686,19 +694,14 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(input_text).block(section_block(
-            input_title_line,
-            app.theme.panel_bg,
-            app.theme.border_input,
-            Borders::ALL,
-        )),
-        left[2],
-    );
+    frame.render_widget(Paragraph::new(input_text).block(input_block), left[2]);
 
     if app.mode == Mode::Insert && app.focus == Focus::Chat {
         let cursor_row = (app.input_cursor_line.saturating_sub(app.input_top_line)) as u16;
-        frame.set_cursor(left[2].x + 1 + cursor_x_in_view as u16, left[2].y + 1 + cursor_row);
+        frame.set_cursor(
+            input_inner.x + cursor_x_in_view as u16,
+            input_inner.y + cursor_row,
+        );
     }
 
     if app.show_stats_panel {
