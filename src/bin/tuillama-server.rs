@@ -29,7 +29,7 @@ struct Message {
 include!("../modules/protocol.rs");
 include!("../modules/ollama_payloads.rs");
 
-const MAX_TOOL_ITERS: usize = 7;
+const MAX_TOOL_ITERS: usize = 14;
 const TOOL_RESULT_LIMIT: usize = 8_000;
 
 fn debug_enabled() -> bool {
@@ -125,6 +125,21 @@ fn latest_user_query(messages: &[Message]) -> Option<String> {
         .rev()
         .find(|m| matches!(m.role, Role::User) && !m.content.trim().is_empty())
         .map(|m| m.content.trim().to_string())
+}
+
+fn extract_urls_from_text(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Ok(re) = regex::Regex::new(r#"https?://[^\s)\]}>\"']+"#) {
+        for m in re.find_iter(text) {
+            let url = m
+                .as_str()
+                .trim_end_matches(&['.', ',', ';', ':', '!', '?'][..]);
+            if !url.is_empty() && !urls.iter().any(|u| u == url) {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    urls
 }
 
 fn collect_urls(value: &JsonValue, out: &mut Vec<String>) {
@@ -387,64 +402,102 @@ async fn process_agentic_web_search(
     // Force at least one real web retrieval in WEB ON mode, so providers/models
     // that don't autonomously emit tool calls still get fresh context.
     if let Some(query) = latest_user_query(&messages) {
-        let _ = send_status(
-            writer,
-            request_id,
-            chat_id,
-            format!("Searching the web for: {query}"),
-        )
-        .await;
-        debug_log(
-            debug,
-            request_id,
-            format!("preflight web_search query={query}"),
-        );
-        let search_result = run_tool_call(
-            &client,
-            &api_base,
-            &headers,
-            request_id,
-            debug,
-            "web_search",
-            json!({ "query": query }),
-        )
-        .await;
+        let direct_urls = extract_urls_from_text(&query);
 
-        let mut urls = Vec::new();
-        collect_urls(&search_result, &mut urls);
-        urls.truncate(3);
-        debug_log(
-            debug,
-            request_id,
-            format!("preflight extracted urls: {:?}", urls),
-        );
-
-        let mut fetches: Vec<JsonValue> = Vec::new();
-        for url in urls {
+        let web_context = if direct_urls.is_empty() {
             let _ = send_status(
                 writer,
                 request_id,
                 chat_id,
-                format!("Parsing website {url}"),
+                format!("Searching the web for: {query}"),
             )
             .await;
-            let fetched = run_tool_call(
+            debug_log(
+                debug,
+                request_id,
+                format!("preflight web_search query={query}"),
+            );
+            let search_result = run_tool_call(
                 &client,
                 &api_base,
                 &headers,
                 request_id,
                 debug,
-                "web_fetch",
-                json!({ "url": url }),
+                "web_search",
+                json!({ "query": query }),
             )
             .await;
-            fetches.push(fetched);
-        }
 
-        let web_context = json!({
-            "search": search_result,
-            "fetch": fetches,
-        });
+            let mut urls = Vec::new();
+            collect_urls(&search_result, &mut urls);
+            urls.truncate(3);
+            debug_log(
+                debug,
+                request_id,
+                format!("preflight extracted urls: {:?}", urls),
+            );
+
+            let mut fetches: Vec<JsonValue> = Vec::new();
+            for url in urls {
+                let _ = send_status(
+                    writer,
+                    request_id,
+                    chat_id,
+                    format!("Parsing website {url}"),
+                )
+                .await;
+                let fetched = run_tool_call(
+                    &client,
+                    &api_base,
+                    &headers,
+                    request_id,
+                    debug,
+                    "web_fetch",
+                    json!({ "url": url }),
+                )
+                .await;
+                fetches.push(fetched);
+            }
+
+            json!({
+                "mode": "search_then_fetch",
+                "search": search_result,
+                "fetch": fetches,
+            })
+        } else {
+            debug_log(
+                debug,
+                request_id,
+                format!("preflight direct url fetch urls={:?}", direct_urls),
+            );
+
+            let mut fetches: Vec<JsonValue> = Vec::new();
+            for url in direct_urls {
+                let _ = send_status(
+                    writer,
+                    request_id,
+                    chat_id,
+                    format!("Parsing website {url}"),
+                )
+                .await;
+                let fetched = run_tool_call(
+                    &client,
+                    &api_base,
+                    &headers,
+                    request_id,
+                    debug,
+                    "web_fetch",
+                    json!({ "url": url }),
+                )
+                .await;
+                fetches.push(fetched);
+            }
+
+            json!({
+                "mode": "direct_url_fetch",
+                "fetch": fetches,
+            })
+        };
 
         let web_context_text = truncate_for_context(&web_context.to_string(), TOOL_RESULT_LIMIT);
         debug_log(
@@ -647,6 +700,25 @@ mod tests {
         assert_eq!(
             tools[1]["function"]["parameters"]["required"],
             json!(["url"])
+        );
+    }
+
+    #[test]
+    fn extracts_urls_from_text() {
+        assert_eq!(
+            extract_urls_from_text("Summarize https://example.com/a?x=1 and https://foo.bar/b."),
+            vec![
+                "https://example.com/a?x=1".to_string(),
+                "https://foo.bar/b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_unique_urls_from_text() {
+        assert_eq!(
+            extract_urls_from_text("Read https://example.com and https://example.com"),
+            vec!["https://example.com".to_string()]
         );
     }
 }
@@ -914,7 +986,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let server_addr =
-        env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+        env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "0.0.0.0:7878".to_string());
     let listener = TcpListener::bind(&server_addr).await?;
     eprintln!("tuillama-server listening on {server_addr}");
 
