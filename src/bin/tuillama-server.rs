@@ -29,7 +29,7 @@ struct Message {
 include!("../modules/protocol.rs");
 include!("../modules/ollama_payloads.rs");
 
-const MAX_TOOL_ITERS: usize = 7;
+const MAX_TOOL_ITERS: usize = 14;
 const TOOL_RESULT_LIMIT: usize = 8_000;
 
 fn debug_enabled() -> bool {
@@ -986,7 +986,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let server_addr =
-        env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+        env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "0.0.0.0:7878".to_string());
     let listener = TcpListener::bind(&server_addr).await?;
     eprintln!("tuillama-server listening on {server_addr}");
 
