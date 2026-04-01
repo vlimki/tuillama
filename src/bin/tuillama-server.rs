@@ -29,8 +29,64 @@ struct Message {
 include!("../modules/protocol.rs");
 include!("../modules/ollama_payloads.rs");
 
-const MAX_TOOL_ITERS: usize = 14;
+const DEFAULT_MAX_TOOL_ITERS: usize = 12;
+const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:7878";
 const TOOL_RESULT_LIMIT: usize = 8_000;
+
+#[derive(Clone, Debug)]
+struct ServerConfig {
+    server_addr: String,
+    max_tool_iters: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: DEFAULT_SERVER_ADDR.to_string(),
+            max_tool_iters: DEFAULT_MAX_TOOL_ITERS,
+        }
+    }
+}
+
+fn parse_server_config() -> Result<ServerConfig> {
+    let mut config = ServerConfig::default();
+    let mut args = env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--addr" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --addr"))?;
+                config.server_addr = value;
+            }
+            "--max-tool-iters" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --max-tool-iters"))?;
+                let parsed = value
+                    .parse::<usize>()
+                    .context("invalid value for --max-tool-iters")?;
+                if parsed == 0 {
+                    return Err(anyhow!("--max-tool-iters must be greater than 0"));
+                }
+                config.max_tool_iters = parsed;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: tuillama-server [--addr <IP:PORT>] [--max-tool-iters <N>]\n\nDefaults:\n  --addr {}\n  --max-tool-iters {}",
+                    DEFAULT_SERVER_ADDR, DEFAULT_MAX_TOOL_ITERS
+                );
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(anyhow!("unknown argument: {arg}. Use --help for usage."));
+            }
+        }
+    }
+
+    Ok(config)
+}
 
 fn debug_enabled() -> bool {
     matches!(
@@ -374,6 +430,7 @@ async fn process_agentic_web_search(
     ollama_api_key: Option<String>,
     messages: Vec<Message>,
     debug: bool,
+    max_tool_iters: usize,
 ) -> Result<String> {
     let client = reqwest::Client::new();
     let headers = build_auth_headers(ollama_api_key.as_deref());
@@ -516,7 +573,7 @@ async fn process_agentic_web_search(
 
     let mut final_answer = String::new();
 
-    for iter in 0..MAX_TOOL_ITERS {
+    for iter in 0..max_tool_iters {
         let _ = send_status(
             writer,
             request_id,
@@ -524,7 +581,7 @@ async fn process_agentic_web_search(
             format!(
                 "Reasoning over retrieved context (step {} of {})",
                 iter + 1,
-                MAX_TOOL_ITERS
+                max_tool_iters
             ),
         )
         .await;
@@ -871,6 +928,7 @@ async fn process_stream_request(
     ollama_api_key: Option<String>,
     web_search: bool,
     messages: Vec<Message>,
+    max_tool_iters: usize,
 ) {
     let debug = debug_enabled();
     debug_log(
@@ -889,6 +947,7 @@ async fn process_stream_request(
             ollama_api_key,
             messages,
             debug,
+            max_tool_iters,
         )
         .await
         {
@@ -939,7 +998,7 @@ async fn process_stream_request(
     .await;
 }
 
-async fn handle_client(stream: TcpStream) -> Result<()> {
+async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<()> {
     let (reader_half, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
     let mut reader = BufReader::new(reader_half);
@@ -962,6 +1021,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                 ..
             } => {
                 let writer2 = writer.clone();
+                let cfg = config.clone();
                 tokio::spawn(async move {
                     process_stream_request(
                         writer2,
@@ -973,6 +1033,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                         ollama_api_key,
                         web_search,
                         messages,
+                        cfg.max_tool_iters,
                     )
                     .await;
                 });
@@ -985,15 +1046,15 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let server_addr =
-        env::var("TUILLAMA_SERVER_ADDR").unwrap_or_else(|_| "0.0.0.0:7878".to_string());
-    let listener = TcpListener::bind(&server_addr).await?;
-    eprintln!("tuillama-server listening on {server_addr}");
+    let config = Arc::new(parse_server_config()?);
+    let listener = TcpListener::bind(&config.server_addr).await?;
+    eprintln!("tuillama-server listening on {}", config.server_addr);
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let cfg = config.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream).await {
+            if let Err(e) = handle_client(stream, cfg).await {
                 eprintln!("client handler error: {e}");
             }
         });
