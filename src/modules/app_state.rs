@@ -5,6 +5,8 @@ struct ActiveStream {
     buffer: String,
     thinking: String,
     status: Option<String>,
+    started_at: Instant,
+    generated_tokens: usize,
 }
 
 struct App {
@@ -66,6 +68,9 @@ struct App {
     // redraw throttle
     last_draw: Instant,
     stream_throttle: Duration,
+    last_stream_tps: Option<f64>,
+    last_stream_tokens: usize,
+    last_stream_ms: u128,
 }
 
 impl App {
@@ -137,6 +142,9 @@ impl App {
             pending_cache: None,
             last_draw: Instant::now(),
             stream_throttle,
+            last_stream_tps: None,
+            last_stream_tokens: 0,
+            last_stream_ms: 0,
         }
     }
 }
