@@ -30,7 +30,7 @@ include!("../modules/protocol.rs");
 include!("../modules/ollama_payloads.rs");
 
 const DEFAULT_MAX_TOOL_ITERS: usize = 12;
-const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:7878";
+const DEFAULT_SERVER_ADDR: &str = "0.0.0.0:7878";
 const TOOL_RESULT_LIMIT: usize = 8_000;
 
 #[derive(Clone, Debug)]
