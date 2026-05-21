@@ -318,6 +318,17 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .current_chat_id
         .as_ref()
         .and_then(|chat_id| app.active_streams.get(chat_id));
+    let live_tps = active_stream.map(|stream| {
+        let elapsed = stream.started_at.elapsed().as_secs_f64().max(0.001);
+        (stream.generated_tokens as f64) / elapsed
+    });
+    let tps_value = if let Some(tps) = live_tps {
+        format!("{tps:.1} tok/s (live)")
+    } else if let Some(tps) = app.last_stream_tps {
+        format!("{tps:.1} tok/s (last)")
+    } else {
+        "n/a".to_string()
+    };
     let metrics = vec![
         Line::from(vec![
             Span::styled("messages: ", Style::default().fg(app.theme.stats_label)),
@@ -342,6 +353,10 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                     .fg(app.theme.stats_value)
                     .add_modifier(Modifier::BOLD),
             ),
+        ]),
+        Line::from(vec![
+            Span::styled("throughput: ", Style::default().fg(app.theme.stats_label)),
+            Span::styled(tps_value, Style::default().fg(app.theme.stats_value).add_modifier(Modifier::BOLD)),
         ]),
     ];
     frame.render_widget(
@@ -413,6 +428,14 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                     app.pending_assistant.chars().count(),
                     app.pending_thinking.chars().count()
                 ),
+                Style::default().fg(app.theme.stats_value),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("token run", Style::default().fg(app.theme.stats_label)),
+            Span::raw(": "),
+            Span::styled(
+                format!("{} tokens in {} ms", app.last_stream_tokens, app.last_stream_ms),
                 Style::default().fg(app.theme.stats_value),
             ),
         ]),

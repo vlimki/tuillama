@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
                     if let Some(active) = app.active_streams.get_mut(&chat_id) {
                         if active.request_id == request_id {
                             active.buffer.push_str(&delta);
+                            active.generated_tokens += estimate_token_count(&delta);
                             if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
                                 app.pending_assistant.push_str(&delta);
                                 app.pending_cache = None;
@@ -153,7 +154,13 @@ async fn main() -> Result<()> {
                                 buffer: String::new(),
                                 thinking: String::new(),
                                 status: None,
+                                started_at: Instant::now(),
+                                generated_tokens: 0,
                             });
+                        let elapsed_ms = active.started_at.elapsed().as_millis().max(1);
+                        app.last_stream_tokens = active.generated_tokens;
+                        app.last_stream_ms = elapsed_ms;
+                        app.last_stream_tps = Some((active.generated_tokens as f64) / (elapsed_ms as f64 / 1000.0));
                         let content = active.buffer;
                         let thinking = (!active.thinking.is_empty()).then_some(active.thinking);
 
@@ -227,6 +234,7 @@ async fn main() -> Result<()> {
                     if let Some(active) = app.active_streams.get_mut(&chat_id) {
                         if active.request_id == request_id {
                             active.thinking.push_str(&delta);
+                            active.generated_tokens += estimate_token_count(&delta);
                             if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
                                 app.pending_thinking.push_str(&delta);
                                 if app.chat_at_bottom {
@@ -274,6 +282,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+
+
+fn estimate_token_count(text: &str) -> usize {
+    text.split_whitespace().count()
+}
 
 fn refresh_current_stream_state(app: &mut App) {
     let Some(chat_id) = app.current_chat_id.as_ref() else {
@@ -594,6 +607,8 @@ async fn handle_key(
                         buffer: String::new(),
                         thinking: String::new(),
                         status: None,
+                        started_at: Instant::now(),
+                        generated_tokens: 0,
                     },
                 );
                 refresh_current_stream_state(app);
