@@ -139,7 +139,11 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                ServerEvent::Done { request_id, chat_id } => {
+                ServerEvent::Done {
+                    request_id,
+                    chat_id,
+                    ..
+                } => {
                     let matches_active = app
                         .active_streams
                         .get(&chat_id)
@@ -313,6 +317,25 @@ fn refresh_current_stream_state(app: &mut App) {
         app.sending = false;
     }
     app.pending_cache = None;
+}
+
+fn cancel_current_stream(
+    app: &mut App,
+    server_tx: &UnboundedSender<ClientRequest>,
+) -> Result<bool> {
+    let Some(chat_id) = app.current_chat_id.clone() else {
+        return Ok(false);
+    };
+    let Some(active) = app.active_streams.get(&chat_id) else {
+        return Ok(false);
+    };
+    server_tx
+        .send(ClientRequest::CancelStream {
+            request_id: active.request_id.clone(),
+            chat_id,
+        })
+        .map_err(|_| anyhow!("background server is unavailable"))?;
+    Ok(true)
 }
 
 fn append_assistant_to_chat(chat_id: &str, content: String, thinking: Option<String>) -> Result<()> {
@@ -505,6 +528,10 @@ async fn handle_key(
         app.quit = true;
         return Ok(());
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('x')) {
+        let _ = cancel_current_stream(app, server_tx)?;
+        return Ok(());
+    }
 
     // Global: toggle sidebar visibility with Ctrl+T
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
@@ -539,7 +566,9 @@ async fn handle_key(
     match app.mode {
         Mode::Insert => match key.code {
             KeyCode::Esc => {
-                app.mode = Mode::Normal;
+                if !cancel_current_stream(app, server_tx)? {
+                    app.mode = Mode::Normal;
+                }
             }
             // Send with Ctrl+S
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {

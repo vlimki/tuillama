@@ -3,11 +3,12 @@ use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::{env, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
     sync::Mutex,
+    task::JoinHandle,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -894,6 +895,7 @@ async fn process_normal_stream(
                                 &ServerEvent::Done {
                                     request_id: request_id.clone(),
                                     chat_id: chat_id.clone(),
+                                    status: None,
                                 },
                             )
                             .await;
@@ -966,6 +968,7 @@ async fn process_stream_request(
                     &ServerEvent::Done {
                         request_id,
                         chat_id,
+                        status: None,
                     },
                 )
                 .await;
@@ -1001,6 +1004,7 @@ async fn process_stream_request(
 async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<()> {
     let (reader_half, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
+    let mut active_requests: HashMap<(String, String), JoinHandle<()>> = HashMap::new();
     let mut reader = BufReader::new(reader_half);
     let mut line = String::new();
 
@@ -1020,9 +1024,13 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                 messages,
                 ..
             } => {
+                if let Some(old) = active_requests.remove(&(chat_id.clone(), request_id.clone())) {
+                    old.abort();
+                }
                 let writer2 = writer.clone();
                 let cfg = config.clone();
-                tokio::spawn(async move {
+                let key = (chat_id.clone(), request_id.clone());
+                let handle = tokio::spawn(async move {
                     process_stream_request(
                         writer2,
                         request_id,
@@ -1037,6 +1045,34 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                     )
                     .await;
                 });
+                active_requests.insert(key, handle);
+            }
+            ClientRequest::CancelStream {
+                request_id,
+                chat_id,
+            } => {
+                if let Some(handle) = active_requests.remove(&(chat_id.clone(), request_id.clone())) {
+                    handle.abort();
+                    let _ = send_server_event(
+                        &writer,
+                        &ServerEvent::Done {
+                            request_id,
+                            chat_id,
+                            status: Some("cancelled".to_string()),
+                        },
+                    )
+                    .await;
+                } else {
+                    let _ = send_server_event(
+                        &writer,
+                        &ServerEvent::Error {
+                            request_id,
+                            chat_id,
+                            message: "cancelled".to_string(),
+                        },
+                    )
+                    .await;
+                }
             }
         }
     }
