@@ -199,7 +199,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from("  Ctrl+P: hide/show right statistics panel"),
                 Line::from("  Ctrl+W: toggle web search"),
                 Line::from("  Ctrl+Y: hide/show thinking blocks"),
-                Line::from("  Ctrl+X: cancel active stream"),
+                Line::from("  Ctrl+X: terminate generation"),
                 Line::from("  q / Ctrl+C: quit"),
                 Line::from(""),
                 Line::from(Span::styled("Sidebar", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
@@ -211,7 +211,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from("  Sidebar focus: / search chats, Enter apply, Esc clear"),
                 Line::from("  ↑/k: scroll up, ↓/j: scroll down, g: top, G: bottom"),
                 Line::from("  :attach /path/to/image then Ctrl+S to attach image"),
-                Line::from("  Ctrl+S: send in INSERT mode, Esc: cancel stream / normal mode"),
+                Line::from("  Ctrl+S: send in INSERT mode, Esc: normal mode"),
             ];
             frame.render_widget(Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false }), area);
         }

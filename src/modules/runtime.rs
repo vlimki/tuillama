@@ -724,9 +724,7 @@ async fn handle_key(
     match app.mode {
         Mode::Insert => match key.code {
             KeyCode::Esc => {
-                if !cancel_current_stream(app, server_tx)? {
-                    app.mode = Mode::Normal;
-                }
+                app.mode = Mode::Normal;
             }
             // Send with Ctrl+S
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
