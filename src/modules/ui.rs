@@ -198,6 +198,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from("  Ctrl+T: hide/show left sidebar"),
                 Line::from("  Ctrl+P: hide/show right statistics panel"),
                 Line::from("  Ctrl+W: toggle web search"),
+                Line::from("  : command mode (:attach PATH, :web on)"),
                 Line::from("  Ctrl+Y: hide/show thinking blocks"),
                 Line::from("  Ctrl+X: terminate generation"),
                 Line::from("  q / Ctrl+C: quit"),
@@ -210,7 +211,8 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from("  r: refresh screen"),
                 Line::from("  Sidebar focus: / search chats, Enter apply, Esc clear"),
                 Line::from("  ↑/k: scroll up, ↓/j: scroll down, g: top, G: bottom"),
-                Line::from("  :attach /path/to/image then Ctrl+S to attach image"),
+                Line::from("  :attach /path/to/image then Enter to attach image"),
+                Line::from("  :web on then Enter to enable web search"),
                 Line::from("  Ctrl+S: send in INSERT mode, Esc: normal mode"),
             ];
             frame.render_widget(Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false }), area);
@@ -301,6 +303,7 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let mode_value = match app.mode {
         Mode::Normal => "normal",
         Mode::Insert => "insert",
+        Mode::Command => "command",
         Mode::Visual => "visual",
     };
 
@@ -510,12 +513,20 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled("input", Style::default().fg(app.theme.stats_label)),
             Span::raw(": "),
             Span::styled(
-                format!(
-                    "{} chars • line {} col {}",
-                    app.input.chars().count(),
-                    app.input_cursor_line + 1,
-                    app.input_cursor_col + 1
-                ),
+                if app.mode == Mode::Command {
+                    format!(
+                        "command {} chars • col {}",
+                        app.command_input.chars().count(),
+                        app.command_cursor_col + 1
+                    )
+                } else {
+                    format!(
+                        "{} chars • line {} col {}",
+                        app.input.chars().count(),
+                        app.input_cursor_line + 1,
+                        app.input_cursor_col + 1
+                    )
+                },
                 Style::default().fg(app.theme.stats_value),
             ),
         ]),
@@ -597,6 +608,7 @@ fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: 
                 &app.syn_ss,
                 &app.syn_theme,
                 app.syntax_enabled,
+                app.render_emojis,
             );
             for line in rendered_thinking.lines {
                 let spans = std::iter::once(Span::styled("▏ ", thinking_style))
@@ -626,12 +638,12 @@ fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: 
         if *h == msg_h {
             cached.clone()
         } else {
-            let t = render_markdown_to_text(&m.content, &app.theme, inner_w, &app.syn_ss, &app.syn_theme, app.syntax_enabled);
+            let t = render_markdown_to_text(&m.content, &app.theme, inner_w, &app.syn_ss, &app.syn_theme, app.syntax_enabled, app.render_emojis);
             app.render_cache.insert(key, (msg_h, t.clone()));
             t
         }
     } else {
-        let t = render_markdown_to_text(&m.content, &app.theme, inner_w, &app.syn_ss, &app.syn_theme, app.syntax_enabled);
+        let t = render_markdown_to_text(&m.content, &app.theme, inner_w, &app.syn_ss, &app.syn_theme, app.syntax_enabled, app.render_emojis);
         app.render_cache.insert(key, (msg_h, t.clone()));
         t
     };
@@ -662,7 +674,11 @@ fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: 
 
 fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let input_multiline = app.input.chars().filter(|&c| c == '\n').count();
-    let input_height: u16 = std::cmp::min(input_multiline as u16 + 1, 5);
+    let input_height: u16 = if app.mode == Mode::Command {
+        1
+    } else {
+        std::cmp::min(input_multiline as u16 + 1, 5)
+    };
 
     let cols = if app.show_stats_panel {
         Layout::default()
@@ -767,9 +783,13 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     );
 
     let help_hint = Span::styled(" • ? help", Style::default().fg(app.theme.status_hint));
-    let base = if app.mode == Mode::Insert { "Compose" } else { "Command" };
-    let mode_name = match app.mode { Mode::Insert => "INSERT", Mode::Normal => "NORMAL", Mode::Visual => "VISUAL" };
-    let mode_color = match app.mode { Mode::Insert => app.theme.mode_insert, Mode::Normal => app.theme.mode_normal, Mode::Visual => app.theme.mode_visual };
+    let base = match app.mode {
+        Mode::Insert => "Compose",
+        Mode::Command => "Command Palette",
+        Mode::Normal | Mode::Visual => "Command",
+    };
+    let mode_name = match app.mode { Mode::Insert => "INSERT", Mode::Command => "COMMAND", Mode::Normal => "NORMAL", Mode::Visual => "VISUAL" };
+    let mode_color = match app.mode { Mode::Insert => app.theme.mode_insert, Mode::Command => app.theme.mode_insert, Mode::Normal => app.theme.mode_normal, Mode::Visual => app.theme.mode_visual };
     let attachment_hint = if app.pending_attachments.is_empty() {
         Span::raw("")
     } else {
@@ -793,18 +813,33 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     );
     let input_inner = input_block.inner(left[2]);
     let input_inner_w = input_inner.width as usize;
-    let lines: Vec<&str> = app.input.split('\n').collect();
+    let command_display = format!(":{}", app.command_input);
+    let lines: Vec<&str> = if app.mode == Mode::Command {
+        vec![command_display.as_str()]
+    } else {
+        app.input.split('\n').collect()
+    };
     let total_lines = lines.len();
-    if app.input_cursor_line >= total_lines { app.input_cursor_line = total_lines.saturating_sub(1); }
-    let cur_line_str = lines.get(app.input_cursor_line).copied().unwrap_or("");
+    let active_cursor_line = if app.mode == Mode::Command {
+        0
+    } else {
+        if app.input_cursor_line >= total_lines { app.input_cursor_line = total_lines.saturating_sub(1); }
+        app.input_cursor_line
+    };
+    let cur_line_str = lines.get(active_cursor_line).copied().unwrap_or("");
     let cur_line_grs: Vec<&str> = UnicodeSegmentation::graphemes(cur_line_str, true).collect();
-    if app.input_cursor_col > cur_line_grs.len() { app.input_cursor_col = cur_line_grs.len(); }
+    let active_cursor_col = if app.mode == Mode::Command {
+        (app.command_cursor_col + 1).min(cur_line_grs.len())
+    } else {
+        if app.input_cursor_col > cur_line_grs.len() { app.input_cursor_col = cur_line_grs.len(); }
+        app.input_cursor_col
+    };
 
     let view_h = input_height as usize;
     let headroom = if view_h > 1 { view_h - 1 } else { 0 };
     let max_top_allowed = total_lines.saturating_sub(view_h);
-    let min_top_for_cursor = app.input_cursor_line.saturating_sub(headroom);
-    let max_top_for_cursor = app.input_cursor_line.min(max_top_allowed);
+    let min_top_for_cursor = active_cursor_line.saturating_sub(headroom);
+    let max_top_for_cursor = active_cursor_line.min(max_top_allowed);
     if app.input_top_line < min_top_for_cursor { app.input_top_line = min_top_for_cursor; }
     if app.input_top_line > max_top_for_cursor { app.input_top_line = max_top_for_cursor; }
     if app.input_top_line > max_top_allowed { app.input_top_line = max_top_allowed; }
@@ -814,8 +849,8 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     for i in 0..view_h {
         let li = app.input_top_line + i;
         let s = if li < total_lines { lines[li] } else { "" };
-        if li == app.input_cursor_line {
-            let (visible, cx) = line_view(s, app.input_cursor_col, input_inner_w);
+        if li == active_cursor_line {
+            let (visible, cx) = line_view(s, active_cursor_col, input_inner_w);
             cursor_x_in_view = cx;
             input_text.lines.push(Line::from(visible));
         } else {
@@ -839,6 +874,11 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             input_inner.x + cursor_x_in_view as u16,
             input_inner.y + cursor_row,
         );
+    } else if app.mode == Mode::Command {
+        frame.set_cursor(
+            input_inner.x + (app.command_cursor_col + 1).min(input_inner_w) as u16,
+            input_inner.y,
+        );
     }
 
     if app.show_stats_panel {
@@ -852,7 +892,7 @@ fn rendered_message_height(app: &App, inner_w: u16, m: &Message) -> u16 {
     if app.show_thinking {
         if let Some(thinking) = m.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
             y = y.saturating_add(1);
-            let rendered_thinking = render_markdown_to_text(thinking, &app.theme, inner_w.saturating_sub(3), &app.syn_ss, &app.syn_theme, app.syntax_enabled);
+            let rendered_thinking = render_markdown_to_text(thinking, &app.theme, inner_w.saturating_sub(3), &app.syn_ss, &app.syn_theme, app.syntax_enabled, app.render_emojis);
             y = y.saturating_add(rendered_thinking.lines.len() as u16);
             y = y.saturating_add(1);
         }
@@ -860,7 +900,7 @@ fn rendered_message_height(app: &App, inner_w: u16, m: &Message) -> u16 {
     if !m.attachments.is_empty() {
         y = y.saturating_add(m.attachments.len() as u16 + 1);
     }
-    let rendered_body = render_markdown_to_text(&m.content, &app.theme, inner_w, &app.syn_ss, &app.syn_theme, app.syntax_enabled);
+    let rendered_body = render_markdown_to_text(&m.content, &app.theme, inner_w, &app.syn_ss, &app.syn_theme, app.syntax_enabled, app.render_emojis);
     y = y.saturating_add(rendered_body.lines.len() as u16);
     if !m.sources.is_empty() {
         let source_lines = m

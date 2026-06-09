@@ -36,6 +36,8 @@ struct App {
     input_cursor_line: usize, // line index in input
     input_cursor_col: usize,  // grapheme index in current line
     input_top_line: usize,    // first visible line in input viewport
+    command_input: String,
+    command_cursor_col: usize,
     pending_attachments: Vec<Attachment>,
     chat_scroll: u16,
     chat_inner_height: u16,
@@ -50,6 +52,7 @@ struct App {
     web_search: bool,
     system_prompt: Option<String>,
     bold_selection: bool,
+    render_emojis: bool,
     theme: Theme,
     quit: bool,
     mode: Mode,
@@ -87,6 +90,7 @@ impl App {
         web_search: bool,
         system_prompt: Option<String>,
         bold_selection: bool,
+        render_emojis: bool,
         theme: Theme,
         syntax_enabled: bool,
         syntax_theme_name: String,
@@ -122,6 +126,8 @@ impl App {
             input_cursor_line: 0,
             input_cursor_col: 0,
             input_top_line: 0,
+            command_input: String::new(),
+            command_cursor_col: 0,
             pending_attachments: Vec::new(),
             chat_scroll: 0,
             chat_inner_height: 0,
@@ -136,6 +142,7 @@ impl App {
             web_search,
             system_prompt,
             bold_selection,
+            render_emojis,
             theme,
             quit: false,
             mode: Mode::Normal,

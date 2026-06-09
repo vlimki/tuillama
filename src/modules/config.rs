@@ -26,6 +26,7 @@ struct AppConfig {
     options: Option<toml::value::Table>,
     system_prompt: Option<String>,
     bold_selection: Option<bool>,
+    render_emojis: Option<bool>,
     colors: Option<toml::value::Table>,
     syntax: Option<SyntaxSection>,
     syntax_theme: Option<String>, // legacy
