@@ -192,6 +192,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from(""),
                 Line::from(Span::styled("Chat", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
                 Line::from("  h/l: move focus, i: insert, v: visual, p: paste clipboard"),
+                Line::from("  Sidebar focus: / search chats, Enter apply, Esc clear"),
                 Line::from("  ↑/k: scroll up, ↓/j: scroll down, g: top, G: bottom"),
                 Line::from("  Ctrl+S: send in INSERT mode, Esc: cancel stream / normal mode"),
             ];
@@ -217,11 +218,36 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let mut items: Vec<ListItem> = Vec::new();
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled("Search chats…", Style::default().fg(app.theme.status_hint)),
-        Span::raw(" "),
-        Span::styled("[+]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
-    ])).style(Style::default().bg(app.theme.panel_alt_bg)));
+    let search_label = if app.sidebar_search_query.is_empty() {
+        "Search chats…".to_string()
+    } else {
+        format!("Search: {}", app.sidebar_search_query)
+    };
+    let search_suffix = if app.sidebar_search_active {
+        "[typing]"
+    } else if app.sidebar_search_query.is_empty() {
+        "[/]"
+    } else {
+        "[Esc clears]"
+    };
+    let search_bg = if app.sidebar_search_active {
+        app.theme.sidebar_selected_bg
+    } else {
+        app.theme.panel_alt_bg
+    };
+    items.push(
+        ListItem::new(Line::from(vec![
+            Span::styled(search_label, Style::default().fg(app.theme.status_hint)),
+            Span::raw(" "),
+            Span::styled(
+                search_suffix,
+                Style::default()
+                    .fg(app.theme.mode_insert)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(search_bg)),
+    );
     items.push(ListItem::new(Line::from(Span::styled(
         "─".repeat(inner.width.saturating_sub(2) as usize),
         Style::default().fg(app.theme.message_rule),
@@ -235,14 +261,15 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         } else {
             Style::default().bg(app.theme.sidebar_item_bg)
         };
-        items.push(
-            ListItem::new(vec![
-                Line::from(Span::styled(c.title.clone(), Style::default().fg(app.theme.sidebar_item).add_modifier(Modifier::BOLD))),
-                Line::from(Span::styled(ts, Style::default().fg(app.theme.sidebar_timestamp))),
-                Line::from(""),
-            ])
-            .style(style),
-        );
+        let mut lines = vec![
+            Line::from(Span::styled(c.title.clone(), Style::default().fg(app.theme.sidebar_item).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(ts, Style::default().fg(app.theme.sidebar_timestamp))),
+        ];
+        if let Some(excerpt) = &c.search_excerpt {
+            lines.push(Line::from(Span::styled(excerpt.clone(), Style::default().fg(app.theme.status_hint))));
+        }
+        lines.push(Line::from(""));
+        items.push(ListItem::new(lines).style(style));
     }
 
     let list = List::new(items).highlight_style(Style::default().bg(app.theme.sidebar_selected_bg));

@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
                 ServerEvent::Done {
                     request_id,
                     chat_id,
-                    ..
+                    status,
                 } => {
                     let matches_active = app
                         .active_streams
@@ -167,23 +167,31 @@ async fn main() -> Result<()> {
                         app.last_stream_tps = Some((active.generated_tokens as f64) / (elapsed_ms as f64 / 1000.0));
                         let content = active.buffer;
                         let thinking = (!active.thinking.is_empty()).then_some(active.thinking);
+                        let has_partial = !content.is_empty() || thinking.is_some();
+                        let cancelled = status.as_deref() == Some("cancelled");
 
                         if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
-                            app.messages.push(Message {
-                                role: Role::Assistant,
-                                content: content.clone(),
-                                created_ts: now_sec(),
-                                thinking,
-                            });
+                            if has_partial {
+                                app.messages.push(Message {
+                                    role: Role::Assistant,
+                                    content: content.clone(),
+                                    created_ts: now_sec(),
+                                    thinking,
+                                });
+                                if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
+                                    app.selected_msg = Some(app.messages.len().saturating_sub(1));
+                                }
+                                persist_current_chat(&mut app)?;
+                            } else {
+                                refresh_current_stream_state(&mut app);
+                            }
+                            if cancelled {
+                                app.status_message = Some("Stream cancelled".to_string());
+                            }
                             if app.chat_at_bottom {
                                 app.scroll_to_bottom_on_draw = true;
                             }
-                            refresh_current_stream_state(&mut app);
-                            persist_current_chat(&mut app)?;
-                            if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
-                                app.selected_msg = Some(app.messages.len().saturating_sub(1));
-                            }
-                        } else if !content.is_empty() {
+                        } else if has_partial {
                             if let Err(e) = append_assistant_to_chat(&chat_id, content, thinking) {
                                 app.messages.push(Message {
                                     role: Role::System,
@@ -192,7 +200,7 @@ async fn main() -> Result<()> {
                                     thinking: None,
                                 });
                             }
-                            app.chats = list_chats().unwrap_or_default();
+                            refresh_sidebar_chats(&mut app, None);
                         }
                     }
                 }
@@ -226,7 +234,7 @@ async fn main() -> Result<()> {
                                     thinking: None,
                                 });
                             }
-                            app.chats = list_chats().unwrap_or_default();
+                            refresh_sidebar_chats(&mut app, None);
                         }
                     }
                 }
@@ -376,6 +384,30 @@ fn now_sec() -> i64 {
         .as_secs() as i64
 }
 
+fn refresh_sidebar_chats(app: &mut App, preferred_id: Option<&str>) {
+    app.chats = if app.sidebar_search_query.trim().is_empty() {
+        list_chats().unwrap_or_default()
+    } else {
+        search_chats(&app.sidebar_search_query).unwrap_or_default()
+    };
+
+    if let Some(id) = preferred_id {
+        if let Some(idx) = app.chats.iter().position(|c| c.id == id) {
+            app.sidebar_idx = idx;
+            return;
+        }
+    }
+    if app.sidebar_idx >= app.chats.len() {
+        app.sidebar_idx = app.chats.len().saturating_sub(1);
+    }
+}
+
+fn update_sidebar_search(app: &mut App, query: String) {
+    let selected_id = app.chats.get(app.sidebar_idx).map(|c| c.id.clone());
+    app.sidebar_search_query = query;
+    refresh_sidebar_chats(app, selected_id.as_deref());
+}
+
 fn start_new_chat(app: &mut App) -> Result<()> {
     let now = now_sec();
     let id = gen_chat_id();
@@ -403,10 +435,7 @@ fn start_new_chat(app: &mut App) -> Result<()> {
         messages: Vec::new(),
     };
     save_chat(&chat)?;
-    app.chats = list_chats().unwrap_or_default();
-    if let Some(idx) = app.chats.iter().position(|c| c.id == id) {
-        app.sidebar_idx = idx;
-    }
+    refresh_sidebar_chats(app, Some(&id));
     refresh_current_stream_state(app);
     Ok(())
 }
@@ -462,10 +491,7 @@ fn persist_current_chat(app: &mut App) -> Result<()> {
         messages: app.messages.clone(),
     };
     save_chat(&chat)?;
-    app.chats = list_chats().unwrap_or_default();
-    if let Some(idx) = app.chats.iter().position(|c| c.id == id) {
-        app.sidebar_idx = idx;
-    }
+    refresh_sidebar_chats(app, Some(&id));
     refresh_current_stream_state(app);
     Ok(())
 }
@@ -493,10 +519,7 @@ async fn handle_key(
                     refresh_current_stream_state(app);
                 }
                 app.popup = Popup::None;
-                app.chats = list_chats().unwrap_or_default();
-                if app.sidebar_idx >= app.chats.len() {
-                    app.sidebar_idx = app.chats.len().saturating_sub(1);
-                }
+                refresh_sidebar_chats(app, None);
                 return Ok(());
             }
             KeyCode::Char('n') | KeyCode::Esc => {
@@ -560,6 +583,42 @@ async fn handle_key(
     // Global: toggle thinking visibility with Ctrl+Y
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('y')) {
         app.show_thinking = !app.show_thinking;
+        return Ok(());
+    }
+
+    if app.sidebar_search_active {
+        match key.code {
+            KeyCode::Esc => {
+                app.sidebar_search_active = false;
+                update_sidebar_search(app, String::new());
+            }
+            KeyCode::Enter => {
+                app.sidebar_search_active = false;
+            }
+            KeyCode::Backspace => {
+                let mut query = app.sidebar_search_query.clone();
+                query.pop();
+                update_sidebar_search(app, query);
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+            {
+                let mut query = app.sidebar_search_query.clone();
+                query.push(c);
+                update_sidebar_search(app, query);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if key.code == KeyCode::Esc
+        && app.focus == Focus::Sidebar
+        && !app.sidebar_search_query.is_empty()
+    {
+        update_sidebar_search(app, String::new());
         return Ok(());
     }
 
@@ -790,6 +849,11 @@ async fn handle_key(
             }
 
             match key.code {
+                KeyCode::Char('/') => {
+                    if app.focus == Focus::Sidebar {
+                        app.sidebar_search_active = true;
+                    }
+                }
                 KeyCode::Char('h') => {
                     if app.show_sidebar {
                         app.focus = Focus::Sidebar;

@@ -30,6 +30,7 @@ struct ChatMeta {
     id: String,
     title: String,
     updated_ts: i64,
+    search_excerpt: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

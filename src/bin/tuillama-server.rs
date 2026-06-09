@@ -1011,6 +1011,7 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
     while reader.read_line(&mut line).await? > 0 {
         let req: ClientRequest = serde_json::from_str(line.trim_end())?;
         line.clear();
+        active_requests.retain(|_, handle| !handle.is_finished());
 
         match req {
             ClientRequest::StartStream {
@@ -1051,7 +1052,11 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                 request_id,
                 chat_id,
             } => {
-                if let Some(handle) = active_requests.remove(&(chat_id.clone(), request_id.clone())) {
+                if let Some(handle) = active_requests.remove(&(chat_id.clone(), request_id.clone()))
+                {
+                    if handle.is_finished() {
+                        continue;
+                    }
                     handle.abort();
                     let _ = send_server_event(
                         &writer,

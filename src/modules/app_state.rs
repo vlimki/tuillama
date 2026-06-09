@@ -25,6 +25,8 @@ struct App {
     chats: Vec<ChatMeta>,
     sidebar_idx: usize,
     show_sidebar: bool,
+    sidebar_search_active: bool,
+    sidebar_search_query: String,
     show_stats_panel: bool,
 
     // UI/input
@@ -109,6 +111,8 @@ impl App {
             chats,
             sidebar_idx: 0,
             show_sidebar: true,
+            sidebar_search_active: false,
+            sidebar_search_query: String::new(),
             show_stats_panel: true,
             input: String::new(),
             input_cursor_line: 0,
