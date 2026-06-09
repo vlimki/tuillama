@@ -17,6 +17,7 @@ async fn main() -> Result<()> {
     let web_search = false;
     let system_prompt = cfg.system_prompt.clone();
     let bold_selection = cfg.bold_selection.unwrap_or(false);
+    let render_emojis = cfg.render_emojis.unwrap_or(true);
     let theme = Theme::from_config(cfg.colors.as_ref());
 
     let (syntax_enabled, syntax_theme_name, syntax_custom) = {
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
         web_search,
         system_prompt,
         bold_selection,
+        render_emojis,
         theme,
         syntax_enabled,
         syntax_theme_name,
@@ -449,6 +451,53 @@ fn attachment_from_path(path_text: &str) -> Result<Attachment> {
     })
 }
 
+fn execute_command_palette(app: &mut App) {
+    let command = app.command_input.trim().trim_start_matches(':').trim();
+    if command.is_empty() {
+        app.status_message = Some("Command cancelled".to_string());
+        return;
+    }
+
+    if let Some(path) = command.strip_prefix("attach ").map(str::trim).filter(|p| !p.is_empty()) {
+        match attachment_from_path(path) {
+            Ok(attachment) => {
+                let name = attachment.path.clone();
+                app.pending_attachments.push(attachment);
+                app.status_message = Some(format!("Attached image {name}"));
+            }
+            Err(e) => {
+                app.messages.push(Message {
+                    role: Role::System,
+                    content: format!("Attachment failed: {e}"),
+                    created_ts: now_sec(),
+                    thinking: None,
+                    attachments: Vec::new(),
+                    sources: Vec::new(),
+                });
+                app.render_cache.clear();
+            }
+        }
+        return;
+    }
+
+    match command {
+        "web on" => {
+            app.web_search = true;
+            app.status_message = Some("Web search enabled".to_string());
+        }
+        _ => {
+            app.status_message = Some(format!("Unknown command: :{command}"));
+        }
+    }
+}
+
+fn command_byte_index(input: &str, col: usize) -> usize {
+    UnicodeSegmentation::graphemes(input, true)
+        .take(col)
+        .map(str::len)
+        .sum()
+}
+
 fn mime_type_for_path(path: &std::path::Path) -> String {
     match path
         .extension()
@@ -729,30 +778,6 @@ async fn handle_key(
             // Send with Ctrl+S
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let input = app.input.trim().to_string();
-                if let Some(path) = input.strip_prefix(":attach ").map(str::trim).filter(|p| !p.is_empty()) {
-                    match attachment_from_path(path) {
-                        Ok(attachment) => {
-                            let name = attachment.path.clone();
-                            app.pending_attachments.push(attachment);
-                            app.input.clear();
-                            app.input_cursor_line = 0;
-                            app.input_cursor_col = 0;
-                            app.input_top_line = 0;
-                            app.status_message = Some(format!("Attached image {name}"));
-                        }
-                        Err(e) => {
-                            app.messages.push(Message {
-                                role: Role::System,
-                                content: format!("Attachment failed: {e}"),
-                                created_ts: now_sec(),
-                                thinking: None,
-                                attachments: Vec::new(),
-                                sources: Vec::new(),
-                            });
-                        }
-                    }
-                    return Ok(());
-                }
                 if input.is_empty() && app.pending_attachments.is_empty() {
                     return Ok(());
                 }
@@ -976,6 +1001,55 @@ async fn handle_key(
             }
             _ => {}
         },
+        Mode::Command => match key.code {
+            KeyCode::Esc => {
+                app.command_input.clear();
+                app.command_cursor_col = 0;
+                app.mode = Mode::Normal;
+                app.status_message = Some("Command cancelled".to_string());
+            }
+            KeyCode::Enter => {
+                execute_command_palette(app);
+                app.command_input.clear();
+                app.command_cursor_col = 0;
+                app.mode = Mode::Normal;
+            }
+            KeyCode::Backspace => {
+                if app.command_cursor_col > 0 {
+                    let start = command_byte_index(&app.command_input, app.command_cursor_col - 1);
+                    let end = command_byte_index(&app.command_input, app.command_cursor_col);
+                    app.command_input.replace_range(start..end, "");
+                    app.command_cursor_col -= 1;
+                }
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.command_cursor_col > 0 {
+                    let start = command_byte_index(&app.command_input, app.command_cursor_col - 1);
+                    let end = command_byte_index(&app.command_input, app.command_cursor_col);
+                    app.command_input.replace_range(start..end, "");
+                    app.command_cursor_col -= 1;
+                }
+            }
+            KeyCode::Left => {
+                app.command_cursor_col = app.command_cursor_col.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let len = UnicodeSegmentation::graphemes(app.command_input.as_str(), true).count();
+                app.command_cursor_col = (app.command_cursor_col + 1).min(len);
+            }
+            KeyCode::Char(c) => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    return Ok(());
+                }
+                let byte_cursor = command_byte_index(&app.command_input, app.command_cursor_col);
+                app.command_input.insert(byte_cursor, c);
+                app.command_cursor_col += 1;
+            }
+            _ => {}
+        },
         Mode::Normal => {
             if let KeyCode::Char('?') = key.code {
                 app.popup = Popup::Help;
@@ -983,6 +1057,12 @@ async fn handle_key(
             }
 
             match key.code {
+                KeyCode::Char(':') => {
+                    app.command_input.clear();
+                    app.command_cursor_col = 0;
+                    app.mode = Mode::Command;
+                    app.status_message = Some("Command mode".to_string());
+                }
                 KeyCode::Char('/') => {
                     if app.focus == Focus::Sidebar {
                         app.sidebar_search_active = true;

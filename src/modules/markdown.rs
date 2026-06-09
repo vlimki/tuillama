@@ -33,6 +33,7 @@ struct MarkdownRenderer<'a> {
     ss: &'a SyntaxSet,
     syn_theme: &'a SynTheme,
     syntax_enabled: bool,
+    render_emojis: bool,
 }
 
 impl<'a> MarkdownRenderer<'a> {
@@ -42,6 +43,7 @@ impl<'a> MarkdownRenderer<'a> {
         ss: &'a SyntaxSet,
         syn_theme: &'a SynTheme,
         syntax_enabled: bool,
+        render_emojis: bool,
     ) -> Self {
         Self {
             text: Text::default(),
@@ -58,6 +60,7 @@ impl<'a> MarkdownRenderer<'a> {
             ss,
             syn_theme,
             syntax_enabled,
+            render_emojis,
         }
     }
 
@@ -98,7 +101,7 @@ impl<'a> MarkdownRenderer<'a> {
     }
 
     fn push_span(&mut self, content: impl Into<String>, style: Style) {
-        let content = content.into();
+        let content = filter_emojis(content.into(), self.render_emojis);
         if content.is_empty() {
             return;
         }
@@ -251,7 +254,8 @@ impl<'a> MarkdownRenderer<'a> {
         };
 
         for raw in contents.trim_end_matches('\n').split('\n') {
-            self.push_code_block_line(raw, high.as_mut());
+            let raw = filter_emojis(raw.to_string(), self.render_emojis);
+            self.push_code_block_line(&raw, high.as_mut());
         }
     }
 
@@ -474,6 +478,25 @@ impl<'a> MarkdownRenderer<'a> {
     }
 }
 
+fn filter_emojis(input: String, render_emojis: bool) -> String {
+    if render_emojis {
+        return input;
+    }
+
+    UnicodeSegmentation::graphemes(input.as_str(), true)
+        .filter(|g| !is_emoji_grapheme(g))
+        .collect()
+}
+
+fn is_emoji_grapheme(g: &str) -> bool {
+    g.chars().any(|c| {
+        matches!(
+            c as u32,
+            0x1F000..=0x1FAFF | 0xE0020..=0xE007F
+        ) || c == '\u{FE0F}'
+    })
+}
+
 fn render_markdown_to_text(
     input: &str,
     theme: &Theme,
@@ -481,6 +504,7 @@ fn render_markdown_to_text(
     ss: &SyntaxSet,
     syn_theme: &SynTheme,
     syntax_enabled: bool,
+    render_emojis: bool,
 ) -> Text<'static> {
     let input = input.replace("‑", "-").replace('\t', "    ");
     let mut options = Options::empty();
@@ -491,7 +515,7 @@ fn render_markdown_to_text(
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
     let parser = Parser::new_ext(&input, options);
-    let mut renderer = MarkdownRenderer::new(theme, inner_width, ss, syn_theme, syntax_enabled);
+    let mut renderer = MarkdownRenderer::new(theme, inner_width, ss, syn_theme, syntax_enabled, render_emojis);
     for event in parser {
         renderer.handle_event(event);
     }
@@ -503,18 +527,30 @@ mod markdown_tests {
     use super::*;
 
     fn render_plain(input: &str) -> Vec<String> {
+        render_plain_with_emoji_config(input, true)
+    }
+
+    fn render_plain_with_emoji_config(input: &str, render_emojis: bool) -> Vec<String> {
         let ss = SyntaxSet::load_defaults_newlines();
         let syn_theme = SynTheme::default();
-        render_markdown_to_text(input, &Theme::default(), 80, &ss, &syn_theme, false)
-            .lines
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .into_iter()
-                    .map(|span| span.content.into_owned())
-                    .collect::<String>()
-            })
-            .collect()
+        render_markdown_to_text(
+            input,
+            &Theme::default(),
+            80,
+            &ss,
+            &syn_theme,
+            false,
+            render_emojis,
+        )
+        .lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect()
     }
 
     #[test]
@@ -536,5 +572,12 @@ mod markdown_tests {
 
         assert_eq!(lines[0], "1. Parent with *literal stars*");
         assert_eq!(lines[1], "  • Child with bold text");
+    }
+
+    #[test]
+    fn can_suppress_emoji_graphemes() {
+        let lines = render_plain_with_emoji_config("Status 😀 is good", false);
+
+        assert_eq!(lines[0], "Status  is good");
     }
 }
