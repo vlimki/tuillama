@@ -82,8 +82,10 @@ fn render_markdown_to_text(
     let hr_line_len = inner_width.max(1) as usize;
     const NBSP: char = '\u{00A0}';
 
-    // Fix a GPT-ism
-    let input = &input.replace("‑", "-");
+    // Fix GPT-isms and terminal-hostile control characters before rendering.
+    // Raw tabs can move the terminal cursor outside ratatui's layout math, so
+    // render them as spaces everywhere (including syntax-highlighted code).
+    let input = input.replace("‑", "-").replace('\t', "    ");
 
     for raw in input.lines() {
         let trimmed = raw.trim_start();

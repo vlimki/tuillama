@@ -18,14 +18,29 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     h[1]
 }
 
+const TAB_DISPLAY: &str = "    ";
+const TAB_WIDTH: usize = 4;
+
+fn display_grapheme(g: &str) -> &str {
+    if g == "\t" { TAB_DISPLAY } else { g }
+}
+
+fn display_width(g: &str) -> usize {
+    if g == "\t" {
+        TAB_WIDTH
+    } else {
+        UnicodeWidthStr::width(g)
+    }
+}
+
 fn line_view(s: &str, col_gi: usize, maxw: usize) -> (String, usize) {
     let maxw = maxw.max(1);
     let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(s, true).collect();
-    let widths: Vec<usize> = graphemes.iter().map(|g| UnicodeWidthStr::width(*g)).collect();
+    let widths: Vec<usize> = graphemes.iter().map(|g| display_width(g)).collect();
 
     let mut w_to_cursor = 0usize;
-    for i in 0..col_gi.min(widths.len()) {
-        w_to_cursor += widths[i];
+    for width in widths.iter().take(col_gi.min(widths.len())) {
+        w_to_cursor += width;
     }
 
     let mut start = 0usize;
@@ -42,7 +57,7 @@ fn line_view(s: &str, col_gi: usize, maxw: usize) -> (String, usize) {
         if used + w > maxw {
             break;
         }
-        out.push_str(graphemes[i]);
+        out.push_str(display_grapheme(graphemes[i]));
         used += w;
     }
 
@@ -806,9 +821,11 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         } else {
             let mut visible = String::new();
             for g in UnicodeSegmentation::graphemes(s, true) {
-                let w = UnicodeWidthStr::width(g);
-                if UnicodeWidthStr::width(visible.as_str()) + w > input_inner_w { break; }
-                visible.push_str(g);
+                let w = display_width(g);
+                if UnicodeWidthStr::width(visible.as_str()) + w > input_inner_w {
+                    break;
+                }
+                visible.push_str(display_grapheme(g));
             }
             input_text.lines.push(Line::from(visible));
         }

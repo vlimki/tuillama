@@ -333,6 +333,10 @@ fn estimate_token_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+fn normalize_tabs(text: &str) -> String {
+    text.replace('\t', "    ")
+}
+
 fn refresh_current_stream_state(app: &mut App) {
     let Some(chat_id) = app.current_chat_id.as_ref() else {
         app.pending_request_id = None;
@@ -937,8 +941,13 @@ async fn handle_key(
                 }
                 byte_cursor += col_byte;
 
-                app.input.insert(byte_cursor, c);
-                app.input_cursor_col += 1;
+                if c == '\t' {
+                    app.input.insert_str(byte_cursor, "    ");
+                    app.input_cursor_col += 4;
+                } else {
+                    app.input.insert(byte_cursor, c);
+                    app.input_cursor_col += 1;
+                }
             }
             KeyCode::Tab => {
                 let lines: Vec<&str> = app.input.split('\n').collect();
@@ -956,8 +965,8 @@ async fn handle_key(
                 }
                 byte_cursor += col_byte;
 
-                app.input.insert(byte_cursor, '\t');
-                app.input_cursor_col += 1;
+                app.input.insert_str(byte_cursor, "    ");
+                app.input_cursor_col += 4;
             }
             // manual chat scroll while typing
             KeyCode::PageUp => {
@@ -1027,8 +1036,8 @@ async fn handle_key(
                     if app.focus == Focus::Chat {
                         match read_clipboard_text().await {
                             Ok(clip) => {
-                                // append at end
-                                app.input.push_str(&clip);
+                                // append at end, but expand tabs so the terminal layout stays stable
+                                app.input.push_str(&normalize_tabs(&clip));
                                 let lines: Vec<&str> = app.input.split('\n').collect();
                                 app.input_cursor_line = lines.len().saturating_sub(1);
                                 let last = lines.last().copied().unwrap_or("");
