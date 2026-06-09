@@ -4,6 +4,7 @@ struct ActiveStream {
     request_id: String,
     buffer: String,
     thinking: String,
+    sources: Vec<Source>,
     status: Option<String>,
     started_at: Instant,
     generated_tokens: usize,
@@ -16,6 +17,7 @@ struct App {
     messages: Vec<Message>,
     pending_assistant: String,
     pending_thinking: String,
+    pending_sources: Vec<Source>,
     status_message: Option<String>,
     show_thinking: bool,
     pending_request_id: Option<String>,
@@ -25,6 +27,8 @@ struct App {
     chats: Vec<ChatMeta>,
     sidebar_idx: usize,
     show_sidebar: bool,
+    sidebar_search_active: bool,
+    sidebar_search_query: String,
     show_stats_panel: bool,
 
     // UI/input
@@ -32,6 +36,7 @@ struct App {
     input_cursor_line: usize, // line index in input
     input_cursor_col: usize,  // grapheme index in current line
     input_top_line: usize,    // first visible line in input viewport
+    pending_attachments: Vec<Attachment>,
     chat_scroll: u16,
     chat_inner_height: u16,
     chat_inner_width: u16,
@@ -102,6 +107,7 @@ impl App {
             messages: Vec::new(),
             pending_assistant: String::new(),
             pending_thinking: String::new(),
+            pending_sources: Vec::new(),
             status_message: None,
             show_thinking: true,
             pending_request_id: None,
@@ -109,11 +115,14 @@ impl App {
             chats,
             sidebar_idx: 0,
             show_sidebar: true,
+            sidebar_search_active: false,
+            sidebar_search_query: String::new(),
             show_stats_panel: true,
             input: String::new(),
             input_cursor_line: 0,
             input_cursor_col: 0,
             input_top_line: 0,
+            pending_attachments: Vec::new(),
             chat_scroll: 0,
             chat_inner_height: 0,
             chat_inner_width: 0,

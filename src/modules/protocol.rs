@@ -12,6 +12,10 @@ enum ClientRequest {
         web_search: bool,
         messages: Vec<Message>,
     },
+    CancelStream {
+        request_id: String,
+        chat_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,9 +36,18 @@ enum ServerEvent {
         chat_id: String,
         message: String,
     },
+    Source {
+        request_id: String,
+        chat_id: String,
+        title: String,
+        url: String,
+        snippet: String,
+    },
     Done {
         request_id: String,
         chat_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     Error {
         request_id: String,

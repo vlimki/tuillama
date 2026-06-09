@@ -18,14 +18,29 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     h[1]
 }
 
+const TAB_DISPLAY: &str = "    ";
+const TAB_WIDTH: usize = 4;
+
+fn display_grapheme(g: &str) -> &str {
+    if g == "\t" { TAB_DISPLAY } else { g }
+}
+
+fn display_width(g: &str) -> usize {
+    if g == "\t" {
+        TAB_WIDTH
+    } else {
+        UnicodeWidthStr::width(g)
+    }
+}
+
 fn line_view(s: &str, col_gi: usize, maxw: usize) -> (String, usize) {
     let maxw = maxw.max(1);
     let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(s, true).collect();
-    let widths: Vec<usize> = graphemes.iter().map(|g| UnicodeWidthStr::width(*g)).collect();
+    let widths: Vec<usize> = graphemes.iter().map(|g| display_width(g)).collect();
 
     let mut w_to_cursor = 0usize;
-    for i in 0..col_gi.min(widths.len()) {
-        w_to_cursor += widths[i];
+    for width in widths.iter().take(col_gi.min(widths.len())) {
+        w_to_cursor += width;
     }
 
     let mut start = 0usize;
@@ -42,7 +57,7 @@ fn line_view(s: &str, col_gi: usize, maxw: usize) -> (String, usize) {
         if used + w > maxw {
             break;
         }
-        out.push_str(graphemes[i]);
+        out.push_str(display_grapheme(graphemes[i]));
         used += w;
     }
 
@@ -184,6 +199,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from("  Ctrl+P: hide/show right statistics panel"),
                 Line::from("  Ctrl+W: toggle web search"),
                 Line::from("  Ctrl+Y: hide/show thinking blocks"),
+                Line::from("  Ctrl+X: terminate generation"),
                 Line::from("  q / Ctrl+C: quit"),
                 Line::from(""),
                 Line::from(Span::styled("Sidebar", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
@@ -191,8 +207,11 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from(""),
                 Line::from(Span::styled("Chat", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
                 Line::from("  h/l: move focus, i: insert, v: visual, p: paste clipboard"),
+                Line::from("  r: refresh screen"),
+                Line::from("  Sidebar focus: / search chats, Enter apply, Esc clear"),
                 Line::from("  ↑/k: scroll up, ↓/j: scroll down, g: top, G: bottom"),
-                Line::from("  Ctrl+S: send in INSERT mode"),
+                Line::from("  :attach /path/to/image then Ctrl+S to attach image"),
+                Line::from("  Ctrl+S: send in INSERT mode, Esc: normal mode"),
             ];
             frame.render_widget(Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false }), area);
         }
@@ -216,11 +235,36 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let mut items: Vec<ListItem> = Vec::new();
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled("Search chats…", Style::default().fg(app.theme.status_hint)),
-        Span::raw(" "),
-        Span::styled("[+]", Style::default().fg(app.theme.mode_insert).add_modifier(Modifier::BOLD)),
-    ])).style(Style::default().bg(app.theme.panel_alt_bg)));
+    let search_label = if app.sidebar_search_query.is_empty() {
+        "Search chats…".to_string()
+    } else {
+        format!("Search: {}", app.sidebar_search_query)
+    };
+    let search_suffix = if app.sidebar_search_active {
+        "[typing]"
+    } else if app.sidebar_search_query.is_empty() {
+        "[/]"
+    } else {
+        "[Esc clears]"
+    };
+    let search_bg = if app.sidebar_search_active {
+        app.theme.sidebar_selected_bg
+    } else {
+        app.theme.panel_alt_bg
+    };
+    items.push(
+        ListItem::new(Line::from(vec![
+            Span::styled(search_label, Style::default().fg(app.theme.status_hint)),
+            Span::raw(" "),
+            Span::styled(
+                search_suffix,
+                Style::default()
+                    .fg(app.theme.mode_insert)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(search_bg)),
+    );
     items.push(ListItem::new(Line::from(Span::styled(
         "─".repeat(inner.width.saturating_sub(2) as usize),
         Style::default().fg(app.theme.message_rule),
@@ -234,14 +278,15 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         } else {
             Style::default().bg(app.theme.sidebar_item_bg)
         };
-        items.push(
-            ListItem::new(vec![
-                Line::from(Span::styled(c.title.clone(), Style::default().fg(app.theme.sidebar_item).add_modifier(Modifier::BOLD))),
-                Line::from(Span::styled(ts, Style::default().fg(app.theme.sidebar_timestamp))),
-                Line::from(""),
-            ])
-            .style(style),
-        );
+        let mut lines = vec![
+            Line::from(Span::styled(c.title.clone(), Style::default().fg(app.theme.sidebar_item).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(ts, Style::default().fg(app.theme.sidebar_timestamp))),
+        ];
+        if let Some(excerpt) = &c.search_excerpt {
+            lines.push(Line::from(Span::styled(excerpt.clone(), Style::default().fg(app.theme.status_hint))));
+        }
+        lines.push(Line::from(""));
+        items.push(ListItem::new(lines).style(style));
     }
 
     let list = List::new(items).highlight_style(Style::default().bg(app.theme.sidebar_selected_bg));
@@ -475,8 +520,27 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Ctrl+P toggles this panel.", Style::default().fg(app.theme.status_hint))),
+        Line::from(Span::styled("Sources", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
     ];
+    let latest_sources = active_stream
+        .map(|stream| stream.sources.as_slice())
+        .filter(|sources| !sources.is_empty())
+        .or_else(|| app.messages.iter().rev().find(|m| !m.sources.is_empty()).map(|m| m.sources.as_slice()));
+    let mut trace = trace;
+    if let Some(sources) = latest_sources {
+        for (idx, source) in sources.iter().take(4).enumerate() {
+            trace.push(Line::from(vec![
+                Span::styled(format!("{}.", idx + 1), Style::default().fg(app.theme.stats_label)),
+                Span::raw(" "),
+                Span::styled(source.title.clone(), Style::default().fg(app.theme.stats_value)),
+            ]));
+            trace.push(Line::from(Span::styled(source.url.clone(), Style::default().fg(app.theme.status_hint))));
+        }
+    } else {
+        trace.push(Line::from(Span::styled("No sources yet", Style::default().fg(app.theme.status_hint))));
+    }
+    trace.push(Line::from(""));
+    trace.push(Line::from(Span::styled("Ctrl+P toggles this panel.", Style::default().fg(app.theme.status_hint))));
     frame.render_widget(
         Paragraph::new(Text::from(trace))
             .wrap(Wrap { trim: false })
@@ -546,6 +610,16 @@ fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: 
         }
     }
 
+    if !m.attachments.is_empty() {
+        for attachment in &m.attachments {
+            text.push_line(Line::from(vec![
+                Span::styled("Attachment: ", Style::default().fg(app.theme.stats_label).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{} ({})", attachment.path, attachment.mime_type), Style::default().fg(app.theme.status_hint)),
+            ]));
+        }
+        text.push_line(Line::from(""));
+    }
+
     let msg_h = message_hash(m);
     let key = (idx, inner_w);
     let body = if let Some((h, cached)) = app.render_cache.get(&key) {
@@ -567,6 +641,21 @@ fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: 
     }
     for line in md.lines {
         text.push_line(line);
+    }
+    if !m.sources.is_empty() {
+        text.push_line(Line::from(""));
+        text.push_line(Line::from(Span::styled("Sources", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))));
+        for (idx, source) in m.sources.iter().enumerate() {
+            let title = if source.title.is_empty() { source.url.clone() } else { source.title.clone() };
+            text.push_line(Line::from(vec![
+                Span::styled(format!("[{}] ", idx + 1), Style::default().fg(app.theme.stats_label)),
+                Span::styled(title, Style::default().fg(app.theme.stats_value)),
+            ]));
+            text.push_line(Line::from(Span::styled(source.url.clone(), Style::default().fg(app.theme.status_hint))));
+            if !source.snippet.is_empty() {
+                text.push_line(Line::from(Span::styled(source.snippet.clone(), Style::default().fg(app.theme.message_meta))));
+            }
+        }
     }
     text.push_line(Line::from(""));
 }
@@ -632,7 +721,10 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         render_message_block(&mut text, app, i, &m, inner_w, selected);
     }
 
-    let has_pending_stream = app.sending || !app.pending_assistant.trim().is_empty() || !app.pending_thinking.trim().is_empty();
+    let has_pending_stream = app.sending
+        || !app.pending_assistant.trim().is_empty()
+        || !app.pending_thinking.trim().is_empty()
+        || !app.pending_sources.is_empty();
     if has_pending_stream {
         let selected = app.focus == Focus::Chat && app.mode == Mode::Visual && app.messages.len() == sel;
         let pending = Message {
@@ -640,6 +732,8 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             content: if app.pending_assistant.is_empty() { "…".to_string() } else { app.pending_assistant.clone() },
             created_ts: now_sec(),
             thinking: (!app.pending_thinking.trim().is_empty()).then_some(app.pending_thinking.clone()),
+            attachments: Vec::new(),
+            sources: app.pending_sources.clone(),
         };
         render_message_block(&mut text, app, app.messages.len(), &pending, inner_w, selected);
     }
@@ -676,10 +770,19 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let base = if app.mode == Mode::Insert { "Compose" } else { "Command" };
     let mode_name = match app.mode { Mode::Insert => "INSERT", Mode::Normal => "NORMAL", Mode::Visual => "VISUAL" };
     let mode_color = match app.mode { Mode::Insert => app.theme.mode_insert, Mode::Normal => app.theme.mode_normal, Mode::Visual => app.theme.mode_visual };
+    let attachment_hint = if app.pending_attachments.is_empty() {
+        Span::raw("")
+    } else {
+        Span::styled(
+            format!(" • {} image(s) attached", app.pending_attachments.len()),
+            Style::default().fg(app.theme.status_hint),
+        )
+    };
     let input_title_line = Line::from(vec![
         Span::styled(format!(" {} ", base), Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
         Span::styled(format!("[{}]", mode_name), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
         help_hint,
+        attachment_hint,
     ]);
 
     let input_block = section_block(
@@ -718,9 +821,11 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         } else {
             let mut visible = String::new();
             for g in UnicodeSegmentation::graphemes(s, true) {
-                let w = UnicodeWidthStr::width(g);
-                if UnicodeWidthStr::width(visible.as_str()) + w > input_inner_w { break; }
-                visible.push_str(g);
+                let w = display_width(g);
+                if UnicodeWidthStr::width(visible.as_str()) + w > input_inner_w {
+                    break;
+                }
+                visible.push_str(display_grapheme(g));
             }
             input_text.lines.push(Line::from(visible));
         }
@@ -752,8 +857,19 @@ fn rendered_message_height(app: &App, inner_w: u16, m: &Message) -> u16 {
             y = y.saturating_add(1);
         }
     }
+    if !m.attachments.is_empty() {
+        y = y.saturating_add(m.attachments.len() as u16 + 1);
+    }
     let rendered_body = render_markdown_to_text(&m.content, &app.theme, inner_w, &app.syn_ss, &app.syn_theme, app.syntax_enabled);
     y = y.saturating_add(rendered_body.lines.len() as u16);
+    if !m.sources.is_empty() {
+        let source_lines = m
+            .sources
+            .iter()
+            .map(|source| if source.snippet.is_empty() { 2 } else { 3 })
+            .sum::<u16>();
+        y = y.saturating_add(2 + source_lines);
+    }
     y.saturating_add(1)
 }
 
