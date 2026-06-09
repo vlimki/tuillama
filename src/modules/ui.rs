@@ -192,6 +192,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from(""),
                 Line::from(Span::styled("Chat", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
                 Line::from("  h/l: move focus, i: insert, v: visual, p: paste clipboard"),
+                Line::from("  r: refresh screen"),
                 Line::from("  Sidebar focus: / search chats, Enter apply, Esc clear"),
                 Line::from("  ↑/k: scroll up, ↓/j: scroll down, g: top, G: bottom"),
                 Line::from("  Ctrl+S: send in INSERT mode, Esc: cancel stream / normal mode"),

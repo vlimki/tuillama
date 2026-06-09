@@ -107,6 +107,12 @@ async fn main() -> Result<()> {
                 app.pending_cache = None;
                 terminal.clear()?;
             }
+            AppEvent::RefreshScreen => {
+                app.render_cache.clear();
+                app.pending_cache = None;
+                terminal.clear()?;
+                app.status_message = Some("Screen refreshed".to_string());
+            }
             AppEvent::OllamaError(e) => {
                 app.messages.push(Message {
                     role: Role::System,
@@ -853,6 +859,9 @@ async fn handle_key(
                     if app.focus == Focus::Sidebar {
                         app.sidebar_search_active = true;
                     }
+                }
+                KeyCode::Char('r') => {
+                    let _ = tx.send(AppEvent::RefreshScreen);
                 }
                 KeyCode::Char('h') => {
                     if app.show_sidebar {
