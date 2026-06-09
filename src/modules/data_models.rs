@@ -14,6 +14,25 @@ struct Message {
     created_ts: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<Source>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Attachment {
+    path: String,
+    mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Source {
+    title: String,
+    url: String,
+    snippet: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

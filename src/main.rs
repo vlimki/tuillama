@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::{
     cursor::SetCursorStyle,

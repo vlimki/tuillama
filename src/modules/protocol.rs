@@ -36,6 +36,13 @@ enum ServerEvent {
         chat_id: String,
         message: String,
     },
+    Source {
+        request_id: String,
+        chat_id: String,
+        title: String,
+        url: String,
+        snippet: String,
+    },
     Done {
         request_id: String,
         chat_id: String,

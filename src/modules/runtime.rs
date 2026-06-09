@@ -119,6 +119,8 @@ async fn main() -> Result<()> {
                     content: format!("Error: {}", e),
                     created_ts: now_sec(),
                     thinking: None,
+                    attachments: Vec::new(),
+                    sources: Vec::new(),
                 });
                 app.render_cache.clear();
             }
@@ -163,6 +165,7 @@ async fn main() -> Result<()> {
                                 request_id: request_id.clone(),
                                 buffer: String::new(),
                                 thinking: String::new(),
+                                sources: Vec::new(),
                                 status: None,
                                 started_at: Instant::now(),
                                 generated_tokens: 0,
@@ -183,6 +186,8 @@ async fn main() -> Result<()> {
                                     content: content.clone(),
                                     created_ts: now_sec(),
                                     thinking,
+                                    attachments: Vec::new(),
+                                    sources: active.sources.clone(),
                                 });
                                 if matches!(app.mode, Mode::Visual) && app.selected_msg.is_none() {
                                     app.selected_msg = Some(app.messages.len().saturating_sub(1));
@@ -198,12 +203,14 @@ async fn main() -> Result<()> {
                                 app.scroll_to_bottom_on_draw = true;
                             }
                         } else if has_partial {
-                            if let Err(e) = append_assistant_to_chat(&chat_id, content, thinking) {
+                            if let Err(e) = append_assistant_to_chat(&chat_id, content, thinking, active.sources.clone()) {
                                 app.messages.push(Message {
                                     role: Role::System,
                                     content: format!("Error: {}", e),
                                     created_ts: now_sec(),
                                     thinking: None,
+                                    attachments: Vec::new(),
+                                    sources: Vec::new(),
                                 });
                             }
                             refresh_sidebar_chats(&mut app, None);
@@ -230,6 +237,8 @@ async fn main() -> Result<()> {
                                 content: formatted,
                                 created_ts: now_sec(),
                                 thinking: None,
+                                attachments: Vec::new(),
+                                sources: Vec::new(),
                             });
                         } else {
                             if let Err(e) = append_system_to_chat(&chat_id, formatted) {
@@ -238,6 +247,8 @@ async fn main() -> Result<()> {
                                     content: format!("Error: {}", e),
                                     created_ts: now_sec(),
                                     thinking: None,
+                                    attachments: Vec::new(),
+                                    sources: Vec::new(),
                                 });
                             }
                             refresh_sidebar_chats(&mut app, None);
@@ -279,6 +290,22 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                ServerEvent::Source {
+                    request_id,
+                    chat_id,
+                    title,
+                    url,
+                    snippet,
+                } => {
+                    if let Some(active) = app.active_streams.get_mut(&chat_id) {
+                        if active.request_id == request_id && !active.sources.iter().any(|s| s.url == url) {
+                            active.sources.push(Source { title, url, snippet });
+                            if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                                app.pending_sources = active.sources.clone();
+                            }
+                        }
+                    }
+                }
             },
         }
 
@@ -311,6 +338,7 @@ fn refresh_current_stream_state(app: &mut App) {
         app.pending_request_id = None;
         app.pending_assistant.clear();
         app.pending_thinking.clear();
+        app.pending_sources.clear();
         app.status_message = None;
         app.sending = false;
         app.pending_cache = None;
@@ -321,12 +349,14 @@ fn refresh_current_stream_state(app: &mut App) {
         app.pending_request_id = Some(active.request_id.clone());
         app.pending_assistant = active.buffer.clone();
         app.pending_thinking = active.thinking.clone();
+        app.pending_sources = active.sources.clone();
         app.status_message = active.status.clone();
         app.sending = true;
     } else {
         app.pending_request_id = None;
         app.pending_assistant.clear();
         app.pending_thinking.clear();
+        app.pending_sources.clear();
         app.status_message = None;
         app.sending = false;
     }
@@ -352,7 +382,7 @@ fn cancel_current_stream(
     Ok(true)
 }
 
-fn append_assistant_to_chat(chat_id: &str, content: String, thinking: Option<String>) -> Result<()> {
+fn append_assistant_to_chat(chat_id: &str, content: String, thinking: Option<String>, sources: Vec<Source>) -> Result<()> {
     let mut chat = match load_chat(chat_id) {
         Ok(c) => c,
         Err(_) => return Ok(()),
@@ -362,6 +392,8 @@ fn append_assistant_to_chat(chat_id: &str, content: String, thinking: Option<Str
         content,
         created_ts: now_sec(),
         thinking,
+        attachments: Vec::new(),
+        sources,
     });
     chat.updated_ts = now_sec();
     save_chat(&chat)
@@ -377,6 +409,8 @@ fn append_system_to_chat(chat_id: &str, content: String) -> Result<()> {
         content,
         created_ts: now_sec(),
         thinking: None,
+        attachments: Vec::new(),
+        sources: Vec::new(),
     });
     chat.updated_ts = now_sec();
     save_chat(&chat)
@@ -388,6 +422,60 @@ fn now_sec() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn attachment_from_path(path_text: &str) -> Result<Attachment> {
+    let expanded = if let Some(rest) = path_text.strip_prefix("~/") {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("~"))
+            .join(rest)
+    } else {
+        PathBuf::from(path_text)
+    };
+    let data = fs::read(&expanded).with_context(|| format!("read attachment {}", expanded.display()))?;
+    let mime_type = mime_type_for_path(&expanded);
+    if !mime_type.starts_with("image/") {
+        return Err(anyhow!("only image attachments are supported for now"));
+    }
+    Ok(Attachment {
+        path: expanded.display().to_string(),
+        mime_type,
+        data_base64: Some(general_purpose::STANDARD.encode(data)),
+    })
+}
+
+fn mime_type_for_path(path: &std::path::Path) -> String {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn message_to_preview_markdown(message: &Message) -> String {
+    let mut out = message.content.clone();
+    if !message.sources.is_empty() {
+        out.push_str("\n\n## Sources\n");
+        for source in &message.sources {
+            if source.title.is_empty() {
+                out.push_str(&format!("- {}\n", source.url));
+            } else {
+                out.push_str(&format!("- [{}]({})\n", source.title, source.url));
+            }
+        }
+    }
+    out
 }
 
 fn refresh_sidebar_chats(app: &mut App, preferred_id: Option<&str>) {
@@ -433,6 +521,7 @@ fn start_new_chat(app: &mut App) -> Result<()> {
     app.chat_at_bottom = true;
     app.render_cache.clear();
     app.pending_cache = None;
+    app.pending_attachments.clear();
     let chat = Chat {
         id: id.clone(),
         title: "Untitled chat".to_string(),
@@ -638,7 +727,31 @@ async fn handle_key(
             // Send with Ctrl+S
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let input = app.input.trim().to_string();
-                if input.is_empty() {
+                if let Some(path) = input.strip_prefix(":attach ").map(str::trim).filter(|p| !p.is_empty()) {
+                    match attachment_from_path(path) {
+                        Ok(attachment) => {
+                            let name = attachment.path.clone();
+                            app.pending_attachments.push(attachment);
+                            app.input.clear();
+                            app.input_cursor_line = 0;
+                            app.input_cursor_col = 0;
+                            app.input_top_line = 0;
+                            app.status_message = Some(format!("Attached image {name}"));
+                        }
+                        Err(e) => {
+                            app.messages.push(Message {
+                                role: Role::System,
+                                content: format!("Attachment failed: {e}"),
+                                created_ts: now_sec(),
+                                thinking: None,
+                                attachments: Vec::new(),
+                                sources: Vec::new(),
+                            });
+                        }
+                    }
+                    return Ok(());
+                }
+                if input.is_empty() && app.pending_attachments.is_empty() {
                     return Ok(());
                 }
 
@@ -653,11 +766,14 @@ async fn handle_key(
                 app.input_cursor_col = 0;
                 app.input_top_line = 0;
 
+                let attachments = std::mem::take(&mut app.pending_attachments);
                 app.messages.push(Message {
                     role: Role::User,
-                    content: input,
+                    content: if input.is_empty() { "[image]".to_string() } else { input },
                     created_ts: now_sec(),
                     thinking: None,
+                    attachments,
+                    sources: Vec::new(),
                 });
                 app.render_cache.remove(&(app.messages.len() - 1, app.chat_inner_height));
                 persist_current_chat(app)?;
@@ -677,6 +793,8 @@ async fn handle_key(
                                 content: sp,
                                 created_ts: now_sec(),
                                 thinking: None,
+                                attachments: Vec::new(),
+                                sources: Vec::new(),
                             },
                         );
                     }
@@ -700,6 +818,7 @@ async fn handle_key(
                         request_id: request_id.clone(),
                         buffer: String::new(),
                         thinking: String::new(),
+                        sources: Vec::new(),
                         status: None,
                         started_at: Instant::now(),
                         generated_tokens: 0,
@@ -717,6 +836,8 @@ async fn handle_key(
                         content: "Error: background server is unavailable".to_string(),
                         created_ts: now_sec(),
                         thinking: None,
+                        attachments: Vec::new(),
+                        sources: Vec::new(),
                     });
                 }
             }
@@ -919,6 +1040,8 @@ async fn handle_key(
                                     content: format!("Clipboard paste failed: {}", e),
                                     created_ts: now_sec(),
                                     thinking: None,
+                                    attachments: Vec::new(),
+                                    sources: Vec::new(),
                                 });
                                 app.render_cache.clear();
                             }
@@ -1019,6 +1142,8 @@ async fn handle_key(
                                     content: format!("Clipboard copy failed: {}", e),
                                     created_ts: now_sec(),
                                     thinking: None,
+                                    attachments: Vec::new(),
+                                    sources: Vec::new(),
                                 });
                                 app.render_cache.clear();
                             }
@@ -1094,7 +1219,7 @@ async fn handle_key(
                     if let Some(i) = app.selected_msg {
                         if let Some(m) = app.messages.get(i) {
                             let tx2 = tx.clone();
-                            let content = m.content.clone();
+                            let content = message_to_preview_markdown(m);
                             let fmt = app.preview_fmt.clone();
                             let opener = app.preview_open.clone();
                             tokio::spawn(async move {

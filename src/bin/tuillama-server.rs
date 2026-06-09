@@ -3,7 +3,11 @@ use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::{collections::HashMap, env, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
@@ -25,6 +29,25 @@ struct Message {
     content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<Source>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Attachment {
+    path: String,
+    mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Source {
+    title: String,
+    url: String,
+    snippet: String,
 }
 
 include!("../modules/protocol.rs");
@@ -143,6 +166,84 @@ async fn send_thinking(
         },
     )
     .await
+}
+
+async fn send_source(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: &str,
+    chat_id: &str,
+    source: &Source,
+) -> Result<()> {
+    send_server_event(
+        writer,
+        &ServerEvent::Source {
+            request_id: request_id.to_string(),
+            chat_id: chat_id.to_string(),
+            title: source.title.clone(),
+            url: source.url.clone(),
+            snippet: source.snippet.clone(),
+        },
+    )
+    .await
+}
+
+async fn emit_sources_from_value(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: &str,
+    chat_id: &str,
+    seen_urls: &mut HashSet<String>,
+    value: &JsonValue,
+) {
+    for source in sources_from_value(value) {
+        if seen_urls.insert(source.url.clone()) {
+            let _ = send_source(writer, request_id, chat_id, &source).await;
+        }
+    }
+}
+
+fn sources_from_value(value: &JsonValue) -> Vec<Source> {
+    let mut sources = Vec::new();
+    collect_sources(value, &mut sources);
+    sources
+}
+
+fn collect_sources(value: &JsonValue, out: &mut Vec<Source>) {
+    match value {
+        JsonValue::Object(map) => {
+            let url = ["url", "link", "href"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(|v| v.as_str()))
+                .filter(|url| url.starts_with("http://") || url.starts_with("https://"));
+            if let Some(url) = url {
+                if !out.iter().any(|source| source.url == url) {
+                    let title = ["title", "name", "site_name"]
+                        .iter()
+                        .find_map(|key| map.get(*key).and_then(|v| v.as_str()))
+                        .unwrap_or(url)
+                        .to_string();
+                    let snippet = ["snippet", "summary", "description", "content", "text"]
+                        .iter()
+                        .find_map(|key| map.get(*key).and_then(|v| v.as_str()))
+                        .map(|text| truncate_for_context(text, 240))
+                        .unwrap_or_default();
+                    out.push(Source {
+                        title,
+                        url: url.to_string(),
+                        snippet,
+                    });
+                }
+            }
+            for child in map.values() {
+                collect_sources(child, out);
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_sources(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn build_auth_headers(ollama_api_key: Option<&str>) -> HeaderMap {
@@ -432,7 +533,7 @@ async fn process_agentic_web_search(
     messages: Vec<Message>,
     debug: bool,
     max_tool_iters: usize,
-) -> Result<String> {
+) -> Result<()> {
     let client = reqwest::Client::new();
     let headers = build_auth_headers(ollama_api_key.as_deref());
     let api_base = api_base_from_chat_url(&api_url);
@@ -447,15 +548,8 @@ async fn process_agentic_web_search(
 
     let tools = web_tools();
 
-    let mut convo: Vec<JsonValue> = messages
-        .iter()
-        .map(|m| {
-            json!({
-                "role": role_to_wire(&m.role),
-                "content": m.content,
-            })
-        })
-        .collect();
+    let mut convo: Vec<JsonValue> = messages.iter().map(message_to_ollama_json).collect();
+    let mut emitted_source_urls = HashSet::new();
 
     // Force at least one real web retrieval in WEB ON mode, so providers/models
     // that don't autonomously emit tool calls still get fresh context.
@@ -485,6 +579,14 @@ async fn process_agentic_web_search(
                 json!({ "query": query }),
             )
             .await;
+            emit_sources_from_value(
+                writer,
+                request_id,
+                chat_id,
+                &mut emitted_source_urls,
+                &search_result,
+            )
+            .await;
 
             let mut urls = Vec::new();
             collect_urls(&search_result, &mut urls);
@@ -512,6 +614,14 @@ async fn process_agentic_web_search(
                     debug,
                     "web_fetch",
                     json!({ "url": url }),
+                )
+                .await;
+                emit_sources_from_value(
+                    writer,
+                    request_id,
+                    chat_id,
+                    &mut emitted_source_urls,
+                    &fetched,
                 )
                 .await;
                 fetches.push(fetched);
@@ -548,6 +658,14 @@ async fn process_agentic_web_search(
                     json!({ "url": url }),
                 )
                 .await;
+                emit_sources_from_value(
+                    writer,
+                    request_id,
+                    chat_id,
+                    &mut emitted_source_urls,
+                    &fetched,
+                )
+                .await;
                 fetches.push(fetched);
             }
 
@@ -571,8 +689,6 @@ async fn process_agentic_web_search(
             ),
         }));
     }
-
-    let mut final_answer = String::new();
 
     for iter in 0..max_tool_iters {
         let _ = send_status(
@@ -642,12 +758,6 @@ async fn process_agentic_web_search(
             }
         }
 
-        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-            if !content.is_empty() {
-                final_answer = content.to_string();
-            }
-        }
-
         // Keep the assistant message exactly as returned (including tool_calls/thinking metadata)
         // so Ollama can correctly associate subsequent tool outputs.
         convo.push(msg.clone());
@@ -664,10 +774,20 @@ async fn process_agentic_web_search(
         );
 
         if tool_calls.is_empty() {
-            if final_answer.is_empty() {
-                final_answer = "No response content returned by model.".to_string();
-            }
-            return Ok(final_answer);
+            convo.push(json!({
+                "role": "system",
+                "content": "Tool use is complete. Stream the final answer now. Cite sources by URL when useful."
+            }));
+            let _ = send_status(writer, request_id, chat_id, "Synthesizing final answer").await;
+            let req = json!({
+                "model": &model,
+                "messages": &convo,
+                "stream": true,
+                "think": true,
+                "options": options.clone(),
+            });
+            return stream_json_chat_response(writer, request_id, chat_id, &api_url, &headers, req)
+                .await;
         }
 
         for tc in tool_calls {
@@ -695,6 +815,14 @@ async fn process_agentic_web_search(
                 &client, &api_base, &headers, request_id, debug, tool_name, args,
             )
             .await;
+            emit_sources_from_value(
+                writer,
+                request_id,
+                chat_id,
+                &mut emitted_source_urls,
+                &tool_result,
+            )
+            .await;
             let tool_content = serde_json::to_string(&tool_result)
                 .unwrap_or_else(|_| "{\"error\":\"tool serialization failed\"}".to_string());
 
@@ -706,13 +834,9 @@ async fn process_agentic_web_search(
         }
     }
 
-    if final_answer.is_empty() {
-        Err(anyhow!(
-            "agentic search exceeded iteration limit without final content"
-        ))
-    } else {
-        Ok(final_answer)
-    }
+    Err(anyhow!(
+        "agentic search exceeded iteration limit without final content"
+    ))
 }
 
 #[cfg(test)]
@@ -781,6 +905,97 @@ mod tests {
     }
 }
 
+async fn stream_json_chat_response(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: &str,
+    chat_id: &str,
+    api_url: &str,
+    headers: &HeaderMap,
+    req: JsonValue,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(api_url)
+        .headers(headers.clone())
+        .json(&req)
+        .send()
+        .await
+        .context("chat stream request failed")?;
+
+    if !resp.status().is_success() {
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(anyhow!("HTTP error: {body}"));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(item) = stream.next().await {
+        let chunk = item.context("chat stream read failed")?;
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = buf.drain(..=pos).collect::<Vec<u8>>();
+            let line = &line[..line.len().saturating_sub(1)];
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(obj) = serde_json::from_slice::<OllamaChatStreamChunk>(line) {
+                if let Some(err) = obj.error {
+                    return Err(anyhow!(err));
+                }
+                if let Some(msg) = obj.message {
+                    if !msg.thinking.is_empty() {
+                        let _ = send_server_event(
+                            writer,
+                            &ServerEvent::Thinking {
+                                request_id: request_id.to_string(),
+                                chat_id: chat_id.to_string(),
+                                delta: msg.thinking,
+                            },
+                        )
+                        .await;
+                    }
+                    if !msg.content.is_empty() {
+                        let _ = send_server_event(
+                            writer,
+                            &ServerEvent::Chunk {
+                                request_id: request_id.to_string(),
+                                chat_id: chat_id.to_string(),
+                                delta: msg.content,
+                            },
+                        )
+                        .await;
+                    }
+                }
+                if obj.done {
+                    let _ = send_server_event(
+                        writer,
+                        &ServerEvent::Done {
+                            request_id: request_id.to_string(),
+                            chat_id: chat_id.to_string(),
+                            status: None,
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let _ = send_server_event(
+        writer,
+        &ServerEvent::Done {
+            request_id: request_id.to_string(),
+            chat_id: chat_id.to_string(),
+            status: None,
+        },
+    )
+    .await;
+    Ok(())
+}
+
 async fn process_normal_stream(
     writer: Arc<Mutex<OwnedWriteHalf>>,
     request_id: String,
@@ -791,9 +1006,13 @@ async fn process_normal_stream(
     ollama_api_key: Option<String>,
     messages: Vec<Message>,
 ) {
+    let wire_messages = messages
+        .iter()
+        .map(message_to_ollama_wire)
+        .collect::<Vec<_>>();
     let req = OllamaChatRequest {
         model: &model,
-        messages: &messages,
+        messages: &wire_messages,
         stream: true,
         think: Some(true),
         options: options.as_ref(),
@@ -953,26 +1172,7 @@ async fn process_stream_request(
         )
         .await
         {
-            Ok(answer) => {
-                let _ = send_server_event(
-                    &writer,
-                    &ServerEvent::Chunk {
-                        request_id: request_id.clone(),
-                        chat_id: chat_id.clone(),
-                        delta: answer,
-                    },
-                )
-                .await;
-                let _ = send_server_event(
-                    &writer,
-                    &ServerEvent::Done {
-                        request_id,
-                        chat_id,
-                        status: None,
-                    },
-                )
-                .await;
-            }
+            Ok(()) => {}
             Err(e) => {
                 let _ = send_server_event(
                     &writer,
