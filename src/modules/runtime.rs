@@ -46,11 +46,20 @@ async fn main() -> Result<()> {
         (fmt, open)
     };
 
+    let server_addr = std::env::var("TUILLAMA_SERVER_ADDR")
+        .ok()
+        .or_else(|| cfg.server_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
+
+    let input_poll_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(input_poll_ms));
+
     let mut app = App::new(
         model,
         api_url,
         options,
         ollama_api_key,
+        server_addr.clone(),
+        input_poll_ms.clone(),
         web_search,
         system_prompt,
         bold_selection,
@@ -71,16 +80,13 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) = unbounded_channel();
-    let server_addr = std::env::var("TUILLAMA_SERVER_ADDR")
-        .ok()
-        .or_else(|| cfg.server_addr.clone())
-        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
     let server_tx = connect_server(tx.clone(), &server_addr).await?;
 
     // Blocking input reader thread with configurable poll period
     let tx_input = tx.clone();
     std::thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(input_poll_ms)).unwrap_or(false) {
+        let poll_ms = input_poll_ms.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        if event::poll(Duration::from_millis(poll_ms)).unwrap_or(false) {
             match event::read() {
                 Ok(CEvent::Key(key)) => {
                     let _ = tx_input.send(AppEvent::Input(key));
@@ -452,9 +458,17 @@ fn attachment_from_path(path_text: &str) -> Result<Attachment> {
 }
 
 fn execute_command_palette(app: &mut App) {
-    let command = app.command_input.trim().trim_start_matches(':').trim();
+    let command = app.command_input.trim().trim_start_matches(':').trim().to_string();
     if command.is_empty() {
         app.status_message = Some("Command cancelled".to_string());
+        return;
+    }
+
+    if let Some(args) = command.strip_prefix("set ").map(str::trim) {
+        match execute_set_command(app, args) {
+            Ok(message) => app.status_message = Some(message),
+            Err(e) => app.status_message = Some(format!("Set failed: {e}")),
+        }
         return;
     }
 
@@ -480,13 +494,160 @@ fn execute_command_palette(app: &mut App) {
         return;
     }
 
-    match command {
+    match command.as_str() {
         "web on" => {
             app.web_search = true;
             app.status_message = Some("Web search enabled".to_string());
         }
         _ => {
             app.status_message = Some(format!("Unknown command: :{command}"));
+        }
+    }
+}
+
+fn execute_set_command(app: &mut App, args: &str) -> Result<String> {
+    let (key, value_text) = parse_set_args(args)?;
+    let key = normalize_set_key(&key);
+
+    match key.as_str() {
+        "model" => app.model = value_text.to_string(),
+        "api_url" => app.api_url = value_text.to_string(),
+        "ollama_api_key" => app.ollama_api_key = parse_optional_string(value_text),
+        "server_addr" => app.server_addr = value_text.to_string(),
+        "system_prompt" => app.system_prompt = parse_optional_string(value_text),
+        "bold_selection" => app.bold_selection = parse_bool(value_text)?,
+        "render_emojis" => {
+            app.render_emojis = parse_bool(value_text)?;
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "syntax_theme" | "syntax.theme_name" => {
+            app.syntax_theme_name = value_text.to_string();
+            app.syn_theme = build_syntect_theme(&app.syntax_theme_name, app.syntax_custom.as_ref());
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "syntax.enabled" => {
+            app.syntax_enabled = parse_bool(value_text)?;
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "performance.stream_fps" => {
+            let fps = parse_u64(value_text)?.max(1);
+            app.stream_throttle = Duration::from_millis(1000 / fps);
+        }
+        "performance.input_poll_ms" => {
+            app.input_poll_ms.store(
+                parse_u64(value_text)?.max(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        "preview.preview_fmt" => app.preview_fmt = value_text.to_string(),
+        "preview.preview_open" => app.preview_open = value_text.to_string(),
+        _ => {
+            if let Some(color_key) = key.strip_prefix("colors.").or_else(|| theme_color_key(&key)) {
+                app.theme.set_color(color_key, value_text)?;
+                app.render_cache.clear();
+                app.pending_cache = None;
+            } else if let Some(custom_key) = key.strip_prefix("syntax.custom.") {
+                let color = parse_color_name(value_text)
+                    .ok_or_else(|| anyhow!("invalid color '{value_text}' for syntax.custom.{custom_key}"))?;
+                let custom = app.syntax_custom.get_or_insert_with(toml::value::Table::new);
+                custom.insert(custom_key.to_string(), toml::Value::String(value_text.to_string()));
+                let _ = color;
+                app.syn_theme = build_syntect_theme(&app.syntax_theme_name, app.syntax_custom.as_ref());
+                app.render_cache.clear();
+                app.pending_cache = None;
+            } else {
+                let option_key = key.strip_prefix("options.").unwrap_or(&key);
+                set_option_value(app, option_key, parse_jsonish_value(value_text));
+            }
+        }
+    }
+
+    Ok(format!("Set {key} = {value_text}"))
+}
+
+fn parse_set_args(args: &str) -> Result<(String, &str)> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("usage: :set <option> <value>"));
+    }
+    if let Some((key, value)) = trimmed.split_once('=') {
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(anyhow!("usage: :set <option> <value>"));
+        }
+        return Ok((key.to_string(), value));
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let key = parts.next().unwrap_or_default().trim();
+    let value = parts.next().unwrap_or_default().trim();
+    if key.is_empty() || value.is_empty() {
+        return Err(anyhow!("usage: :set <option> <value>"));
+    }
+    Ok((key.to_string(), value))
+}
+
+fn normalize_set_key(key: &str) -> String {
+    key.trim().trim_start_matches(':').replace('-', "_")
+}
+
+fn parse_optional_string(value: &str) -> Option<String> {
+    match value.trim() {
+        "" | "none" | "null" | "off" => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn parse_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
+        _ => Err(anyhow!("expected boolean true/false, on/off, yes/no, or 1/0")),
+    }
+}
+
+fn parse_u64(value: &str) -> Result<u64> {
+    value.trim().parse::<u64>().with_context(|| format!("invalid integer '{value}'"))
+}
+
+fn parse_jsonish_value(value: &str) -> JsonValue {
+    let trimmed = value.trim();
+    if let Ok(parsed) = serde_json::from_str::<JsonValue>(trimmed) {
+        return parsed;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" => JsonValue::Bool(true),
+        "false" | "off" | "no" => JsonValue::Bool(false),
+        "null" | "none" => JsonValue::Null,
+        _ => {
+            if let Ok(i) = trimmed.parse::<i64>() {
+                JsonValue::Number(i.into())
+            } else if let Ok(f) = trimmed.parse::<f64>() {
+                serde_json::Number::from_f64(f)
+                    .map(JsonValue::Number)
+                    .unwrap_or_else(|| JsonValue::String(trimmed.to_string()))
+            } else {
+                JsonValue::String(trimmed.to_string())
+            }
+        }
+    }
+}
+
+fn set_option_value(app: &mut App, option_key: &str, value: JsonValue) {
+    let options = app
+        .options
+        .get_or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
+    if !options.is_object() {
+        *options = JsonValue::Object(serde_json::Map::new());
+    }
+    if let Some(map) = options.as_object_mut() {
+        if value.is_null() {
+            map.remove(option_key);
+        } else {
+            map.insert(option_key.to_string(), value);
         }
     }
 }

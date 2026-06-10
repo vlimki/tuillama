@@ -165,6 +165,58 @@ fn color_from_cfg(tbl: &toml::value::Table, key: &str, default: Color) -> Color 
 }
 
 impl Theme {
+    fn set_color(&mut self, key: &str, value: &str) -> Result<()> {
+        let color = parse_color_name(value).ok_or_else(|| anyhow!("invalid color '{value}' for colors.{key}"))?;
+        match key {
+            "app_bg" => self.app_bg = color,
+            "panel_bg" => self.panel_bg = color,
+            "panel_alt_bg" => self.panel_alt_bg = color,
+            "input_bg" => self.input_bg = color,
+            "sidebar_title" => self.sidebar_title = color,
+            "sidebar_timestamp" => self.sidebar_timestamp = color,
+            "sidebar_item" => self.sidebar_item = color,
+            "sidebar_item_bg" => self.sidebar_item_bg = color,
+            "sidebar_selected_bg" => self.sidebar_selected_bg = color,
+            "title_chat" => self.title_chat = color,
+            "title_input" => self.title_input = color,
+            "title_bar_bg" => self.title_bar_bg = color,
+            "user_prefix" => self.user_prefix = color,
+            "assistant_prefix" => self.assistant_prefix = color,
+            "system_prefix" => self.system_prefix = color,
+            "message_meta" => self.message_meta = color,
+            "message_rule" => self.message_rule = color,
+            "heading1" => self.heading1 = color,
+            "heading2" => self.heading2 = color,
+            "heading3" => self.heading3 = color,
+            "heading4" => self.heading4 = color,
+            "blockquote_bar" => self.blockquote_bar = color,
+            "list_bullet" => self.list_bullet = color,
+            "ordered_number" => self.ordered_number = color,
+            "inline_code" => self.inline_code = color,
+            "inline_code_bg" => self.inline_code_bg = color,
+            "code_block_fg" => self.code_block_fg = color,
+            "code_block_bg" => self.code_block_bg = color,
+            "hr" => self.hr = color,
+            "status_hint" => self.status_hint = color,
+            "mode_insert" => self.mode_insert = color,
+            "mode_normal" => self.mode_normal = color,
+            "mode_visual" => self.mode_visual = color,
+            "mode_focus" => self.mode_focus = color,
+            "border_sidebar" => self.border_sidebar = color,
+            "border_chat" => self.border_chat = color,
+            "border_input" => self.border_input = color,
+            "popup_title" => self.popup_title = color,
+            "popup_accent" => self.popup_accent = color,
+            "popup_text" => self.popup_text = color,
+            "stats_label" => self.stats_label = color,
+            "stats_value" => self.stats_value = color,
+            "stats_accent" => self.stats_accent = color,
+            _ => return Err(anyhow!("unknown color option colors.{key}")),
+        }
+        Ok(())
+    }
+
+
     fn from_config(tbl: Option<&toml::value::Table>) -> Self {
         let mut t = Theme::default();
         if let Some(map) = tbl {
@@ -221,6 +273,55 @@ impl Theme {
             t.stats_accent = color_from_cfg(map, "stats_accent", t.stats_accent);
         }
         t
+    }
+}
+
+fn theme_color_key(key: &str) -> Option<&'static str> {
+    match key {
+        "app_bg" => Some("app_bg"),
+        "panel_bg" => Some("panel_bg"),
+        "panel_alt_bg" => Some("panel_alt_bg"),
+        "input_bg" => Some("input_bg"),
+        "sidebar_title" => Some("sidebar_title"),
+        "sidebar_timestamp" => Some("sidebar_timestamp"),
+        "sidebar_item" => Some("sidebar_item"),
+        "sidebar_item_bg" => Some("sidebar_item_bg"),
+        "sidebar_selected_bg" => Some("sidebar_selected_bg"),
+        "title_chat" => Some("title_chat"),
+        "title_input" => Some("title_input"),
+        "title_bar_bg" => Some("title_bar_bg"),
+        "user_prefix" => Some("user_prefix"),
+        "assistant_prefix" => Some("assistant_prefix"),
+        "system_prefix" => Some("system_prefix"),
+        "message_meta" => Some("message_meta"),
+        "message_rule" => Some("message_rule"),
+        "heading1" => Some("heading1"),
+        "heading2" => Some("heading2"),
+        "heading3" => Some("heading3"),
+        "heading4" => Some("heading4"),
+        "blockquote_bar" => Some("blockquote_bar"),
+        "list_bullet" => Some("list_bullet"),
+        "ordered_number" => Some("ordered_number"),
+        "inline_code" => Some("inline_code"),
+        "inline_code_bg" => Some("inline_code_bg"),
+        "code_block_fg" => Some("code_block_fg"),
+        "code_block_bg" => Some("code_block_bg"),
+        "hr" => Some("hr"),
+        "status_hint" => Some("status_hint"),
+        "mode_insert" => Some("mode_insert"),
+        "mode_normal" => Some("mode_normal"),
+        "mode_visual" => Some("mode_visual"),
+        "mode_focus" => Some("mode_focus"),
+        "border_sidebar" => Some("border_sidebar"),
+        "border_chat" => Some("border_chat"),
+        "border_input" => Some("border_input"),
+        "popup_title" => Some("popup_title"),
+        "popup_accent" => Some("popup_accent"),
+        "popup_text" => Some("popup_text"),
+        "stats_label" => Some("stats_label"),
+        "stats_value" => Some("stats_value"),
+        "stats_accent" => Some("stats_accent"),
+        _ => None,
     }
 }
 
