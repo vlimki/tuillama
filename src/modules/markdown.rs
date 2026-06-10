@@ -16,7 +16,7 @@ struct InlineAttrs {
 enum Inline {
     Text { content: String, attrs: InlineAttrs },
     Code(String),
-    Math { content: String, block: bool },
+    Math(String),
     Footnote(String),
     Image { label: String, url: String },
     LinkUrl(String),
@@ -59,11 +59,11 @@ struct MarkdownDocumentBuilder {
     footnote_blocks: Vec<MdBlock>,
     quote_depth: usize,
     table: Option<TableBuildState>,
-    math_placeholders: Vec<(bool, String)>,
+    math_placeholders: Vec<String>,
 }
 
 impl MarkdownDocumentBuilder {
-    fn new(math_placeholders: Vec<(bool, String)>) -> Self {
+    fn new(math_placeholders: Vec<String>) -> Self {
         Self {
             blocks: Vec::new(),
             inline_buf: Vec::new(),
@@ -123,7 +123,7 @@ impl MarkdownDocumentBuilder {
         for part in split_math_placeholders(text, &self.math_placeholders) {
             match part {
                 MathSplit::Text(s) if !s.is_empty() => self.push_inline(Inline::Text { content: s, attrs }),
-                MathSplit::Math { block, content } => self.push_inline(Inline::Math { content, block }),
+                MathSplit::Math(content) => self.push_inline(Inline::Math(content)),
                 MathSplit::Text(_) => {}
             }
         }
@@ -272,7 +272,7 @@ impl MarkdownDocumentBuilder {
         if let Some((_, contents)) = self.code_block.as_mut() {
             match event {
                 Event::End(TagEnd::CodeBlock) => self.handle_end(TagEnd::CodeBlock),
-                Event::Text(text) => contents.push_str(&text),
+                Event::Text(text) => contents.push_str(&restore_math_placeholders(&text, &self.math_placeholders)),
                 Event::SoftBreak | Event::HardBreak => contents.push('\n'),
                 _ => {}
             }
@@ -283,7 +283,10 @@ impl MarkdownDocumentBuilder {
             Event::Start(tag) => self.handle_start(tag),
             Event::End(tag) => self.handle_end(tag),
             Event::Text(text) => self.push_text(&text),
-            Event::Code(code) => self.push_inline(Inline::Code(code.to_string())),
+            Event::Code(code) => self.push_inline(Inline::Code(restore_math_placeholders(
+                &code,
+                &self.math_placeholders,
+            ))),
             Event::Html(html) | Event::InlineHtml(html) => self.push_text(&html),
             Event::FootnoteReference(label) => self.push_inline(Inline::Footnote(label.to_string())),
             Event::SoftBreak => self.push_text(" "),
@@ -301,25 +304,28 @@ impl MarkdownDocumentBuilder {
 
 enum MathSplit {
     Text(String),
-    Math { block: bool, content: String },
+    Math(String),
 }
 
-fn split_math_placeholders(text: &str, placeholders: &[(bool, String)]) -> Vec<MathSplit> {
+const MATH_PLACEHOLDER_PREFIX: &str = "TUILLAMAMATHPLACEHOLDER";
+const MATH_PLACEHOLDER_SUFFIX: &str = "END";
+
+fn split_math_placeholders(text: &str, placeholders: &[String]) -> Vec<MathSplit> {
     let mut parts = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find("\u{E000}MATH") {
+    while let Some(start) = rest.find(MATH_PLACEHOLDER_PREFIX) {
         if start > 0 {
             parts.push(MathSplit::Text(rest[..start].to_string()));
         }
-        let after_start = &rest[start + "\u{E000}MATH".len()..];
-        if let Some(end) = after_start.find('\u{E001}') {
+        let after_start = &rest[start + MATH_PLACEHOLDER_PREFIX.len()..];
+        if let Some(end) = after_start.find(MATH_PLACEHOLDER_SUFFIX) {
             let idx_text = &after_start[..end];
             if let Ok(idx) = idx_text.parse::<usize>() {
-                if let Some((block, content)) = placeholders.get(idx).cloned() {
-                    parts.push(MathSplit::Math { block, content });
+                if let Some(content) = placeholders.get(idx).cloned() {
+                    parts.push(MathSplit::Math(content));
                 }
             }
-            rest = &after_start[end + '\u{E001}'.len_utf8()..];
+            rest = &after_start[end + MATH_PLACEHOLDER_SUFFIX.len()..];
         } else {
             parts.push(MathSplit::Text(rest[start..].to_string()));
             rest = "";
@@ -331,32 +337,88 @@ fn split_math_placeholders(text: &str, placeholders: &[(bool, String)]) -> Vec<M
     parts
 }
 
-fn protect_math(input: &str) -> (String, Vec<(bool, String)>) {
+fn restore_math_placeholders(text: &str, placeholders: &[String]) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(MATH_PLACEHOLDER_PREFIX) {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + MATH_PLACEHOLDER_PREFIX.len()..];
+        if let Some(end) = after_start.find(MATH_PLACEHOLDER_SUFFIX) {
+            let idx_text = &after_start[..end];
+            if let Ok(idx) = idx_text.parse::<usize>() {
+                if let Some(content) = placeholders.get(idx) {
+                    out.push_str(content);
+                }
+            }
+            rest = &after_start[end + MATH_PLACEHOLDER_SUFFIX.len()..];
+        } else {
+            out.push_str(&rest[start..]);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn latex_verb_len(input: &str) -> Option<usize> {
+    let mut prefix_len = "\\verb".len();
+    let mut rest = input.strip_prefix("\\verb")?;
+    if let Some(after_star) = rest.strip_prefix('*') {
+        prefix_len += '*'.len_utf8();
+        rest = after_star;
+    }
+
+    let mut chars = rest.char_indices();
+    let (_, delimiter) = chars.next()?;
+    if delimiter.is_ascii_alphanumeric() || delimiter.is_whitespace() {
+        return None;
+    }
+    for (idx, ch) in chars {
+        if ch == delimiter {
+            return Some(prefix_len + idx + ch.len_utf8());
+        }
+    }
+    None
+}
+
+fn protect_math(input: &str) -> (String, Vec<String>) {
     let mut out = String::new();
     let mut placeholders = Vec::new();
     let mut i = 0usize;
     while i < input.len() {
         let rest = &input[i..];
+        if let Some(len) = latex_verb_len(rest) {
+            out.push_str(&input[i..i + len]);
+            i += len;
+            continue;
+        }
+
         let spec = if rest.starts_with("$$") {
-            Some(("$$", "$$", true, 2usize))
+            Some(("$$", 2usize))
         } else if rest.starts_with("\\[") {
-            Some(("\\[", "\\]", true, 2usize))
+            Some(("\\]", 2usize))
         } else if rest.starts_with("\\(") {
-            Some(("\\(", "\\)", false, 2usize))
+            Some(("\\)", 2usize))
+        } else if let Some((open, close)) = latex_environment_delimiters(rest) {
+            Some((close, open.len()))
         } else if rest.starts_with('$') && !rest.starts_with("$$") {
-            Some(("$", "$", false, 1usize))
+            Some(("$", 1usize))
         } else {
             None
         };
 
-        if let Some((_open, close, block, open_len)) = spec {
+        if let Some((close, open_len)) = spec {
             if let Some(end_rel) = find_math_close(&input[i + open_len..], close) {
                 let content_start = i + open_len;
                 let content_end = content_start + end_rel;
+                let raw_end = content_end + close.len();
                 let idx = placeholders.len();
-                placeholders.push((block, input[content_start..content_end].to_string()));
-                out.push_str(&format!("\u{E000}MATH{}\u{E001}", idx));
-                i = content_end + close.len();
+                placeholders.push(input[i..raw_end].to_string());
+                out.push_str(&format!(
+                    "{}{}{}",
+                    MATH_PLACEHOLDER_PREFIX, idx, MATH_PLACEHOLDER_SUFFIX
+                ));
+                i = raw_end;
                 continue;
             }
         }
@@ -369,6 +431,50 @@ fn protect_math(input: &str) -> (String, Vec<(bool, String)>) {
         }
     }
     (out, placeholders)
+}
+
+fn latex_environment_delimiters(input: &str) -> Option<(&'static str, &'static str)> {
+    const ENVS: &[&str] = &[
+        "equation",
+        "equation*",
+        "align",
+        "align*",
+        "gather",
+        "gather*",
+        "multline",
+        "multline*",
+        "split",
+    ];
+    for env in ENVS {
+        let open = match *env {
+            "equation" => "\\begin{equation}",
+            "equation*" => "\\begin{equation*}",
+            "align" => "\\begin{align}",
+            "align*" => "\\begin{align*}",
+            "gather" => "\\begin{gather}",
+            "gather*" => "\\begin{gather*}",
+            "multline" => "\\begin{multline}",
+            "multline*" => "\\begin{multline*}",
+            "split" => "\\begin{split}",
+            _ => unreachable!(),
+        };
+        if input.starts_with(open) {
+            let close = match *env {
+                "equation" => "\\end{equation}",
+                "equation*" => "\\end{equation*}",
+                "align" => "\\end{align}",
+                "align*" => "\\end{align*}",
+                "gather" => "\\end{gather}",
+                "gather*" => "\\end{gather*}",
+                "multline" => "\\end{multline}",
+                "multline*" => "\\end{multline*}",
+                "split" => "\\end{split}",
+                _ => unreachable!(),
+            };
+            return Some((open, close));
+        }
+    }
+    None
 }
 
 fn find_math_close(haystack: &str, close: &str) -> Option<usize> {
@@ -396,6 +502,8 @@ struct MarkdownRenderer<'a> {
     syn_theme: &'a SynTheme,
     syntax_enabled: bool,
     render_emojis: bool,
+    selected_code_block: Option<usize>,
+    code_block_index: usize,
 }
 
 impl<'a> MarkdownRenderer<'a> {
@@ -406,6 +514,7 @@ impl<'a> MarkdownRenderer<'a> {
         syn_theme: &'a SynTheme,
         syntax_enabled: bool,
         render_emojis: bool,
+        selected_code_block: Option<usize>,
     ) -> Self {
         Self {
             text: Text::default(),
@@ -419,6 +528,8 @@ impl<'a> MarkdownRenderer<'a> {
             syn_theme,
             syntax_enabled,
             render_emojis,
+            selected_code_block,
+            code_block_index: 0,
         }
     }
 
@@ -454,6 +565,26 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
+    fn add_modifier_to_last_line(&mut self, modifier: Modifier) {
+        if let Some(line) = self.text.lines.last_mut() {
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(modifier);
+            }
+        }
+    }
+
+    fn push_blank_line(&mut self) {
+        self.flush_line();
+        let already_blank = self.text.lines.last().is_some_and(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.content.as_ref().trim().is_empty())
+        });
+        if !self.text.lines.is_empty() && !already_blank {
+            self.text.push_line(Line::default());
+        }
+    }
+
     fn inline_style(&self, attrs: InlineAttrs) -> Style {
         let mut style = Style::default();
         if attrs.link {
@@ -476,9 +607,11 @@ impl<'a> MarkdownRenderer<'a> {
             match inline {
                 Inline::Text { content, attrs } => self.push_span(content.clone(), base_style.patch(self.inline_style(*attrs))),
                 Inline::Code(code) => self.push_span(code.clone(), base_style.fg(self.theme.inline_code).bg(self.theme.inline_code_bg)),
-                Inline::Math { content, block } => {
-                    let rendered = if *block { format!("⟦ {} ⟧", content) } else { format!("‹{}›", content) };
-                    self.push_span(rendered, base_style.fg(self.theme.heading2).add_modifier(Modifier::ITALIC));
+                Inline::Math(content) => {
+                    self.push_span(
+                        content.clone(),
+                        base_style.fg(self.theme.heading2).add_modifier(Modifier::ITALIC),
+                    );
                 }
                 Inline::Footnote(label) => self.push_span(format!("[{}]", label), base_style.fg(self.theme.ordered_number)),
                 Inline::Image { label, url } => self.push_span(format!("[{}: {}]", label, url), base_style.fg(self.theme.status_hint)),
@@ -506,6 +639,8 @@ impl<'a> MarkdownRenderer<'a> {
 
     fn render_code_block(&mut self, language: Option<String>, contents: String) {
         self.flush_line();
+        let selected = self.selected_code_block == Some(self.code_block_index);
+        self.code_block_index += 1;
         let mut high = if self.syntax_enabled {
             let syn = language
                 .as_deref()
@@ -519,6 +654,9 @@ impl<'a> MarkdownRenderer<'a> {
         for raw in contents.trim_end_matches('\n').split('\n') {
             let raw = filter_emojis(raw.to_string(), self.render_emojis);
             self.push_code_block_line(&raw, high.as_mut());
+            if selected {
+                self.add_modifier_to_last_line(Modifier::REVERSED);
+            }
         }
     }
 
@@ -638,6 +776,7 @@ impl<'a> MarkdownRenderer<'a> {
         match block {
             MdBlock::Paragraph(inlines) => { self.render_inlines(inlines, Style::default()); self.flush_line(); }
             MdBlock::Heading { level, content } => {
+                self.push_blank_line();
                 let style = match level {
                     1 => Style::default().fg(self.theme.heading1).add_modifier(Modifier::BOLD),
                     2 => Style::default().fg(self.theme.heading2).add_modifier(Modifier::BOLD),
@@ -646,6 +785,7 @@ impl<'a> MarkdownRenderer<'a> {
                 };
                 self.render_inlines(content, style);
                 self.flush_line();
+                self.push_blank_line();
             }
             MdBlock::CodeBlock { lang, code } => self.render_code_block(lang.clone(), code.clone()),
             MdBlock::List { ordered, items, .. } => {
@@ -681,7 +821,10 @@ fn inlines_to_spans(renderer: &MarkdownRenderer<'_>, inlines: &[Inline], base_st
         match inline {
             Inline::Text { content, attrs } => spans.push(Span::styled(filter_emojis(content.clone(), renderer.render_emojis), base_style.patch(renderer.inline_style(*attrs)))),
             Inline::Code(code) => spans.push(Span::styled(filter_emojis(code.clone(), renderer.render_emojis), base_style.fg(renderer.theme.inline_code).bg(renderer.theme.inline_code_bg))),
-            Inline::Math { content, block } => spans.push(Span::styled(if *block { format!("⟦ {} ⟧", content) } else { format!("‹{}›", content) }, base_style.fg(renderer.theme.heading2).add_modifier(Modifier::ITALIC))),
+            Inline::Math(content) => spans.push(Span::styled(
+                content.clone(),
+                base_style.fg(renderer.theme.heading2).add_modifier(Modifier::ITALIC),
+            )),
             Inline::Footnote(label) => spans.push(Span::styled(format!("[{}]", label), base_style.fg(renderer.theme.ordered_number))),
             Inline::Image { label, url } => spans.push(Span::styled(format!("[{}: {}]", label, url), base_style.fg(renderer.theme.status_hint))),
             Inline::LinkUrl(url) => spans.push(Span::styled(format!(" ({})", url), base_style.fg(renderer.theme.status_hint))),
@@ -695,7 +838,7 @@ fn inlines_plain(inlines: &[Inline]) -> String {
     for inline in inlines {
         match inline {
             Inline::Text { content, .. } | Inline::Code(content) => s.push_str(content),
-            Inline::Math { content, block } => if *block { s.push_str(&format!("⟦ {} ⟧", content)); } else { s.push_str(&format!("‹{}›", content)); },
+            Inline::Math(content) => s.push_str(content),
             Inline::Footnote(label) => s.push_str(&format!("[{}]", label)),
             Inline::Image { label, url } => s.push_str(&format!("[{}: {}]", label, url)),
             Inline::LinkUrl(url) => s.push_str(&format!(" ({})", url)),
@@ -828,6 +971,28 @@ fn render_markdown_to_text(
     syntax_enabled: bool,
     render_emojis: bool,
 ) -> Text<'static> {
+    render_markdown_to_text_with_selected_code_block(
+        input,
+        theme,
+        inner_width,
+        ss,
+        syn_theme,
+        syntax_enabled,
+        render_emojis,
+        None,
+    )
+}
+
+fn render_markdown_to_text_with_selected_code_block(
+    input: &str,
+    theme: &Theme,
+    inner_width: u16,
+    ss: &SyntaxSet,
+    syn_theme: &SynTheme,
+    syntax_enabled: bool,
+    render_emojis: bool,
+    selected_code_block: Option<usize>,
+) -> Text<'static> {
     let input = input.replace("‑", "-").replace('\t', "    ");
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -837,7 +1002,50 @@ fn render_markdown_to_text(
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
     let blocks = parse_markdown_blocks(&input, options);
-    MarkdownRenderer::new(theme, inner_width, ss, syn_theme, syntax_enabled, render_emojis).render_document(&blocks)
+    MarkdownRenderer::new(
+        theme,
+        inner_width,
+        ss,
+        syn_theme,
+        syntax_enabled,
+        render_emojis,
+        selected_code_block,
+    )
+    .render_document(&blocks)
+}
+
+fn markdown_code_blocks(input: &str) -> Vec<String> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+    for event in Parser::new_ext(input, options) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => current = Some(String::new()),
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(code) = current.take() {
+                    blocks.push(code);
+                }
+            }
+            Event::Text(text) => {
+                if let Some(code) = current.as_mut() {
+                    code.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(code) = current.as_mut() {
+                    code.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
 }
 
 #[cfg(test)]
@@ -932,9 +1140,67 @@ mod markdown_tests {
     fn math_is_rendered_as_atomic_styled_inline_and_block_spans() {
         let lines = render_plain("Inline $a_b * c$ and \\(x^2\\)\n\n$$E = mc^2$$\n\nNot *emphasis*.");
 
-        assert!(lines.iter().any(|line| line.contains("‹a_b * c›")));
-        assert!(lines.iter().any(|line| line.contains("‹x^2›")));
-        assert!(lines.iter().any(|line| line.contains("⟦ E = mc^2 ⟧")));
+        assert!(lines.iter().any(|line| line.contains("a_b * c")));
+        assert!(lines.iter().any(|line| line.contains("x^2")));
+        assert!(lines.iter().any(|line| line.contains("E = mc^2")));
+        assert!(lines.iter().all(|line| !line.contains("MATH")));
         assert!(lines.iter().any(|line| line == "Not emphasis."));
+    }
+
+    #[test]
+    fn latex_environments_render_as_latex_without_placeholders() {
+        let lines = render_plain(
+            "Before\n\n\\begin{equation}\na_b = c_d\n\\end{equation}\n\nAfter",
+        );
+
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("\\begin{equation}"));
+        assert!(rendered.contains("a_b = c_d"));
+        assert!(rendered.contains("\\end{equation}"));
+        assert!(lines.iter().all(|line| !line.contains("MATH")));
+        assert!(lines.iter().all(|line| !line.contains("PLACEHOLDER")));
+    }
+
+    #[test]
+    fn latex_document_math_does_not_leak_placeholders() {
+        let lines = render_plain(
+            r#"\paragraph*{Inline math:}
+The theorem is written as \(a^2 + b^2 = c^2\) or using \verb|$a^2 + b^2 = c^2$|.
+
+\paragraph*{Displayed equation:}
+\[
+E = mc^2
+\]
+
+\begin{align}
+a &= b \\ c &= d
+\end{align}"#,
+        );
+        let rendered = lines.join("\n");
+
+        assert!(!rendered.contains("TUILLAMA"), "{rendered}");
+        assert!(!rendered.contains("PLACEHOLDER"), "{rendered}");
+        assert!(rendered.contains("\\(a^2 + b^2 = c^2\\)"), "{rendered}");
+        assert!(rendered.contains("\\verb|$a^2 + b^2 = c^2$|"), "{rendered}");
+        assert!(rendered.contains("E = mc^2"), "{rendered}");
+        assert!(rendered.contains("\\begin{align}"), "{rendered}");
+        assert!(rendered.contains("a &= b"), "{rendered}");
+    }
+
+
+
+    #[test]
+    fn headings_have_breathing_room_without_leading_blank_space() {
+        let lines = render_plain("# Title\n\nBody\n\n## Next\nMore");
+
+        assert_eq!(lines, vec!["Title", "", "Body", "", "Next", "", "More"]);
+    }
+
+    #[test]
+    fn extracts_fenced_code_blocks_for_visual_yank() {
+        let blocks = markdown_code_blocks("Text\n\n```rust\nfn main() {}\n```\n\n```\nplain\n```");
+
+        assert_eq!(blocks, vec!["fn main() {}\n", "plain\n"]);
     }
 }

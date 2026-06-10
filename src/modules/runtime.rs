@@ -692,6 +692,82 @@ fn message_to_preview_markdown(message: &Message) -> String {
     out
 }
 
+
+fn selected_message_code_blocks(app: &App) -> Vec<String> {
+    app.selected_msg
+        .and_then(|idx| app.messages.get(idx))
+        .map(|message| markdown_code_blocks(&message.content))
+        .unwrap_or_default()
+}
+
+fn select_next_code_block(app: &mut App) {
+    if app.focus != Focus::Chat {
+        return;
+    }
+    let blocks = selected_message_code_blocks(app);
+    if blocks.is_empty() {
+        app.visual_selection = VisualSelection::Message;
+        app.status_message = Some("No code blocks in selected message".to_string());
+        return;
+    }
+    let next = match app.visual_selection {
+        VisualSelection::Message => 0,
+        VisualSelection::CodeBlock(idx) => (idx + 1) % blocks.len(),
+    };
+    app.visual_selection = VisualSelection::CodeBlock(next);
+    app.status_message = Some(format!(
+        "Selected code block {} of {}",
+        next + 1,
+        blocks.len()
+    ));
+}
+
+fn push_clipboard_error(app: &mut App, action: &str, e: anyhow::Error) {
+    app.messages.push(Message {
+        role: Role::System,
+        content: format!("Clipboard {} failed: {}", action, e),
+        created_ts: now_sec(),
+        thinking: None,
+        attachments: Vec::new(),
+        sources: Vec::new(),
+    });
+    app.render_cache.clear();
+}
+
+async fn yank_visual_selection(app: &mut App) {
+    if app.focus != Focus::Chat {
+        return;
+    }
+
+    let Some(message_idx) = app.selected_msg else {
+        return;
+    };
+    let Some(message) = app.messages.get(message_idx) else {
+        return;
+    };
+
+    let (contents, label) = match app.visual_selection {
+        VisualSelection::Message => (message.content.clone(), "message".to_string()),
+        VisualSelection::CodeBlock(code_block_idx) => {
+            let blocks = markdown_code_blocks(&message.content);
+            let Some(code) = blocks.get(code_block_idx).cloned() else {
+                app.visual_selection = VisualSelection::Message;
+                app.status_message = Some("Selected code block no longer exists".to_string());
+                return;
+            };
+            (code, format!("code block {}", code_block_idx + 1))
+        }
+    };
+
+    match write_clipboard_text(&contents).await {
+        Ok(()) => {
+            app.status_message = Some(format!("Yanked {} to clipboard", label));
+            app.mode = Mode::Normal;
+        }
+        Err(e) => push_clipboard_error(app, "copy", e),
+    }
+}
+
 fn refresh_sidebar_chats(app: &mut App, preferred_id: Option<&str>) {
     app.chats = if app.sidebar_search_query.trim().is_empty() {
         list_chats().unwrap_or_default()
@@ -1243,6 +1319,7 @@ async fn handle_key(
                 KeyCode::Char('v') => {
                     if app.focus == Focus::Chat {
                         app.mode = Mode::Visual;
+                        app.visual_selection = VisualSelection::Message;
                         if app.selected_msg.is_none() {
                             app.selected_msg = Some(app.messages.len().saturating_sub(1));
                         }
@@ -1376,6 +1453,7 @@ async fn handle_key(
         Mode::Visual => match key.code {
             KeyCode::Esc | KeyCode::Char('v') => {
                 app.mode = Mode::Normal;
+                app.visual_selection = VisualSelection::Message;
             }
             KeyCode::Char('h') => {
                 if app.show_sidebar {
@@ -1395,23 +1473,14 @@ async fn handle_key(
                 }
             }
             KeyCode::Char('y') => {
-                if app.focus == Focus::Chat {
-                    if let Some(i) = app.selected_msg {
-                        if let Some(m) = app.messages.get(i) {
-                            if let Err(e) = write_clipboard_text(&m.content).await {
-                                app.messages.push(Message {
-                                    role: Role::System,
-                                    content: format!("Clipboard copy failed: {}", e),
-                                    created_ts: now_sec(),
-                                    thinking: None,
-                                    attachments: Vec::new(),
-                                    sources: Vec::new(),
-                                });
-                                app.render_cache.clear();
-                            }
-                        }
-                    }
-                }
+                yank_visual_selection(app).await;
+            }
+            KeyCode::Char('c') => {
+                select_next_code_block(app);
+            }
+            KeyCode::Char('m') => {
+                app.visual_selection = VisualSelection::Message;
+                app.status_message = Some("Selected whole message".to_string());
             }
             KeyCode::Char('j') => match app.focus {
                 Focus::Sidebar => {
@@ -1428,6 +1497,7 @@ async fn handle_key(
                         .unwrap_or_else(|| app.messages.len().saturating_sub(1));
                     let next = (cur + 1).min(app.messages.len().saturating_sub(1));
                     app.selected_msg = Some(next);
+                    app.visual_selection = VisualSelection::Message;
                     let target_y = offset_for_message(app, app.chat_inner_width.max(1), next);
                     let top = app.chat_scroll;
                     let bottom = top.saturating_add(app.chat_inner_height.max(1));
@@ -1451,6 +1521,7 @@ async fn handle_key(
                         .unwrap_or_else(|| app.messages.len().saturating_sub(1));
                     let next = cur.saturating_sub(1);
                     app.selected_msg = Some(next);
+                    app.visual_selection = VisualSelection::Message;
                     let target_y = offset_for_message(app, app.chat_inner_width.max(1), next);
                     let top = app.chat_scroll;
                     let bottom = top.saturating_add(app.chat_inner_height.max(1));

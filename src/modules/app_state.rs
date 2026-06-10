@@ -62,6 +62,7 @@ struct App {
     mode: Mode,
     focus: Focus,
     selected_msg: Option<usize>,
+    visual_selection: VisualSelection,
     popup: Popup,
 
     // preview cfg
@@ -158,6 +159,7 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Chat,
             selected_msg: None,
+            visual_selection: VisualSelection::Message,
             popup: Popup::None,
             preview_fmt,
             preview_open,

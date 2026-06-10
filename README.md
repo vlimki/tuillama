@@ -24,7 +24,7 @@ Toggle on agentic web search at any time via Ctrl-W. Note that you will have to 
 
 ## No LaTeX on the terminal? No problem
 
-Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, select a message, and press `Enter`.
+Preview mode renders Markdown + LaTeX to HTML with MathJax. Enter visual mode, select a message, and press `Enter`. In visual mode, press `y` to copy the selected message, `c` to cycle through code blocks in that message, and `y` again to copy only the highlighted code block.
 
 ![Preview 2](media/preview2.png)
 

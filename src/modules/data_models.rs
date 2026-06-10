@@ -66,6 +66,12 @@ enum Focus {
     Chat,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum VisualSelection {
+    Message,
+    CodeBlock(usize),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Popup {
     None,
