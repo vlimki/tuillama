@@ -316,8 +316,17 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         items.push(ListItem::new(lines).style(style));
     }
 
-    let list = List::new(items).highlight_style(Style::default().bg(app.theme.sidebar_selected_bg));
-    frame.render_widget(list, inner);
+    let list = List::new(items).highlight_style(if app.focus == Focus::Sidebar {
+        Style::default().bg(app.theme.sidebar_selected_bg)
+    } else {
+        Style::default()
+    });
+    let mut state = ListState::default().with_selected(if app.chats.is_empty() {
+        None
+    } else {
+        Some(app.sidebar_idx + 2)
+    });
+    frame.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -354,8 +363,8 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),
-            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Min(10),
         ])
         .split(inner);
@@ -437,7 +446,7 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("throughput: ", Style::default().fg(app.theme.stats_label)),
+            Span::styled("tokens/sec: ", Style::default().fg(app.theme.stats_label)),
             Span::styled(tps_value, Style::default().fg(app.theme.stats_value).add_modifier(Modifier::BOLD)),
         ]),
     ];
@@ -565,27 +574,8 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Sources", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Ctrl+P toggles this panel.", Style::default().fg(app.theme.status_hint))),
     ];
-    let latest_sources = active_stream
-        .map(|stream| stream.sources.as_slice())
-        .filter(|sources| !sources.is_empty())
-        .or_else(|| app.messages.iter().rev().find(|m| !m.sources.is_empty()).map(|m| m.sources.as_slice()));
-    let mut trace = trace;
-    if let Some(sources) = latest_sources {
-        for (idx, source) in sources.iter().take(4).enumerate() {
-            trace.push(Line::from(vec![
-                Span::styled(format!("{}.", idx + 1), Style::default().fg(app.theme.stats_label)),
-                Span::raw(" "),
-                Span::styled(source.title.clone(), Style::default().fg(app.theme.stats_value)),
-            ]));
-            trace.push(Line::from(Span::styled(source.url.clone(), Style::default().fg(app.theme.status_hint))));
-        }
-    } else {
-        trace.push(Line::from(Span::styled("No sources yet", Style::default().fg(app.theme.status_hint))));
-    }
-    trace.push(Line::from(""));
-    trace.push(Line::from(Span::styled("Ctrl+P toggles this panel.", Style::default().fg(app.theme.status_hint))));
     frame.render_widget(
         Paragraph::new(Text::from(trace))
             .wrap(Wrap { trim: false })

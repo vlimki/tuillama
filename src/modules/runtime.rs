@@ -1349,13 +1349,27 @@ async fn handle_key(
                     }
                     Focus::Chat => {}
                 },
-                KeyCode::Up => {
-                    stop_following_stream(app);
-                    app.chat_scroll = app.chat_scroll.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    app.chat_scroll = app.chat_scroll.saturating_add(1);
-                }
+                KeyCode::Up => match app.focus {
+                    Focus::Sidebar => {
+                        if app.show_sidebar && !app.chats.is_empty() {
+                            app.sidebar_idx = app.sidebar_idx.saturating_sub(1);
+                        }
+                    }
+                    Focus::Chat => {
+                        stop_following_stream(app);
+                        app.chat_scroll = app.chat_scroll.saturating_sub(1);
+                    }
+                },
+                KeyCode::Down => match app.focus {
+                    Focus::Sidebar => {
+                        if app.show_sidebar && !app.chats.is_empty() {
+                            app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len() - 1);
+                        }
+                    }
+                    Focus::Chat => {
+                        app.chat_scroll = app.chat_scroll.saturating_add(1);
+                    }
+                },
                 _ => {}
             }
         }
@@ -1482,13 +1496,27 @@ async fn handle_key(
                     }
                 }
             },
-            KeyCode::Up => {
-                stop_following_stream(app);
-                app.chat_scroll = app.chat_scroll.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                app.chat_scroll = app.chat_scroll.saturating_add(1);
-            }
+            KeyCode::Up => match app.focus {
+                Focus::Sidebar => {
+                    if app.show_sidebar && !app.chats.is_empty() {
+                        app.sidebar_idx = app.sidebar_idx.saturating_sub(1);
+                    }
+                }
+                Focus::Chat => {
+                    stop_following_stream(app);
+                    app.chat_scroll = app.chat_scroll.saturating_sub(1);
+                }
+            },
+            KeyCode::Down => match app.focus {
+                Focus::Sidebar => {
+                    if app.show_sidebar && !app.chats.is_empty() {
+                        app.sidebar_idx = (app.sidebar_idx + 1).min(app.chats.len() - 1);
+                    }
+                }
+                Focus::Chat => {
+                    app.chat_scroll = app.chat_scroll.saturating_add(1);
+                }
+            },
             _ => {}
         },
     }
