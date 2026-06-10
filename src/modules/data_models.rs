@@ -56,6 +56,7 @@ struct ChatMeta {
 enum Mode {
     Normal,
     Insert,
+    Command,
     Visual,
 }
 

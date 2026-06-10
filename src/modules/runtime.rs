@@ -17,7 +17,9 @@ async fn main() -> Result<()> {
     let web_search = false;
     let system_prompt = cfg.system_prompt.clone();
     let bold_selection = cfg.bold_selection.unwrap_or(false);
-    let theme = Theme::from_config(cfg.colors.as_ref());
+    let render_emojis = cfg.render_emojis.unwrap_or(true);
+    let color_config = cfg.colors.clone().unwrap_or_default();
+    let theme = Theme::from_config(Some(&color_config));
 
     let (syntax_enabled, syntax_theme_name, syntax_custom) = {
         let s = cfg.syntax.clone();
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
         let p = cfg.performance.clone().unwrap_or_default();
         let fps = p.stream_fps.unwrap_or(30).max(1);
         let poll = p.input_poll_ms.unwrap_or(250).max(1);
-        (Duration::from_millis(1000 / fps as u64), poll)
+        (Duration::from_millis(1000 / fps as u64), Arc::new(AtomicU64::new(poll)))
     };
 
     let (preview_fmt, preview_open) = {
@@ -45,19 +47,28 @@ async fn main() -> Result<()> {
         (fmt, open)
     };
 
+    let server_addr = std::env::var("TUILLAMA_SERVER_ADDR")
+        .ok()
+        .or_else(|| cfg.server_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
+
     let mut app = App::new(
         model,
         api_url,
+        server_addr.clone(),
         options,
         ollama_api_key,
         web_search,
         system_prompt,
         bold_selection,
+        render_emojis,
+        color_config,
         theme,
         syntax_enabled,
         syntax_theme_name,
-        syntax_custom,
+        syntax_custom.clone(),
         stream_throttle,
+        input_poll_ms.clone(),
         preview_fmt,
         preview_open,
     );
@@ -69,16 +80,13 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) = unbounded_channel();
-    let server_addr = std::env::var("TUILLAMA_SERVER_ADDR")
-        .ok()
-        .or_else(|| cfg.server_addr.clone())
-        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
-    let server_tx = connect_server(tx.clone(), &server_addr).await?;
+    let mut server_tx = connect_server(tx.clone(), &server_addr).await?;
 
     // Blocking input reader thread with configurable poll period
     let tx_input = tx.clone();
     std::thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(input_poll_ms)).unwrap_or(false) {
+        let poll_ms = input_poll_ms.load(Ordering::Relaxed).max(1);
+        if event::poll(Duration::from_millis(poll_ms)).unwrap_or(false) {
             match event::read() {
                 Ok(CEvent::Key(key)) => {
                     let _ = tx_input.send(AppEvent::Input(key));
@@ -101,7 +109,7 @@ async fn main() -> Result<()> {
         let mut should_draw = true;
 
         match ev {
-            AppEvent::Input(key) => handle_key(key, &mut app, &tx, &server_tx).await?,
+            AppEvent::Input(key) => handle_key(key, &mut app, &tx, &mut server_tx).await?,
             AppEvent::Resize => {
                 app.render_cache.clear();
                 app.pending_cache = None;
@@ -449,6 +457,268 @@ fn attachment_from_path(path_text: &str) -> Result<Attachment> {
     })
 }
 
+async fn execute_command_palette(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    server_tx: &mut UnboundedSender<ClientRequest>,
+) -> Result<()> {
+    let command = app.command_input.trim().trim_start_matches(':').trim().to_string();
+    if command.is_empty() {
+        app.status_message = Some("Command cancelled".to_string());
+        return Ok(());
+    }
+
+    if let Some(path) = command.strip_prefix("attach ").map(str::trim).filter(|p| !p.is_empty()) {
+        match attachment_from_path(path) {
+            Ok(attachment) => {
+                let name = attachment.path.clone();
+                app.pending_attachments.push(attachment);
+                app.status_message = Some(format!("Attached image {name}"));
+            }
+            Err(e) => {
+                app.messages.push(Message {
+                    role: Role::System,
+                    content: format!("Attachment failed: {e}"),
+                    created_ts: now_sec(),
+                    thinking: None,
+                    attachments: Vec::new(),
+                    sources: Vec::new(),
+                });
+                app.render_cache.clear();
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(rest) = command.strip_prefix("set ").map(str::trim) {
+        execute_set_command(app, tx, server_tx, rest).await?;
+        return Ok(());
+    }
+
+    match command.as_str() {
+        "web on" => {
+            app.web_search = true;
+            app.status_message = Some("Web search enabled".to_string());
+        }
+        _ => {
+            app.status_message = Some(format!("Unknown command: :{command}"));
+        }
+    }
+    Ok(())
+}
+
+async fn execute_set_command(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    server_tx: &mut UnboundedSender<ClientRequest>,
+    rest: &str,
+) -> Result<()> {
+    let Some((key, raw_value)) = split_set_command(rest) else {
+        app.status_message = Some("Usage: :set <config-key> <value>".to_string());
+        return Ok(());
+    };
+    let key = key.trim().trim_start_matches('.');
+    let value = raw_value.trim();
+    if value.is_empty() {
+        app.status_message = Some(format!("Missing value for {key}"));
+        return Ok(());
+    }
+
+    match key {
+        "model" => app.model = value.to_string(),
+        "api_url" => app.api_url = value.to_string(),
+        "ollama_api_key" => app.ollama_api_key = optional_string_value(value),
+        "server_addr" => {
+            let new_tx = connect_server(tx.clone(), value).await?;
+            *server_tx = new_tx;
+            app.server_addr = value.to_string();
+        }
+        "system_prompt" => app.system_prompt = optional_string_value(value),
+        "bold_selection" => app.bold_selection = parse_command_bool(value)?,
+        "render_emojis" => {
+            app.render_emojis = parse_command_bool(value)?;
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "colors" => {
+            app.color_config = parse_toml_table_value(value)?;
+            app.theme = Theme::from_config(Some(&app.color_config));
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "syntax" => {
+            let table = parse_toml_table_value(value)?;
+            if let Some(enabled) = table.get("enabled").and_then(|v| v.as_bool()) {
+                app.syntax_enabled = enabled;
+            }
+            if let Some(theme_name) = table.get("theme_name").and_then(|v| v.as_str()) {
+                app.syntax_theme_name = theme_name.to_string();
+            }
+            if let Some(custom) = table.get("custom").and_then(|v| v.as_table()).cloned() {
+                app.syntax_custom = Some(custom);
+            }
+            app.syn_theme = build_syntect_theme(&app.syntax_theme_name, app.syntax_custom.as_ref());
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "syntax.enabled" => {
+            app.syntax_enabled = parse_command_bool(value)?;
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "syntax.theme_name" | "syntax_theme" => {
+            app.syntax_theme_name = value.to_string();
+            app.syn_theme = build_syntect_theme(&app.syntax_theme_name, app.syntax_custom.as_ref());
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "syntax.custom" => {
+            app.syntax_custom = Some(parse_toml_table_value(value)?);
+            app.syn_theme = build_syntect_theme(&app.syntax_theme_name, app.syntax_custom.as_ref());
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        "performance.stream_fps" => {
+            let fps = value.parse::<u64>().with_context(|| format!("parse {key}"))?.max(1);
+            app.stream_throttle = Duration::from_millis(1000 / fps);
+        }
+        "performance.input_poll_ms" => {
+            let poll = value.parse::<u64>().with_context(|| format!("parse {key}"))?.max(1);
+            app.input_poll_ms.store(poll, Ordering::Relaxed);
+        }
+        "performance" => {
+            let table = parse_toml_table_value(value)?;
+            if let Some(fps) = table.get("stream_fps").and_then(toml_value_as_u64) {
+                app.stream_throttle = Duration::from_millis(1000 / fps.max(1));
+            }
+            if let Some(poll) = table.get("input_poll_ms").and_then(toml_value_as_u64) {
+                app.input_poll_ms.store(poll.max(1), Ordering::Relaxed);
+            }
+        }
+        "preview.preview_fmt" => app.preview_fmt = value.to_string(),
+        "preview.preview_open" => app.preview_open = value.to_string(),
+        "preview" => {
+            let table = parse_toml_table_value(value)?;
+            if let Some(fmt) = table.get("preview_fmt").and_then(|v| v.as_str()) {
+                app.preview_fmt = fmt.to_string();
+            }
+            if let Some(open) = table.get("preview_open").and_then(|v| v.as_str()) {
+                app.preview_open = open.to_string();
+            }
+        }
+        "options" => app.options = Some(parse_options_object(value)?),
+        "num_ctx" => set_option_value(app, "num_ctx", parse_config_value(value)),
+        _ if key.starts_with("options.") => {
+            set_option_value(app, key.trim_start_matches("options."), parse_config_value(value));
+        }
+        _ if key.starts_with("colors.") => {
+            let color_key = key.trim_start_matches("colors.");
+            app.color_config.insert(color_key.to_string(), toml::Value::String(value.to_string()));
+            app.theme = Theme::from_config(Some(&app.color_config));
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        _ if key.starts_with("syntax.custom.") => {
+            let custom_key = key.trim_start_matches("syntax.custom.");
+            let mut custom = app.syntax_custom.take().unwrap_or_default();
+            custom.insert(custom_key.to_string(), parse_toml_scalar_value(value));
+            app.syntax_custom = Some(custom);
+            app.syn_theme = build_syntect_theme(&app.syntax_theme_name, app.syntax_custom.as_ref());
+            app.render_cache.clear();
+            app.pending_cache = None;
+        }
+        _ => {
+            app.status_message = Some(format!("Unknown config key: {key}"));
+            return Ok(());
+        }
+    }
+
+    app.status_message = Some(format!("Set {key}"));
+    Ok(())
+}
+
+fn split_set_command(rest: &str) -> Option<(&str, &str)> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((key, value)) = trimmed.split_once('=') {
+        return Some((key.trim(), value.trim()));
+    }
+    let idx = trimmed.find(char::is_whitespace)?;
+    Some((&trimmed[..idx], trimmed[idx..].trim()))
+}
+
+fn optional_string_value(value: &str) -> Option<String> {
+    match value.trim() {
+        "" | "none" | "null" => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn parse_command_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
+        _ => Err(anyhow!("expected boolean value, got {value}")),
+    }
+}
+
+fn parse_toml_table_value(value: &str) -> Result<toml::value::Table> {
+    let parsed = toml_value_from_text(value)?;
+    parsed
+        .as_table()
+        .cloned()
+        .ok_or_else(|| anyhow!("expected TOML table value"))
+}
+
+fn parse_toml_scalar_value(value: &str) -> toml::Value {
+    toml_value_from_text(value).unwrap_or_else(|_| toml::Value::String(value.to_string()))
+}
+
+fn toml_value_from_text(value: &str) -> Result<toml::Value> {
+    let wrapper = format!("value = {value}");
+    let table: toml::value::Table = toml::from_str(&wrapper).with_context(|| format!("parse TOML value {value}"))?;
+    table
+        .get("value")
+        .cloned()
+        .ok_or_else(|| anyhow!("missing TOML value"))
+}
+
+fn parse_options_object(value: &str) -> Result<JsonValue> {
+    match parse_config_value(value) {
+        JsonValue::Object(map) => Ok(JsonValue::Object(map)),
+        other => Err(anyhow!("options must be an object/table, got {other}")),
+    }
+}
+
+fn parse_config_value(value: &str) -> JsonValue {
+    serde_json::from_str(value)
+        .or_else(|_| toml_value_from_text(value).and_then(|v| serde_json::to_value(v).map_err(Into::into)))
+        .unwrap_or_else(|_| JsonValue::String(value.to_string()))
+}
+
+fn set_option_value(app: &mut App, key: &str, value: JsonValue) {
+    let options = app.options.get_or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
+    if !options.is_object() {
+        *options = JsonValue::Object(serde_json::Map::new());
+    }
+    if let Some(map) = options.as_object_mut() {
+        map.insert(key.to_string(), value);
+    }
+}
+
+fn toml_value_as_u64(value: &toml::Value) -> Option<u64> {
+    value.as_integer().and_then(|v| u64::try_from(v).ok())
+}
+
+fn command_byte_index(input: &str, col: usize) -> usize {
+    UnicodeSegmentation::graphemes(input, true)
+        .take(col)
+        .map(str::len)
+        .sum()
+}
+
 fn mime_type_for_path(path: &std::path::Path) -> String {
     match path
         .extension()
@@ -599,7 +869,7 @@ async fn handle_key(
     key: KeyEvent,
     app: &mut App,
     tx: &UnboundedSender<AppEvent>,
-    server_tx: &UnboundedSender<ClientRequest>,
+    server_tx: &mut UnboundedSender<ClientRequest>,
 ) -> Result<()> {
     // Popups
     match &app.popup {
@@ -729,30 +999,6 @@ async fn handle_key(
             // Send with Ctrl+S
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let input = app.input.trim().to_string();
-                if let Some(path) = input.strip_prefix(":attach ").map(str::trim).filter(|p| !p.is_empty()) {
-                    match attachment_from_path(path) {
-                        Ok(attachment) => {
-                            let name = attachment.path.clone();
-                            app.pending_attachments.push(attachment);
-                            app.input.clear();
-                            app.input_cursor_line = 0;
-                            app.input_cursor_col = 0;
-                            app.input_top_line = 0;
-                            app.status_message = Some(format!("Attached image {name}"));
-                        }
-                        Err(e) => {
-                            app.messages.push(Message {
-                                role: Role::System,
-                                content: format!("Attachment failed: {e}"),
-                                created_ts: now_sec(),
-                                thinking: None,
-                                attachments: Vec::new(),
-                                sources: Vec::new(),
-                            });
-                        }
-                    }
-                    return Ok(());
-                }
                 if input.is_empty() && app.pending_attachments.is_empty() {
                     return Ok(());
                 }
@@ -976,6 +1222,57 @@ async fn handle_key(
             }
             _ => {}
         },
+        Mode::Command => match key.code {
+            KeyCode::Esc => {
+                app.command_input.clear();
+                app.command_cursor_col = 0;
+                app.mode = Mode::Normal;
+                app.status_message = Some("Command cancelled".to_string());
+            }
+            KeyCode::Enter => {
+                if let Err(e) = execute_command_palette(app, tx, server_tx).await {
+                    app.status_message = Some(format!("Command failed: {e}"));
+                }
+                app.command_input.clear();
+                app.command_cursor_col = 0;
+                app.mode = Mode::Normal;
+            }
+            KeyCode::Backspace => {
+                if app.command_cursor_col > 0 {
+                    let start = command_byte_index(&app.command_input, app.command_cursor_col - 1);
+                    let end = command_byte_index(&app.command_input, app.command_cursor_col);
+                    app.command_input.replace_range(start..end, "");
+                    app.command_cursor_col -= 1;
+                }
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.command_cursor_col > 0 {
+                    let start = command_byte_index(&app.command_input, app.command_cursor_col - 1);
+                    let end = command_byte_index(&app.command_input, app.command_cursor_col);
+                    app.command_input.replace_range(start..end, "");
+                    app.command_cursor_col -= 1;
+                }
+            }
+            KeyCode::Left => {
+                app.command_cursor_col = app.command_cursor_col.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let len = UnicodeSegmentation::graphemes(app.command_input.as_str(), true).count();
+                app.command_cursor_col = (app.command_cursor_col + 1).min(len);
+            }
+            KeyCode::Char(c) => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    return Ok(());
+                }
+                let byte_cursor = command_byte_index(&app.command_input, app.command_cursor_col);
+                app.command_input.insert(byte_cursor, c);
+                app.command_cursor_col += 1;
+            }
+            _ => {}
+        },
         Mode::Normal => {
             if let KeyCode::Char('?') = key.code {
                 app.popup = Popup::Help;
@@ -983,6 +1280,12 @@ async fn handle_key(
             }
 
             match key.code {
+                KeyCode::Char(':') => {
+                    app.command_input.clear();
+                    app.command_cursor_col = 0;
+                    app.mode = Mode::Command;
+                    app.status_message = Some("Command mode".to_string());
+                }
                 KeyCode::Char('/') => {
                     if app.focus == Focus::Sidebar {
                         app.sidebar_search_active = true;
@@ -1252,4 +1555,22 @@ async fn handle_key(
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn splits_set_commands_with_spaces_or_equals() {
+        assert_eq!(split_set_command("model qwen3.6:27b"), Some(("model", "qwen3.6:27b")));
+        assert_eq!(split_set_command("options.num_ctx = 32768"), Some(("options.num_ctx", "32768")));
+    }
+
+    #[test]
+    fn parses_config_values_for_set_options() {
+        assert_eq!(parse_config_value("32768"), JsonValue::from(32768));
+        assert_eq!(parse_config_value("true"), JsonValue::from(true));
+        assert_eq!(parse_config_value("qwen3.6:27b"), JsonValue::from("qwen3.6:27b"));
+    }
 }

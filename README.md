@@ -94,6 +94,9 @@ If your prompt includes one or more full `http://` or `https://` URLs, WEB mode 
 When debugging WEB mode, run the server with `TUILLAMA_DEBUG_WEB=1` to print per-request traces (tool calls, endpoints, statuses, extracted URLs) to stderr.
 
 You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
+Set `render_emojis = false` in config to suppress emoji graphemes in rendered Markdown when your terminal/font does not handle them well.
+
+Command mode opens from normal mode with `:` and executes commands with Enter. Currently supported commands are `:attach /path/to/image` to queue an image attachment for the next message, `:web on` to enable web search, and `:set <config-key> <value>` to update runtime config without writing the config file. Examples: `:set model qwen3.6:27b`, `:set options.num_ctx 32768`, `:set render_emojis false`, and `:set colors.heading1 yellow`.
 
 ## Limitations (for now)
 
