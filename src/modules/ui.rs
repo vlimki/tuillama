@@ -233,6 +233,7 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
                 Line::from(""),
                 Line::from(Span::styled("Chat", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
                 Line::from("  h/l: move focus, i: insert, v: visual, p: paste clipboard"),
+                Line::from("  VISUAL: j/k select message, y yank, c cycle code blocks, m whole message"),
                 Line::from("  r: refresh screen"),
                 Line::from("  Sidebar focus: / search chats, Enter apply, Esc clear"),
                 Line::from("  ↑/k: scroll up, ↓/j: scroll down, g: top, G: bottom"),
@@ -594,7 +595,15 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: &Message, inner_w: u16, selected: bool) {
+fn render_message_block(
+    text: &mut Text<'static>,
+    app: &mut App,
+    idx: usize,
+    m: &Message,
+    inner_w: u16,
+    selected: bool,
+    selected_code_block: Option<usize>,
+) {
     let timestamp = message_timestamp(m, app.current_created_ts);
     let (label, color) = match m.role {
         Role::User => ("You", app.theme.user_prefix),
@@ -658,7 +667,18 @@ fn render_message_block(text: &mut Text<'static>, app: &mut App, idx: usize, m: 
 
     let msg_h = message_hash(m);
     let key = (idx, inner_w);
-    let body = if let Some((h, cached)) = app.render_cache.get(&key) {
+    let body = if let Some(code_block) = selected_code_block {
+        render_markdown_to_text_with_selected_code_block(
+            &m.content,
+            &app.theme,
+            inner_w,
+            &app.syn_ss,
+            &app.syn_theme,
+            app.syntax_enabled,
+            app.render_emojis,
+            Some(code_block),
+        )
+    } else if let Some((h, cached)) = app.render_cache.get(&key) {
         if *h == msg_h {
             cached.clone()
         } else {
@@ -756,9 +776,18 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let mut text = Text::default();
     let sel = app.selected_msg.unwrap_or_else(|| app.messages.len().saturating_sub(1));
     for i in 0..app.messages.len() {
-        let selected = app.focus == Focus::Chat && app.mode == Mode::Visual && i == sel;
+        let visual_match = app.focus == Focus::Chat && app.mode == Mode::Visual && i == sel;
+        let selected = visual_match && app.visual_selection == VisualSelection::Message;
+        let selected_code_block = if visual_match {
+            match app.visual_selection {
+                VisualSelection::CodeBlock(code_block) => Some(code_block),
+                VisualSelection::Message => None,
+            }
+        } else {
+            None
+        };
         let m = app.messages[i].clone();
-        render_message_block(&mut text, app, i, &m, inner_w, selected);
+        render_message_block(&mut text, app, i, &m, inner_w, selected, selected_code_block);
     }
 
     let has_pending_stream = app.sending
@@ -766,7 +795,10 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         || !app.pending_thinking.trim().is_empty()
         || !app.pending_sources.is_empty();
     if has_pending_stream {
-        let selected = app.focus == Focus::Chat && app.mode == Mode::Visual && app.messages.len() == sel;
+        let selected = app.focus == Focus::Chat
+            && app.mode == Mode::Visual
+            && app.messages.len() == sel
+            && app.visual_selection == VisualSelection::Message;
         let pending = Message {
             role: Role::Assistant,
             content: if app.pending_assistant.is_empty() { "…".to_string() } else { app.pending_assistant.clone() },
@@ -775,7 +807,7 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             attachments: Vec::new(),
             sources: app.pending_sources.clone(),
         };
-        render_message_block(&mut text, app, app.messages.len(), &pending, inner_w, selected);
+        render_message_block(&mut text, app, app.messages.len(), &pending, inner_w, selected, None);
     }
 
     let wrapped_line_count = wrapped_text_height(&text, inner_w.max(1));
@@ -822,11 +854,26 @@ fn draw_chat(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             Style::default().fg(app.theme.status_hint),
         )
     };
+    let visual_hint = if app.mode == Mode::Visual {
+        match app.visual_selection {
+            VisualSelection::Message => Span::styled(
+                " • y yank message • c code blocks",
+                Style::default().fg(app.theme.status_hint),
+            ),
+            VisualSelection::CodeBlock(idx) => Span::styled(
+                format!(" • code block {} • y yank • c next", idx + 1),
+                Style::default().fg(app.theme.status_hint),
+            ),
+        }
+    } else {
+        Span::raw("")
+    };
     let input_title_line = Line::from(vec![
         Span::styled(format!(" {} ", base), Style::default().fg(app.theme.title_input).add_modifier(Modifier::BOLD)),
         Span::styled(format!("[{}]", mode_name), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
         help_hint,
         attachment_hint,
+        visual_hint,
     ]);
 
     let input_block = section_block(
