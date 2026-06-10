@@ -93,6 +93,31 @@ fn approx_token_count(text: &str) -> usize {
     ((chars as f32) / 4.0).ceil() as usize
 }
 
+fn context_window_tokens(app: &App) -> Option<usize> {
+    app.options.as_ref().and_then(|options| {
+        options.get("num_ctx").and_then(|value| {
+            value
+                .as_u64()
+                .map(|n| n as usize)
+                .or_else(|| value.as_str().and_then(|s| s.parse::<usize>().ok()))
+        })
+    })
+}
+
+fn format_token_budget(tokens: usize, context_window: usize) -> String {
+    format!("{} / {}", compact_token_count(tokens), compact_token_count(context_window))
+}
+
+fn compact_token_count(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 fn wrapped_text_height(text: &Text, width: u16) -> u16 {
     let width = width.max(1) as usize;
     text.lines
@@ -291,14 +316,28 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         items.push(ListItem::new(lines).style(style));
     }
 
-    let list = List::new(items).highlight_style(Style::default().bg(app.theme.sidebar_selected_bg));
-    frame.render_widget(list, inner);
+    let list = List::new(items).highlight_style(if app.focus == Focus::Sidebar {
+        Style::default().bg(app.theme.sidebar_selected_bg)
+    } else {
+        Style::default()
+    });
+    let mut state = ListState::default().with_selected(if app.chats.is_empty() {
+        None
+    } else {
+        Some(app.sidebar_idx + 2)
+    });
+    frame.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let total_chars: usize = app.messages.iter().map(|m| m.content.chars().count()).sum::<usize>()
-        + app.pending_assistant.chars().count();
+        + app.pending_assistant.chars().count()
+        + app.input.chars().count()
+        + app.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
     let total_tokens = approx_token_count(&"x".repeat(total_chars));
+    let context_budget = context_window_tokens(app)
+        .map(|num_ctx| format_token_budget(total_tokens, num_ctx))
+        .unwrap_or_else(|| "unknown".to_string());
     let status_value = if app.sending { "streaming" } else { "idle" };
     let mode_value = match app.mode {
         Mode::Normal => "normal",
@@ -324,8 +363,8 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),
-            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Min(10),
         ])
         .split(inner);
@@ -387,6 +426,10 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled(total_tokens.to_string(), Style::default().fg(app.theme.stats_value).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
+            Span::styled("context: ", Style::default().fg(app.theme.stats_label)),
+            Span::styled(context_budget, Style::default().fg(app.theme.stats_value).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
             Span::styled("last activity: ", Style::default().fg(app.theme.stats_label)),
         ]),
         Line::from(vec![
@@ -403,7 +446,7 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("throughput: ", Style::default().fg(app.theme.stats_label)),
+            Span::styled("tokens/sec: ", Style::default().fg(app.theme.stats_label)),
             Span::styled(tps_value, Style::default().fg(app.theme.stats_value).add_modifier(Modifier::BOLD)),
         ]),
     ];
@@ -531,27 +574,8 @@ fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Sources", Style::default().fg(app.theme.heading2).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Ctrl+P toggles this panel.", Style::default().fg(app.theme.status_hint))),
     ];
-    let latest_sources = active_stream
-        .map(|stream| stream.sources.as_slice())
-        .filter(|sources| !sources.is_empty())
-        .or_else(|| app.messages.iter().rev().find(|m| !m.sources.is_empty()).map(|m| m.sources.as_slice()));
-    let mut trace = trace;
-    if let Some(sources) = latest_sources {
-        for (idx, source) in sources.iter().take(4).enumerate() {
-            trace.push(Line::from(vec![
-                Span::styled(format!("{}.", idx + 1), Style::default().fg(app.theme.stats_label)),
-                Span::raw(" "),
-                Span::styled(source.title.clone(), Style::default().fg(app.theme.stats_value)),
-            ]));
-            trace.push(Line::from(Span::styled(source.url.clone(), Style::default().fg(app.theme.status_hint))));
-        }
-    } else {
-        trace.push(Line::from(Span::styled("No sources yet", Style::default().fg(app.theme.status_hint))));
-    }
-    trace.push(Line::from(""));
-    trace.push(Line::from(Span::styled("Ctrl+P toggles this panel.", Style::default().fg(app.theme.status_hint))));
     frame.render_widget(
         Paragraph::new(Text::from(trace))
             .wrap(Wrap { trim: false })

@@ -96,11 +96,10 @@ When debugging WEB mode, run the server with `TUILLAMA_DEBUG_WEB=1` to print per
 You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
 Set `render_emojis = false` in config to suppress emoji graphemes in rendered Markdown when your terminal/font does not handle them well.
 
-Command mode opens from normal mode with `:` and executes commands with Enter. Currently supported commands are `:attach /path/to/image` to queue an image attachment for the next message and `:web on` to enable web search.
+Command mode opens from normal mode with `:` and executes commands with Enter. Supported commands include `:attach /path/to/image` to queue an image attachment for the next message, `:web on` to enable web search, and `:set <option> <value>` to change config-backed settings for the current session without writing the config file. For example, use `:set model qwen3.6:27b`, `:set api_url http://localhost:11434/api/chat`, `:set num_ctx 32768`, `:set temperature 0.7`, `:set syntax.enabled false`, `:set colors.stats_accent green`, or `:set preview.preview_fmt pdf`. Bare unknown `:set` keys are treated as Ollama `[options]` entries, so `:set num_ctx 32768` and `:set options.num_ctx 32768` are equivalent.
 
 ## Limitations (for now)
 
-* Models and custom options require manually editing the config file and restarting the app
 * The UI is still minimal and rough around the edges
 * No image support (this should be relatively easy to fix)
 * A bunch of other stuff, probably, since the app is so minimal
