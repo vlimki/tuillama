@@ -100,3 +100,19 @@ number = "magenta"
 operator = "white"
 punct = "light_gray"
 text = "white"
+
+# Tool registry profile: off, web, files, workspace, code, or full.
+[tools]
+profile = "off"
+
+[tools.policy]
+confirm_medium = false
+confirm_risky = true
+deny_dangerous = true
+
+# Scoped workspace for read-only local file tools.
+[workspace]
+root = "~/projects/foo"
+allow_read = true
+allow_write = false
+max_file_bytes = 200000

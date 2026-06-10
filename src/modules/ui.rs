@@ -659,7 +659,7 @@ fn render_message_block(
         for attachment in &m.attachments {
             text.push_line(Line::from(vec![
                 Span::styled("Attachment: ", Style::default().fg(app.theme.stats_label).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{} ({})", attachment.path, attachment.mime_type), Style::default().fg(app.theme.status_hint)),
+                Span::styled(format!("{} ({})", attachment.original_path, attachment.mime_type), Style::default().fg(app.theme.status_hint)),
             ]));
         }
         text.push_line(Line::from(""));

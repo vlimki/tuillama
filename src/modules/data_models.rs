@@ -22,9 +22,19 @@ struct Message {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Attachment {
-    path: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    original_path: String,
     mime_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    size_bytes: u64,
+    #[serde(default)]
+    store_path: String,
+    #[allow(dead_code)]
+    #[serde(default, skip_serializing)]
     data_base64: Option<String>,
 }
 

@@ -314,6 +314,54 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                ServerEvent::ToolCallStarted {
+                    request_id,
+                    chat_id,
+                    name,
+                    ..
+                } => {
+                    if let Some(active) = app.active_streams.get_mut(&chat_id) {
+                        if active.request_id == request_id {
+                            let message = format!("Running tool {name}");
+                            active.status = Some(message.clone());
+                            if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                                app.status_message = Some(message);
+                            }
+                        }
+                    }
+                }
+                ServerEvent::ToolCallFinished {
+                    request_id,
+                    chat_id,
+                    result_summary,
+                    ..
+                } => {
+                    if let Some(active) = app.active_streams.get_mut(&chat_id) {
+                        if active.request_id == request_id {
+                            let message = format!("Tool finished: {result_summary}");
+                            active.status = Some(message.clone());
+                            if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                                app.status_message = Some(message);
+                            }
+                        }
+                    }
+                }
+                ServerEvent::ToolCallFailed {
+                    request_id,
+                    chat_id,
+                    error,
+                    ..
+                } => {
+                    if let Some(active) = app.active_streams.get_mut(&chat_id) {
+                        if active.request_id == request_id {
+                            let message = format!("Tool failed: {error}");
+                            active.status = Some(message.clone());
+                            if app.current_chat_id.as_deref() == Some(chat_id.as_str()) {
+                                app.status_message = Some(message);
+                            }
+                        }
+                    }
+                }
             },
         }
 
@@ -436,6 +484,8 @@ fn now_sec() -> i64 {
         .as_secs() as i64
 }
 
+const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+
 fn attachment_from_path(path_text: &str) -> Result<Attachment> {
     let expanded = if let Some(rest) = path_text.strip_prefix("~/") {
         std::env::var("HOME")
@@ -446,14 +496,28 @@ fn attachment_from_path(path_text: &str) -> Result<Attachment> {
         PathBuf::from(path_text)
     };
     let data = fs::read(&expanded).with_context(|| format!("read attachment {}", expanded.display()))?;
-    let mime_type = mime_type_for_path(&expanded);
-    if !mime_type.starts_with("image/") {
-        return Err(anyhow!("only image attachments are supported for now"));
+    if data.len() as u64 > MAX_ATTACHMENT_BYTES {
+        return Err(anyhow!("attachment exceeds max size of {} bytes", MAX_ATTACHMENT_BYTES));
+    }
+    let mime_type = sniff_mime_type(&expanded, &data);
+    let sha256 = format!("{:x}", Sha256::digest(&data));
+    let store_dir = ProjectDirs::from("dev", "example", "tuillama")
+        .ok_or_else(|| anyhow!("unable to resolve data dir"))?
+        .data_local_dir()
+        .join("attachments");
+    fs::create_dir_all(&store_dir).with_context(|| format!("create {}", store_dir.display()))?;
+    let store_path = store_dir.join(&sha256);
+    if !store_path.exists() {
+        fs::write(&store_path, &data).with_context(|| format!("write {}", store_path.display()))?;
     }
     Ok(Attachment {
-        path: expanded.display().to_string(),
+        id: sha256.chars().take(16).collect(),
+        original_path: expanded.display().to_string(),
         mime_type,
-        data_base64: Some(general_purpose::STANDARD.encode(data)),
+        sha256,
+        size_bytes: data.len() as u64,
+        store_path: store_path.display().to_string(),
+        data_base64: None,
     })
 }
 
@@ -475,9 +539,9 @@ fn execute_command_palette(app: &mut App) {
     if let Some(path) = command.strip_prefix("attach ").map(str::trim).filter(|p| !p.is_empty()) {
         match attachment_from_path(path) {
             Ok(attachment) => {
-                let name = attachment.path.clone();
+                let name = attachment.original_path.clone();
                 app.pending_attachments.push(attachment);
-                app.status_message = Some(format!("Attached image {name}"));
+                app.status_message = Some(format!("Attached file {name}"));
             }
             Err(e) => {
                 app.messages.push(Message {
@@ -659,6 +723,22 @@ fn command_byte_index(input: &str, col: usize) -> usize {
         .sum()
 }
 
+fn sniff_mime_type(path: &std::path::Path, data: &[u8]) -> String {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png".to_string();
+    }
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "image/jpeg".to_string();
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return "image/gif".to_string();
+    }
+    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return "image/webp".to_string();
+    }
+    mime_type_for_path(path)
+}
+
 fn mime_type_for_path(path: &std::path::Path) -> String {
     match path
         .extension()
@@ -672,6 +752,8 @@ fn mime_type_for_path(path: &std::path::Path) -> String {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
+        "txt" | "md" | "rs" | "toml" | "json" | "yaml" | "yml" => "text/plain",
+        "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }
     .to_string()

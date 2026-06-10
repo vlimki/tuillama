@@ -1,11 +1,14 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use directories::ProjectDirs;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::{
     collections::{HashMap, HashSet},
-    env,
+    env, fs,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::{
@@ -37,9 +40,19 @@ struct Message {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Attachment {
-    path: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    original_path: String,
     mime_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    size_bytes: u64,
+    #[serde(default)]
+    store_path: String,
+    #[allow(dead_code)]
+    #[serde(default, skip_serializing)]
     data_base64: Option<String>,
 }
 
@@ -61,6 +74,9 @@ const TOOL_RESULT_LIMIT: usize = 8_000;
 struct ServerConfig {
     server_addr: String,
     max_tool_iters: usize,
+    tool_profile: ToolProfile,
+    workspace: WorkspaceConfig,
+    tool_policy: ToolPolicy,
 }
 
 impl Default for ServerConfig {
@@ -68,12 +84,149 @@ impl Default for ServerConfig {
         Self {
             server_addr: DEFAULT_SERVER_ADDR.to_string(),
             max_tool_iters: DEFAULT_MAX_TOOL_ITERS,
+            tool_profile: ToolProfile::Off,
+            workspace: WorkspaceConfig::default(),
+            tool_policy: ToolPolicy::default(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ToolProfile {
+    Off,
+    Web,
+    Files,
+    Workspace,
+    Code,
+    Full,
+}
+
+impl ToolProfile {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "web" => Ok(Self::Web),
+            "files" => Ok(Self::Files),
+            "workspace" => Ok(Self::Workspace),
+            "code" => Ok(Self::Code),
+            "full" => Ok(Self::Full),
+            other => Err(anyhow!("unknown tool profile: {other}")),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceConfig {
+    root: PathBuf,
+    allow_read: bool,
+    allow_write: bool,
+    max_file_bytes: u64,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            root: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            allow_read: true,
+            allow_write: false,
+            max_file_bytes: 200_000,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ToolRisk {
+    Safe,
+    Medium,
+    Risky,
+    Dangerous,
+}
+
+#[derive(Clone, Debug)]
+struct ToolPolicy {
+    confirm_medium: bool,
+    confirm_risky: bool,
+    deny_dangerous: bool,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self {
+            confirm_medium: false,
+            confirm_risky: true,
+            deny_dangerous: true,
+        }
+    }
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("~"))
+            .join(rest)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn config_file_path() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "example", "tuillama")
+        .map(|proj| proj.config_dir().join("config.toml"))
+}
+
+fn apply_file_config(config: &mut ServerConfig) {
+    let Some(path) = config_file_path() else {
+        return;
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return;
+    };
+
+    if let Some(workspace) = value.get("workspace").and_then(|v| v.as_table()) {
+        if let Some(root) = workspace.get("root").and_then(|v| v.as_str()) {
+            config.workspace.root = expand_home(root);
+        }
+        if let Some(allow_read) = workspace.get("allow_read").and_then(|v| v.as_bool()) {
+            config.workspace.allow_read = allow_read;
+        }
+        if let Some(allow_write) = workspace.get("allow_write").and_then(|v| v.as_bool()) {
+            config.workspace.allow_write = allow_write;
+        }
+        if let Some(max_file_bytes) = workspace.get("max_file_bytes").and_then(|v| v.as_integer()) {
+            if max_file_bytes > 0 {
+                config.workspace.max_file_bytes = max_file_bytes as u64;
+            }
+        }
+    }
+
+    if let Some(tools) = value.get("tools").and_then(|v| v.as_table()) {
+        if let Some(profile) = tools.get("profile").and_then(|v| v.as_str()) {
+            if let Ok(profile) = ToolProfile::parse(profile) {
+                config.tool_profile = profile;
+            }
+        }
+        if let Some(policy) = tools.get("policy").and_then(|v| v.as_table()) {
+            if let Some(confirm_medium) = policy.get("confirm_medium").and_then(|v| v.as_bool()) {
+                config.tool_policy.confirm_medium = confirm_medium;
+            }
+            if let Some(confirm_risky) = policy.get("confirm_risky").and_then(|v| v.as_bool()) {
+                config.tool_policy.confirm_risky = confirm_risky;
+            }
+            if let Some(deny_dangerous) = policy.get("deny_dangerous").and_then(|v| v.as_bool()) {
+                config.tool_policy.deny_dangerous = deny_dangerous;
+            }
         }
     }
 }
 
 fn parse_server_config() -> Result<ServerConfig> {
     let mut config = ServerConfig::default();
+    apply_file_config(&mut config);
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -83,6 +236,12 @@ fn parse_server_config() -> Result<ServerConfig> {
                     .next()
                     .ok_or_else(|| anyhow!("missing value for --addr"))?;
                 config.server_addr = value;
+            }
+            "--tool-profile" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --tool-profile"))?;
+                config.tool_profile = ToolProfile::parse(&value)?;
             }
             "--max-tool-iters" => {
                 let value = args
@@ -98,7 +257,7 @@ fn parse_server_config() -> Result<ServerConfig> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: tuillama-server [--addr <IP:PORT>] [--max-tool-iters <N>]\n\nDefaults:\n  --addr {}\n  --max-tool-iters {}",
+                    "Usage: tuillama-server [--addr <IP:PORT>] [--tool-profile <off|web|files|workspace|code|full>] [--max-tool-iters <N>]\n\nDefaults:\n  --addr {}\n  --max-tool-iters {}",
                     DEFAULT_SERVER_ADDR, DEFAULT_MAX_TOOL_ITERS
                 );
                 std::process::exit(0);
@@ -333,45 +492,294 @@ fn normalize_tool_name(name: &str) -> &str {
     }
 }
 
-fn web_tools() -> Vec<JsonValue> {
-    vec![
+#[derive(Clone)]
+struct ToolContext {
+    client: reqwest::Client,
+    headers: HeaderMap,
+    workspace: WorkspaceConfig,
+}
+
+type ToolResult = Result<JsonValue>;
+
+#[async_trait]
+trait Tool: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn risk(&self) -> ToolRisk;
+    fn schema(&self) -> JsonValue;
+    async fn call(&self, args: JsonValue, ctx: ToolContext) -> ToolResult;
+}
+
+struct WebSearchTool;
+struct WebFetchTool;
+struct FileListTool;
+struct FileReadTool;
+struct FileSearchTool;
+struct WorkspaceSearchTool;
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &'static str {
+        "web_search"
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Medium
+    }
+    fn schema(&self) -> JsonValue {
         json!({
             "type": "function",
             "function": {
-                "name": "web_search",
+                "name": self.name(),
                 "description": "Search the web for up-to-date information. Always pass the user's search text in the required `query` string field.",
                 "parameters": {
                     "type": "object",
                     "required": ["query"],
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query to send to the web search API."
-                        }
-                    },
+                    "properties": { "query": { "type": "string", "description": "The search query to send to the web search API." } },
                     "additionalProperties": false
                 }
             }
-        }),
+        })
+    }
+    async fn call(&self, args: JsonValue, ctx: ToolContext) -> ToolResult {
+        call_ollama_web_tool(&ctx.client, &ctx.headers, self.name(), args).await
+    }
+}
+
+#[async_trait]
+impl Tool for WebFetchTool {
+    fn name(&self) -> &'static str {
+        "web_fetch"
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Medium
+    }
+    fn schema(&self) -> JsonValue {
         json!({
             "type": "function",
             "function": {
-                "name": "web_fetch",
+                "name": self.name(),
                 "description": "Fetch the contents of a specific web page. Always pass the target page in the required `url` string field.",
                 "parameters": {
                     "type": "object",
                     "required": ["url"],
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The absolute http or https URL to fetch."
-                        }
-                    },
+                    "properties": { "url": { "type": "string", "description": "The absolute http or https URL to fetch." } },
                     "additionalProperties": false
                 }
             }
-        }),
+        })
+    }
+    async fn call(&self, args: JsonValue, ctx: ToolContext) -> ToolResult {
+        call_ollama_web_tool(&ctx.client, &ctx.headers, self.name(), args).await
+    }
+}
+
+fn file_tool_schema(
+    name: &'static str,
+    description: &'static str,
+    properties: JsonValue,
+    required: Vec<&'static str>,
+) -> JsonValue {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "required": required,
+                "properties": properties,
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+#[async_trait]
+impl Tool for FileListTool {
+    fn name(&self) -> &'static str {
+        "file_list"
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Safe
+    }
+    fn schema(&self) -> JsonValue {
+        file_tool_schema(
+            self.name(),
+            "List files under the configured workspace root. Optional path narrows the directory and optional glob filters entries.",
+            json!({
+                "path": { "type": "string", "description": "Workspace-relative directory to list." },
+                "glob": { "type": "string", "description": "Optional glob pattern such as **/*.rs." }
+            }),
+            vec![],
+        )
+    }
+    async fn call(&self, args: JsonValue, ctx: ToolContext) -> ToolResult {
+        ensure_workspace_read(&ctx.workspace)?;
+        let base = resolve_workspace_path(&ctx.workspace, arg_str(&args, "path").unwrap_or("."))?;
+        let glob_pat = arg_str(&args, "glob");
+        let mut entries = Vec::new();
+        if let Some(pattern) = glob_pat {
+            let pattern_path = base.join(pattern);
+            for entry in glob::glob(&pattern_path.to_string_lossy())?.take(500) {
+                let path = entry?;
+                if is_within_workspace(&ctx.workspace, &path)? {
+                    entries.push(file_entry_json(&ctx.workspace, &path));
+                }
+            }
+        } else {
+            for entry in fs::read_dir(&base)
+                .with_context(|| format!("read directory {}", base.display()))?
+                .take(500)
+            {
+                entries.push(file_entry_json(&ctx.workspace, &entry?.path()));
+            }
+        }
+        Ok(json!({ "root": ctx.workspace.root.display().to_string(), "entries": entries }))
+    }
+}
+
+#[async_trait]
+impl Tool for FileReadTool {
+    fn name(&self) -> &'static str {
+        "file_read"
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Safe
+    }
+    fn schema(&self) -> JsonValue {
+        file_tool_schema(
+            self.name(),
+            "Read a workspace file with line numbers for citations. Respects max_file_bytes.",
+            json!({
+                "path": { "type": "string", "description": "Workspace-relative file path." },
+                "start_line": { "type": "integer", "minimum": 1 },
+                "end_line": { "type": "integer", "minimum": 1 }
+            }),
+            vec!["path"],
+        )
+    }
+    async fn call(&self, args: JsonValue, ctx: ToolContext) -> ToolResult {
+        ensure_workspace_read(&ctx.workspace)?;
+        let rel = arg_str(&args, "path").ok_or_else(|| anyhow!("missing required path"))?;
+        let path = resolve_workspace_path(&ctx.workspace, rel)?;
+        let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("path is not a file");
+        }
+        if meta.len() > ctx.workspace.max_file_bytes {
+            bail!(
+                "file exceeds max_file_bytes ({})",
+                ctx.workspace.max_file_bytes
+            );
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let start = arg_u64(&args, "start_line").unwrap_or(1).max(1) as usize;
+        let end = arg_u64(&args, "end_line")
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX);
+        let mut lines = Vec::new();
+        for (idx, line) in text.lines().enumerate() {
+            let line_no = idx + 1;
+            if line_no >= start && line_no <= end {
+                lines.push(json!({ "line": line_no, "text": line }));
+            }
+        }
+        Ok(
+            json!({ "path": workspace_relative(&ctx.workspace, &path), "start_line": start, "end_line": end.min(text.lines().count()), "lines": lines }),
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for FileSearchTool {
+    fn name(&self) -> &'static str {
+        "file_search"
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Safe
+    }
+    fn schema(&self) -> JsonValue {
+        file_tool_schema(
+            self.name(),
+            "Search workspace files for a regex or literal query and return line-cited matches. Optional glob narrows files.",
+            json!({
+                "query": { "type": "string" },
+                "glob": { "type": "string", "description": "Optional glob pattern such as **/*.rs." }
+            }),
+            vec!["query"],
+        )
+    }
+    async fn call(&self, args: JsonValue, ctx: ToolContext) -> ToolResult {
+        search_workspace(args, ctx).await
+    }
+}
+
+#[async_trait]
+impl Tool for WorkspaceSearchTool {
+    fn name(&self) -> &'static str {
+        "workspace_search"
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Safe
+    }
+    fn schema(&self) -> JsonValue {
+        file_tool_schema(
+            self.name(),
+            "Search all readable files in the configured workspace and return line-cited matches.",
+            json!({
+                "query": { "type": "string" }
+            }),
+            vec!["query"],
+        )
+    }
+    async fn call(&self, args: JsonValue, ctx: ToolContext) -> ToolResult {
+        search_workspace(args, ctx).await
+    }
+}
+
+fn build_tool_registry(profile: ToolProfile, web_enabled: bool) -> HashMap<String, Arc<dyn Tool>> {
+    let effective_profile = if web_enabled && matches!(profile, ToolProfile::Off) {
+        ToolProfile::Web
+    } else {
+        profile
+    };
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    match effective_profile {
+        ToolProfile::Off => {}
+        ToolProfile::Web => tools.extend([
+            Arc::new(WebSearchTool) as Arc<dyn Tool>,
+            Arc::new(WebFetchTool),
+        ]),
+        ToolProfile::Files | ToolProfile::Workspace => tools.extend(file_tools()),
+        ToolProfile::Code | ToolProfile::Full => {
+            tools.extend([
+                Arc::new(WebSearchTool) as Arc<dyn Tool>,
+                Arc::new(WebFetchTool),
+            ]);
+            tools.extend(file_tools());
+        }
+    }
+    tools
+        .into_iter()
+        .map(|tool| (tool.name().to_string(), tool))
+        .collect()
+}
+
+fn file_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(FileListTool),
+        Arc::new(FileReadTool),
+        Arc::new(FileSearchTool),
+        Arc::new(WorkspaceSearchTool),
     ]
+}
+
+#[allow(dead_code)]
+fn web_tools() -> Vec<JsonValue> {
+    let registry = build_tool_registry(ToolProfile::Web, true);
+    ["web_search", "web_fetch"]
+        .iter()
+        .filter_map(|name| registry.get(*name).map(|tool| tool.schema()))
+        .collect()
 }
 
 fn normalize_tool_payload(tool_name: &str, raw_args: JsonValue) -> JsonValue {
@@ -423,103 +831,298 @@ fn normalize_tool_payload(tool_name: &str, raw_args: JsonValue) -> JsonValue {
     }
 }
 
-async fn run_tool_call(
+fn arg_str<'a>(args: &'a JsonValue, key: &str) -> Option<&'a str> {
+    args.as_object()?.get(key)?.as_str()
+}
+
+fn arg_u64(args: &JsonValue, key: &str) -> Option<u64> {
+    args.as_object()?.get(key)?.as_u64()
+}
+
+fn ensure_workspace_read(workspace: &WorkspaceConfig) -> Result<()> {
+    if workspace.allow_read {
+        Ok(())
+    } else {
+        bail!("workspace read access is disabled")
+    }
+}
+
+fn canonical_workspace_root(workspace: &WorkspaceConfig) -> Result<PathBuf> {
+    fs::canonicalize(&workspace.root)
+        .with_context(|| format!("canonicalize workspace root {}", workspace.root.display()))
+}
+
+fn is_within_workspace(workspace: &WorkspaceConfig, path: &Path) -> Result<bool> {
+    let root = canonical_workspace_root(workspace)?;
+    let canonical =
+        fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    Ok(canonical.starts_with(root))
+}
+
+fn resolve_workspace_path(workspace: &WorkspaceConfig, input: &str) -> Result<PathBuf> {
+    let raw = PathBuf::from(input);
+    if raw.is_absolute() {
+        bail!("absolute paths are not allowed; use workspace-relative paths");
+    }
+    let candidate = workspace.root.join(raw);
+    if !is_within_workspace(workspace, &candidate)? {
+        bail!("path escapes workspace root");
+    }
+    Ok(candidate)
+}
+
+fn workspace_relative(workspace: &WorkspaceConfig, path: &Path) -> String {
+    let root = canonical_workspace_root(workspace).unwrap_or_else(|_| workspace.root.clone());
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical
+        .strip_prefix(root)
+        .unwrap_or(&canonical)
+        .display()
+        .to_string()
+}
+
+fn file_entry_json(workspace: &WorkspaceConfig, path: &Path) -> JsonValue {
+    let meta = fs::metadata(path).ok();
+    json!({
+        "path": workspace_relative(workspace, path),
+        "is_dir": meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+        "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+    })
+}
+
+fn walk_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) -> Result<()> {
+    if out.len() >= limit {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if name == ".git" || name == "target" || name == "node_modules" {
+            continue;
+        }
+        let meta = fs::metadata(&path)?;
+        if meta.is_dir() {
+            walk_files(&path, out, limit)?;
+        } else if meta.is_file() {
+            out.push(path);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn search_workspace(args: JsonValue, ctx: ToolContext) -> ToolResult {
+    ensure_workspace_read(&ctx.workspace)?;
+    let query = arg_str(&args, "query").ok_or_else(|| anyhow!("missing required query"))?;
+    let re = regex::RegexBuilder::new(query)
+        .case_insensitive(true)
+        .build()
+        .ok();
+    let mut files = Vec::new();
+    if let Some(pattern) = arg_str(&args, "glob") {
+        let pattern_path = ctx.workspace.root.join(pattern);
+        for entry in glob::glob(&pattern_path.to_string_lossy())?.take(1000) {
+            let path = entry?;
+            if fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false)
+                && is_within_workspace(&ctx.workspace, &path)?
+            {
+                files.push(path);
+            }
+        }
+    } else {
+        walk_files(&ctx.workspace.root, &mut files, 1000)?;
+    }
+
+    let mut matches = Vec::new();
+    for path in files {
+        if matches.len() >= 200 {
+            break;
+        }
+        let meta = fs::metadata(&path)?;
+        if meta.len() > ctx.workspace.max_file_bytes {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for (idx, line) in text.lines().enumerate() {
+            let is_match = re.as_ref().map(|r| r.is_match(line)).unwrap_or_else(|| {
+                line.to_ascii_lowercase()
+                    .contains(&query.to_ascii_lowercase())
+            });
+            if is_match {
+                matches.push(json!({ "path": workspace_relative(&ctx.workspace, &path), "line": idx + 1, "text": line }));
+                if matches.len() >= 200 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(json!({ "query": query, "matches": matches }))
+}
+
+async fn call_ollama_web_tool(
     client: &reqwest::Client,
-    _api_base: &str,
     headers: &HeaderMap,
-    request_id: &str,
-    debug: bool,
     tool_name: &str,
     args: JsonValue,
-) -> JsonValue {
+) -> ToolResult {
     let normalized = normalize_tool_name(tool_name);
     let endpoint = match normalized {
-        // Use ollama.com instead of local API for these
-        "web_search" => format!("https://ollama.com/api/web_search"),
-        "web_fetch" => format!("https://ollama.com/api/web_fetch"),
-        other => {
-            return json!({
-                "error": format!("Tool {other} not found")
-            });
-        }
+        "web_search" => "https://ollama.com/api/web_search",
+        "web_fetch" => "https://ollama.com/api/web_fetch",
+        other => bail!("Tool {other} not found"),
     };
-
     let payload = normalize_tool_payload(normalized, args);
-
-    debug_log(
-        debug,
-        request_id,
-        format!("tool call start: name={normalized} endpoint={endpoint} payload={payload}"),
-    );
-
-    let resp = match client
+    let resp = client
         .post(endpoint)
         .headers(headers.clone())
         .json(&payload)
         .send()
-        .await
-    {
-        Ok(r) => {
-            debug_log(
-                debug,
-                request_id,
-                format!(
-                    "tool call http status: name={normalized} status={}",
-                    r.status()
-                ),
-            );
-            r
-        }
-        Err(e) => {
-            debug_log(
-                debug,
-                request_id,
-                format!("tool call network error: name={normalized} err={e}"),
-            );
-            return json!({
-                "error": format!("tool request failed: {e}")
-            });
-        }
-    };
-
+        .await?;
     if !resp.status().is_success() {
         let body = resp
             .text()
             .await
             .unwrap_or_else(|_| "unknown error".to_string());
-        debug_log(
-            debug,
-            request_id,
-            format!("tool call http error body: name={normalized} body={body}"),
-        );
-        return json!({
-            "error": format!("tool HTTP error: {body}")
-        });
+        bail!("tool HTTP error: {body}");
     }
+    let body = resp.text().await?;
+    let trimmed = truncate_for_context(&body, TOOL_RESULT_LIMIT);
+    Ok(serde_json::from_str::<JsonValue>(&trimmed).unwrap_or_else(|_| json!({ "text": trimmed })))
+}
 
-    let body = match resp.text().await {
-        Ok(b) => b,
+fn enforce_tool_policy(tool: &dyn Tool, policy: &ToolPolicy) -> Result<()> {
+    match tool.risk() {
+        ToolRisk::Safe => Ok(()),
+        ToolRisk::Medium if policy.confirm_medium => bail!("tool requires medium-risk approval"),
+        ToolRisk::Medium => Ok(()),
+        ToolRisk::Risky if policy.confirm_risky => bail!("tool requires risky approval"),
+        ToolRisk::Risky => Ok(()),
+        ToolRisk::Dangerous if policy.deny_dangerous => bail!("dangerous tool denied by policy"),
+        ToolRisk::Dangerous => Ok(()),
+    }
+}
+
+async fn run_tool_call(
+    registry: &HashMap<String, Arc<dyn Tool>>,
+    policy: &ToolPolicy,
+    ctx: ToolContext,
+    request_id: &str,
+    debug: bool,
+    tool_name: &str,
+    args: JsonValue,
+) -> JsonValue {
+    let normalized = normalize_tool_name(tool_name).to_string();
+    let payload = normalize_tool_payload(&normalized, args);
+    debug_log(
+        debug,
+        request_id,
+        format!("tool call start: name={normalized} payload={payload}"),
+    );
+    let Some(tool) = registry.get(&normalized) else {
+        return json!({ "error": format!("Tool {normalized} not found") });
+    };
+    if let Err(e) = enforce_tool_policy(tool.as_ref(), policy) {
+        return json!({ "error": e.to_string() });
+    }
+    match tool.call(payload, ctx).await {
+        Ok(value) => {
+            debug_log(
+                debug,
+                request_id,
+                format!("tool call response: name={normalized} response={value}"),
+            );
+            value
+        }
         Err(e) => {
             debug_log(
                 debug,
                 request_id,
-                format!("tool call read body error: name={normalized} err={e}"),
+                format!("tool call error: name={normalized} err={e}"),
             );
-            return json!({
-                "error": format!("failed to read tool response: {e}")
-            });
+            json!({ "error": e.to_string() })
         }
-    };
+    }
+}
 
-    let trimmed = truncate_for_context(&body, TOOL_RESULT_LIMIT);
-    let parsed =
-        serde_json::from_str::<JsonValue>(&trimmed).unwrap_or_else(|_| json!({ "text": trimmed }));
-    debug_log(
-        debug,
-        request_id,
-        format!("tool call parsed response: name={normalized} parsed={parsed}"),
-    );
-    parsed
+fn summarize_tool_result(value: &JsonValue) -> String {
+    if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+        return format!("error: {}", truncate_for_context(error, 180));
+    }
+    match value {
+        JsonValue::Object(map) => {
+            if let Some(entries) = map.get("entries").and_then(|v| v.as_array()) {
+                return format!("{} entries", entries.len());
+            }
+            if let Some(matches) = map.get("matches").and_then(|v| v.as_array()) {
+                return format!("{} matches", matches.len());
+            }
+            if let Some(lines) = map.get("lines").and_then(|v| v.as_array()) {
+                return format!("{} lines", lines.len());
+            }
+            format!("object with {} fields", map.len())
+        }
+        JsonValue::Array(items) => format!("{} items", items.len()),
+        other => truncate_for_context(&other.to_string(), 180),
+    }
+}
+
+async fn run_tool_call_with_events(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: &str,
+    chat_id: &str,
+    tool_call_id: String,
+    registry: &HashMap<String, Arc<dyn Tool>>,
+    policy: &ToolPolicy,
+    ctx: ToolContext,
+    debug: bool,
+    tool_name: &str,
+    args: JsonValue,
+) -> JsonValue {
+    let name = normalize_tool_name(tool_name).to_string();
+    let payload = normalize_tool_payload(&name, args);
+    let _ = send_server_event(
+        writer,
+        &ServerEvent::ToolCallStarted {
+            request_id: request_id.to_string(),
+            chat_id: chat_id.to_string(),
+            tool_call_id: tool_call_id.clone(),
+            name: name.clone(),
+            args: payload.clone(),
+        },
+    )
+    .await;
+    let result = run_tool_call(registry, policy, ctx, request_id, debug, &name, payload).await;
+    if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+        let _ = send_server_event(
+            writer,
+            &ServerEvent::ToolCallFailed {
+                request_id: request_id.to_string(),
+                chat_id: chat_id.to_string(),
+                tool_call_id,
+                error: error.to_string(),
+            },
+        )
+        .await;
+    } else {
+        let _ = send_server_event(
+            writer,
+            &ServerEvent::ToolCallFinished {
+                request_id: request_id.to_string(),
+                chat_id: chat_id.to_string(),
+                tool_call_id,
+                result_summary: summarize_tool_result(&result),
+            },
+        )
+        .await;
+    }
+    result
 }
 
 async fn process_agentic_web_search(
@@ -532,10 +1135,21 @@ async fn process_agentic_web_search(
     ollama_api_key: Option<String>,
     messages: Vec<Message>,
     debug: bool,
-    max_tool_iters: usize,
+    server_config: ServerConfig,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let headers = build_auth_headers(ollama_api_key.as_deref());
+    let registry = build_tool_registry(server_config.tool_profile, true);
+    let tool_schemas = registry
+        .values()
+        .map(|tool| tool.schema())
+        .collect::<Vec<_>>();
+    let tool_ctx = ToolContext {
+        client: client.clone(),
+        headers: headers.clone(),
+        workspace: server_config.workspace.clone(),
+    };
+    let max_tool_iters = server_config.max_tool_iters;
     let api_base = api_base_from_chat_url(&api_url);
     debug_log(
         debug,
@@ -545,8 +1159,6 @@ async fn process_agentic_web_search(
             messages.len()
         ),
     );
-
-    let tools = web_tools();
 
     let mut convo: Vec<JsonValue> = messages.iter().map(message_to_ollama_json).collect();
     let mut emitted_source_urls = HashSet::new();
@@ -569,11 +1181,14 @@ async fn process_agentic_web_search(
                 request_id,
                 format!("preflight web_search query={query}"),
             );
-            let search_result = run_tool_call(
-                &client,
-                &api_base,
-                &headers,
+            let search_result = run_tool_call_with_events(
+                writer,
                 request_id,
+                chat_id,
+                "preflight-web-search".to_string(),
+                &registry,
+                &server_config.tool_policy,
+                tool_ctx.clone(),
                 debug,
                 "web_search",
                 json!({ "query": query }),
@@ -606,11 +1221,14 @@ async fn process_agentic_web_search(
                     format!("Parsing website {url}"),
                 )
                 .await;
-                let fetched = run_tool_call(
-                    &client,
-                    &api_base,
-                    &headers,
+                let fetched = run_tool_call_with_events(
+                    writer,
                     request_id,
+                    chat_id,
+                    format!("preflight-web-fetch-{}", fetches.len() + 1),
+                    &registry,
+                    &server_config.tool_policy,
+                    tool_ctx.clone(),
                     debug,
                     "web_fetch",
                     json!({ "url": url }),
@@ -648,11 +1266,14 @@ async fn process_agentic_web_search(
                     format!("Parsing website {url}"),
                 )
                 .await;
-                let fetched = run_tool_call(
-                    &client,
-                    &api_base,
-                    &headers,
+                let fetched = run_tool_call_with_events(
+                    writer,
                     request_id,
+                    chat_id,
+                    format!("preflight-web-fetch-{}", fetches.len() + 1),
+                    &registry,
+                    &server_config.tool_policy,
+                    tool_ctx.clone(),
                     debug,
                     "web_fetch",
                     json!({ "url": url }),
@@ -717,7 +1338,7 @@ async fn process_agentic_web_search(
             "stream": false,
             "think": true,
             "options": options.clone(),
-            "tools": &tools,
+            "tools": &tool_schemas,
         });
 
         let resp = client
@@ -811,8 +1432,22 @@ async fn process_agentic_web_search(
             };
             let _ = send_status(writer, request_id, chat_id, status).await;
 
-            let tool_result = run_tool_call(
-                &client, &api_base, &headers, request_id, debug, tool_name, args,
+            let tool_call_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("tool-call-{}", iter + 1));
+            let tool_result = run_tool_call_with_events(
+                writer,
+                request_id,
+                chat_id,
+                tool_call_id,
+                &registry,
+                &server_config.tool_policy,
+                tool_ctx.clone(),
+                debug,
+                tool_name,
+                args,
             )
             .await;
             emit_sources_from_value(
@@ -1149,7 +1784,7 @@ async fn process_stream_request(
     ollama_api_key: Option<String>,
     web_search: bool,
     messages: Vec<Message>,
-    max_tool_iters: usize,
+    server_config: ServerConfig,
 ) {
     let debug = debug_enabled();
     debug_log(
@@ -1168,7 +1803,7 @@ async fn process_stream_request(
             ollama_api_key,
             messages,
             debug,
-            max_tool_iters,
+            server_config.clone(),
         )
         .await
         {
@@ -1242,7 +1877,7 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                         ollama_api_key,
                         web_search,
                         messages,
-                        cfg.max_tool_iters,
+                        (*cfg).clone(),
                     )
                     .await;
                 });
