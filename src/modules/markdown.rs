@@ -454,6 +454,18 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
+    fn push_blank_line(&mut self) {
+        self.flush_line();
+        let already_blank = self.text.lines.last().is_some_and(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.content.as_ref().trim().is_empty())
+        });
+        if !self.text.lines.is_empty() && !already_blank {
+            self.text.push_line(Line::default());
+        }
+    }
+
     fn inline_style(&self, attrs: InlineAttrs) -> Style {
         let mut style = Style::default();
         if attrs.link {
@@ -638,6 +650,7 @@ impl<'a> MarkdownRenderer<'a> {
         match block {
             MdBlock::Paragraph(inlines) => { self.render_inlines(inlines, Style::default()); self.flush_line(); }
             MdBlock::Heading { level, content } => {
+                self.push_blank_line();
                 let style = match level {
                     1 => Style::default().fg(self.theme.heading1).add_modifier(Modifier::BOLD),
                     2 => Style::default().fg(self.theme.heading2).add_modifier(Modifier::BOLD),
@@ -646,6 +659,7 @@ impl<'a> MarkdownRenderer<'a> {
                 };
                 self.render_inlines(content, style);
                 self.flush_line();
+                self.push_blank_line();
             }
             MdBlock::CodeBlock { lang, code } => self.render_code_block(lang.clone(), code.clone()),
             MdBlock::List { ordered, items, .. } => {
@@ -936,5 +950,12 @@ mod markdown_tests {
         assert!(lines.iter().any(|line| line.contains("‹x^2›")));
         assert!(lines.iter().any(|line| line.contains("⟦ E = mc^2 ⟧")));
         assert!(lines.iter().any(|line| line == "Not emphasis."));
+    }
+
+    #[test]
+    fn headings_have_breathing_room_without_leading_blank_space() {
+        let lines = render_plain("# Title\n\nBody\n\n## Next\nMore");
+
+        assert_eq!(lines, vec!["Title", "", "Body", "", "Next", "", "More"]);
     }
 }
