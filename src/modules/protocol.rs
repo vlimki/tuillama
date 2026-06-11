@@ -43,6 +43,25 @@ enum ServerEvent {
         url: String,
         snippet: String,
     },
+    ToolCallStarted {
+        request_id: String,
+        chat_id: String,
+        tool_call_id: String,
+        name: String,
+        args: JsonValue,
+    },
+    ToolCallFinished {
+        request_id: String,
+        chat_id: String,
+        tool_call_id: String,
+        result_summary: String,
+    },
+    ToolCallFailed {
+        request_id: String,
+        chat_id: String,
+        tool_call_id: String,
+        error: String,
+    },
     Done {
         request_id: String,
         chat_id: String,

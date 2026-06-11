@@ -19,6 +19,25 @@ struct OllamaWireMessage {
     images: Vec<String>,
 }
 
+
+fn attachment_image_base64(attachment: &Attachment) -> Option<String> {
+    if !attachment.mime_type.starts_with("image/") {
+        return None;
+    }
+    if let Some(data) = &attachment.data_base64 {
+        return Some(data.clone());
+    }
+    if attachment.store_path.is_empty() {
+        return None;
+    }
+    fs::read(&attachment.store_path)
+        .ok()
+        .map(|data| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(data)
+        })
+}
+
 fn message_to_ollama_wire(message: &Message) -> OllamaWireMessage {
     OllamaWireMessage {
         role: role_to_wire(&message.role).to_string(),
@@ -26,7 +45,7 @@ fn message_to_ollama_wire(message: &Message) -> OllamaWireMessage {
         images: message
             .attachments
             .iter()
-            .filter_map(|attachment| attachment.data_base64.clone())
+            .filter_map(attachment_image_base64)
             .collect(),
     }
 }
@@ -39,7 +58,7 @@ fn message_to_ollama_json(message: &Message) -> JsonValue {
     let images = message
         .attachments
         .iter()
-        .filter_map(|attachment| attachment.data_base64.clone())
+        .filter_map(attachment_image_base64)
         .collect::<Vec<_>>();
     if !images.is_empty() {
         value["images"] = json!(images);

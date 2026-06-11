@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::{
     cursor::SetCursorStyle,
@@ -29,6 +28,7 @@ use ratatui::{
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
