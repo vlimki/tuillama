@@ -8,7 +8,7 @@ Finally, a minimalist yet competent Ollama interface.
 * Vim keys
 * Beautiful markdown formatting and syntax highlighting on the terminal
 * Dynamic compilation of messages to PDF or HTML (with LaTeX support!)
-* Toggleable agentic web search mode (`Ctrl+W`) for Ollama-compatible providers
+* Built-in web and local file tools, with `Ctrl+W` to force a web retrieval preflight
 
 ## Preview
 
@@ -18,53 +18,30 @@ Finally, a minimalist yet competent Ollama interface.
 
 ## Agentic web search
 
-Toggle on agentic web search at any time via Ctrl-W. Note that you will have to configure an Ollama API key first in the configuration file.
+Press Ctrl-W to force an agentic web retrieval preflight for the next request. The model can still choose `web_search` or `web_fetch` on its own whenever tools are useful; hosted providers may require an Ollama API key in the configuration file.
 
 ![Preview 4](media/preview4.png)
 
 
-## Tool profiles and workspace file tools
+## Built-in tools
 
-`tuillama-server` has a tool registry with named profiles. Profiles decide which tools the model is allowed to see for a request:
+`tuillama-server` gives the model the available tools on every request.: if you ask the assistant to search the web, read a file, list a directory, or search files, the model can call the appropriate tool directly.
 
-| Profile | Tools exposed |
+Available tools:
+
+| Tool | What it does |
 | --- | --- |
-| `off` | No tools by default. `Ctrl+W` still enables the web tools for that request. |
-| `web` | `web_search`, `web_fetch` |
-| `files` | `file_list`, `file_read`, `file_search`, `workspace_search` |
-| `workspace` | Same read-only workspace tools as `files` |
-| `code` | Web tools plus read-only workspace tools |
-| `full` | Web tools plus read-only workspace tools; reserved for future higher-risk tools |
+| `web_search(query)` | Search the web for up-to-date information. |
+| `web_fetch(url)` | Fetch and parse a specific web page. |
+| `file_list(path, glob)` | List a local directory, optionally filtered with a glob. |
+| `file_read(path, start_line, end_line)` | Read a local file with line numbers for citations. |
+| `file_search(query, path, glob)` | Search local files and return path + line-number matches. |
 
-Enable a profile in your config:
-
-```toml
-[tools]
-profile = "workspace"
-
-[workspace]
-root = "~/projects/foo"
-allow_read = true
-allow_write = false
-max_file_bytes = 200000
-
-[tools.policy]
-confirm_medium = false
-confirm_risky = true
-deny_dangerous = true
-```
-
-Or override the profile when starting the server:
-
-```bash
-cargo run --bin tuillama-server -- --tool-profile workspace
-```
-
-The current local workspace tools are read-only and scoped to `[workspace].root`. Absolute paths are rejected; ask for paths relative to the workspace root. Files larger than `max_file_bytes` are not returned.
+The file tools are read-only. They support normal paths plus `~/...` expansion, and large files over the server's built-in byte limit are skipped or rejected.
 
 ### Asking the model to use local files
 
-Once a file/workspace profile is enabled, you can ask natural-language questions that map to these tools:
+You can ask natural-language questions that map to the file tools:
 
 * **List a directory** with `file_list(path, glob)`:
   * “List the files in `src/modules`.”
@@ -72,14 +49,12 @@ Once a file/workspace profile is enabled, you can ask natural-language questions
 * **Read line-cited file contents** with `file_read(path, start_line, end_line)`:
   * “Read `src/main.rs` lines 1 through 80 and explain the startup flow.”
   * “Open `README.md` around the configuration section.”
-* **Search selected files** with `file_search(query, glob)`:
+* **Search files** with `file_search(query, path, glob)`:
   * “Search for `ToolCallStarted` in `**/*.rs`.”
-  * “Find references to `web_search` in server code.”
-* **Search the whole workspace** with `workspace_search(query)`:
-  * “Search the workspace for `Attachment` and summarize where it is used.”
-  * “Find TODOs across the workspace.”
+  * “Find references to `web_search` under `src/bin`.”
+  * “Find TODOs under the current directory.”
 
-Tool results include workspace-relative paths and line numbers so the assistant can cite exactly where file content came from.
+Tool results include paths and line numbers so the assistant can cite exactly where file content came from.
 
 ### Tool-call trace events
 
@@ -152,7 +127,7 @@ export OLLAMA_MODEL=llama3
 export OLLAMA_CHAT_URL=http://localhost:11434/api/chat
 export TUILLAMA_SERVER_ADDR=127.0.0.1:7878
 export OLLAMA_API_KEY=<optional_api_key>
-# optional: enable server debug traces for WEB mode
+# optional: enable server debug traces for tool use
 export TUILLAMA_DEBUG_WEB=1
 ```
 
@@ -168,9 +143,9 @@ All keys under `[options]` are forwarded to Ollama's `options` field.
 
 You can set `ollama_api_key` in config (or `OLLAMA_API_KEY` in env) for hosted providers that require bearer auth.
 
-Press `Ctrl+W` in the client UI to toggle server-side agentic web search per request. In this mode the server loops over `web_search`/`web_fetch` tool calls and returns the final answer to the client.
-If your prompt includes one or more full `http://` or `https://` URLs, WEB mode now fetches those exact pages first (instead of searching) so you can ask for targeted extraction/summarization of a specific source.
-When debugging WEB mode, run the server with `TUILLAMA_DEBUG_WEB=1` to print per-request traces (tool calls, endpoints, statuses, extracted URLs) to stderr.
+The server gives every request the full built-in tool set (`web_search`, `web_fetch`, `file_list`, `file_read`, and `file_search`) and loops over model-requested tool calls before streaming the final answer. Press `Ctrl+W` in the client UI when you want to force an initial web retrieval before model reasoning.
+If your prompt includes one or more full `http://` or `https://` URLs while Ctrl-W web preflight is enabled, the server fetches those exact pages first (instead of searching) so you can ask for targeted extraction/summarization of a specific source.
+When debugging tool use, run the server with `TUILLAMA_DEBUG_WEB=1` to print per-request traces (tool calls, endpoints, statuses, extracted URLs) to stderr.
 
 You can also set the server endpoint in config with `server_addr = "127.0.0.1:7878"`.
 Set `render_emojis = false` in config to suppress emoji graphemes in rendered Markdown when your terminal/font does not handle them well.
