@@ -362,6 +362,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                ServerEvent::ClientToolRequest { .. } => {}
             },
         }
 

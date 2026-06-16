@@ -16,6 +16,10 @@ enum ClientRequest {
         request_id: String,
         chat_id: String,
     },
+    ClientToolResult {
+        tool_call_id: String,
+        result: JsonValue,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +48,13 @@ enum ServerEvent {
         snippet: String,
     },
     ToolCallStarted {
+        request_id: String,
+        chat_id: String,
+        tool_call_id: String,
+        name: String,
+        args: JsonValue,
+    },
+    ClientToolRequest {
         request_id: String,
         chat_id: String,
         tool_call_id: String,

@@ -13,7 +13,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
-    sync::Mutex,
+    sync::{Mutex, oneshot},
     task::JoinHandle,
 };
 
@@ -362,7 +362,11 @@ fn normalize_tool_name(name: &str) -> &str {
 struct ToolContext {
     client: reqwest::Client,
     headers: HeaderMap,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    pending_client_tools: PendingClientTools,
 }
+
+type PendingClientTools = Arc<Mutex<HashMap<String, oneshot::Sender<JsonValue>>>>;
 
 type ToolResult = Result<JsonValue>;
 
@@ -559,6 +563,13 @@ fn build_tool_registry() -> HashMap<String, Arc<dyn Tool>> {
         .into_iter()
         .map(|tool| (tool.name().to_string(), tool))
         .collect()
+}
+
+fn is_client_filesystem_tool(name: &str) -> bool {
+    matches!(
+        normalize_tool_name(name),
+        "file_list" | "file_read" | "file_search"
+    )
 }
 
 fn all_tools() -> Vec<Arc<dyn Tool>> {
@@ -768,6 +779,9 @@ async fn run_tool_call(
         request_id,
         format!("tool call start: name={normalized} payload={payload}"),
     );
+    if is_client_filesystem_tool(&normalized) {
+        return json!({ "error": "filesystem tools must be run through the client-side tool bridge" });
+    }
     let Some(tool) = registry.get(&normalized) else {
         return json!({ "error": format!("Tool {normalized} not found") });
     };
@@ -787,6 +801,44 @@ async fn run_tool_call(
                 format!("tool call error: name={normalized} err={e}"),
             );
             json!({ "error": e.to_string() })
+        }
+    }
+}
+
+async fn run_client_tool_call(
+    ctx: ToolContext,
+    request_id: &str,
+    chat_id: &str,
+    tool_call_id: &str,
+    name: &str,
+    args: JsonValue,
+) -> JsonValue {
+    let (tx, rx) = oneshot::channel();
+    ctx.pending_client_tools
+        .lock()
+        .await
+        .insert(tool_call_id.to_string(), tx);
+    if let Err(e) = send_server_event(
+        &ctx.writer,
+        &ServerEvent::ClientToolRequest {
+            request_id: request_id.to_string(),
+            chat_id: chat_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            name: name.to_string(),
+            args,
+        },
+    )
+    .await
+    {
+        ctx.pending_client_tools.lock().await.remove(tool_call_id);
+        return json!({ "error": format!("failed to send client tool request: {e}") });
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => json!({ "error": "client tool response channel closed" }),
+        Err(_) => {
+            ctx.pending_client_tools.lock().await.remove(tool_call_id);
+            json!({ "error": "client tool timed out" })
         }
     }
 }
@@ -837,7 +889,11 @@ async fn run_tool_call_with_events(
         },
     )
     .await;
-    let result = run_tool_call(registry, ctx, request_id, debug, &name, payload).await;
+    let result = if is_client_filesystem_tool(&name) {
+        run_client_tool_call(ctx, request_id, chat_id, &tool_call_id, &name, payload).await
+    } else {
+        run_tool_call(registry, ctx, request_id, debug, &name, payload).await
+    };
     if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
         let _ = send_server_event(
             writer,
@@ -876,6 +932,7 @@ async fn process_agentic_tools(
     debug: bool,
     server_config: ServerConfig,
     force_web_preflight: bool,
+    pending_client_tools: PendingClientTools,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let headers = build_auth_headers(ollama_api_key.as_deref());
@@ -884,6 +941,8 @@ async fn process_agentic_tools(
     let tool_ctx = ToolContext {
         client: client.clone(),
         headers: headers.clone(),
+        writer: writer.clone(),
+        pending_client_tools,
     };
     let max_tool_iters = server_config.max_tool_iters;
     let api_base = api_base_from_chat_url(&api_url);
@@ -1144,7 +1203,7 @@ async fn process_agentic_tools(
                 .await;
         }
 
-        for tc in tool_calls {
+        for (tool_idx, tc) in tool_calls.into_iter().enumerate() {
             let fn_obj = tc.get("function").cloned().unwrap_or_else(|| json!({}));
             let tool_name = fn_obj
                 .get("name")
@@ -1169,7 +1228,7 @@ async fn process_agentic_tools(
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string)
-                .unwrap_or_else(|| format!("tool-call-{}", iter + 1));
+                .unwrap_or_else(|| format!("tool-call-{}-{}", iter + 1, tool_idx + 1));
             let tool_result = run_tool_call_with_events(
                 writer,
                 request_id,
@@ -1525,6 +1584,7 @@ async fn process_normal_stream(
 
 async fn process_stream_request(
     writer: Arc<Mutex<OwnedWriteHalf>>,
+    pending_client_tools: PendingClientTools,
     request_id: String,
     chat_id: String,
     api_url: String,
@@ -1553,6 +1613,7 @@ async fn process_stream_request(
         debug,
         server_config,
         web_search,
+        pending_client_tools,
     )
     .await
     {
@@ -1575,6 +1636,7 @@ async fn process_stream_request(
 async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<()> {
     let (reader_half, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
+    let pending_client_tools: PendingClientTools = Arc::new(Mutex::new(HashMap::new()));
     let mut active_requests: HashMap<(String, String), JoinHandle<()>> = HashMap::new();
     let mut reader = BufReader::new(reader_half);
     let mut line = String::new();
@@ -1600,11 +1662,13 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                     old.abort();
                 }
                 let writer2 = writer.clone();
+                let pending2 = pending_client_tools.clone();
                 let cfg = config.clone();
                 let key = (chat_id.clone(), request_id.clone());
                 let handle = tokio::spawn(async move {
                     process_stream_request(
                         writer2,
+                        pending2,
                         request_id,
                         chat_id,
                         api_url,
@@ -1648,6 +1712,14 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                         },
                     )
                     .await;
+                }
+            }
+            ClientRequest::ClientToolResult {
+                tool_call_id,
+                result,
+            } => {
+                if let Some(tx) = pending_client_tools.lock().await.remove(&tool_call_id) {
+                    let _ = tx.send(result);
                 }
             }
         }
