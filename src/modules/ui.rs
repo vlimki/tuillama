@@ -93,6 +93,15 @@ fn approx_token_count(text: &str) -> usize {
     ((chars as f32) / 4.0).ceil() as usize
 }
 
+fn message_context_chars(message: &Message) -> usize {
+    message.content.chars().count()
+        + message
+            .thinking
+            .as_deref()
+            .map(|thinking| thinking.chars().count())
+            .unwrap_or(0)
+}
+
 fn context_window_tokens(app: &App) -> Option<usize> {
     app.options.as_ref().and_then(|options| {
         options.get("num_ctx").and_then(|value| {
@@ -331,8 +340,9 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_stats_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let total_chars: usize = app.messages.iter().map(|m| m.content.chars().count()).sum::<usize>()
+    let total_chars: usize = app.messages.iter().map(message_context_chars).sum::<usize>()
         + app.pending_assistant.chars().count()
+        + app.pending_thinking.chars().count()
         + app.input.chars().count()
         + app.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
     let total_tokens = approx_token_count(&"x".repeat(total_chars));

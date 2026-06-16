@@ -7,7 +7,6 @@ use serde_json::{Value as JsonValue, json};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::{
@@ -81,19 +80,6 @@ impl Default for ServerConfig {
             server_addr: DEFAULT_SERVER_ADDR.to_string(),
             max_tool_iters: DEFAULT_MAX_TOOL_ITERS,
         }
-    }
-}
-
-const DEFAULT_MAX_FILE_BYTES: u64 = 200_000;
-
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("~"))
-            .join(rest)
-    } else {
-        PathBuf::from(path)
     }
 }
 
@@ -470,24 +456,8 @@ impl Tool for FileListTool {
             vec![],
         )
     }
-    async fn call(&self, args: JsonValue, _ctx: ToolContext) -> ToolResult {
-        let base = expand_home(arg_str(&args, "path").unwrap_or("."));
-        let glob_pat = arg_str(&args, "glob");
-        let mut entries = Vec::new();
-        if let Some(pattern) = glob_pat {
-            let pattern_path = base.join(pattern);
-            for entry in glob::glob(&pattern_path.to_string_lossy())?.take(500) {
-                entries.push(file_entry_json(&entry?));
-            }
-        } else {
-            for entry in fs::read_dir(&base)
-                .with_context(|| format!("read directory {}", base.display()))?
-                .take(500)
-            {
-                entries.push(file_entry_json(&entry?.path()));
-            }
-        }
-        Ok(json!({ "path": base.display().to_string(), "entries": entries }))
+    async fn call(&self, _args: JsonValue, _ctx: ToolContext) -> ToolResult {
+        bail!("filesystem tools must be executed by the connected client")
     }
 }
 
@@ -508,31 +478,8 @@ impl Tool for FileReadTool {
             vec!["path"],
         )
     }
-    async fn call(&self, args: JsonValue, _ctx: ToolContext) -> ToolResult {
-        let rel = arg_str(&args, "path").ok_or_else(|| anyhow!("missing required path"))?;
-        let path = expand_home(rel);
-        let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
-        if !meta.is_file() {
-            bail!("path is not a file");
-        }
-        if meta.len() > DEFAULT_MAX_FILE_BYTES {
-            bail!("file exceeds max byte limit ({})", DEFAULT_MAX_FILE_BYTES);
-        }
-        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let start = arg_u64(&args, "start_line").unwrap_or(1).max(1) as usize;
-        let end = arg_u64(&args, "end_line")
-            .map(|n| n as usize)
-            .unwrap_or(usize::MAX);
-        let mut lines = Vec::new();
-        for (idx, line) in text.lines().enumerate() {
-            let line_no = idx + 1;
-            if line_no >= start && line_no <= end {
-                lines.push(json!({ "line": line_no, "text": line }));
-            }
-        }
-        Ok(
-            json!({ "path": display_path(&path), "start_line": start, "end_line": end.min(text.lines().count()), "lines": lines }),
-        )
+    async fn call(&self, _args: JsonValue, _ctx: ToolContext) -> ToolResult {
+        bail!("filesystem tools must be executed by the connected client")
     }
 }
 
@@ -553,8 +500,8 @@ impl Tool for FileSearchTool {
             vec!["query"],
         )
     }
-    async fn call(&self, args: JsonValue, _ctx: ToolContext) -> ToolResult {
-        search_files(args).await
+    async fn call(&self, _args: JsonValue, _ctx: ToolContext) -> ToolResult {
+        bail!("filesystem tools must be executed by the connected client")
     }
 }
 
@@ -633,104 +580,6 @@ fn normalize_tool_payload(tool_name: &str, raw_args: JsonValue) -> JsonValue {
         },
         _ => args,
     }
-}
-
-fn arg_str<'a>(args: &'a JsonValue, key: &str) -> Option<&'a str> {
-    args.as_object()?.get(key)?.as_str()
-}
-
-fn arg_u64(args: &JsonValue, key: &str) -> Option<u64> {
-    args.as_object()?.get(key)?.as_u64()
-}
-
-fn display_path(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
-}
-
-fn file_entry_json(path: &Path) -> JsonValue {
-    let meta = fs::metadata(path).ok();
-    json!({
-        "path": display_path(path),
-        "is_dir": meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-        "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
-    })
-}
-
-fn walk_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) -> Result<()> {
-    if out.len() >= limit {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        if name == ".git" || name == "target" || name == "node_modules" {
-            continue;
-        }
-        let meta = fs::metadata(&path)?;
-        if meta.is_dir() {
-            walk_files(&path, out, limit)?;
-        } else if meta.is_file() {
-            out.push(path);
-            if out.len() >= limit {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn search_files(args: JsonValue) -> ToolResult {
-    let query = arg_str(&args, "query").ok_or_else(|| anyhow!("missing required query"))?;
-    let re = regex::RegexBuilder::new(query)
-        .case_insensitive(true)
-        .build()
-        .ok();
-    let base = expand_home(arg_str(&args, "path").unwrap_or("."));
-    let mut files = Vec::new();
-    if let Some(pattern) = arg_str(&args, "glob") {
-        let pattern_path = base.join(pattern);
-        for entry in glob::glob(&pattern_path.to_string_lossy())?.take(1000) {
-            let path = entry?;
-            if fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
-                files.push(path);
-            }
-        }
-    } else {
-        walk_files(&base, &mut files, 1000)?;
-    }
-
-    let mut matches = Vec::new();
-    for path in files {
-        if matches.len() >= 200 {
-            break;
-        }
-        let meta = fs::metadata(&path)?;
-        if meta.len() > DEFAULT_MAX_FILE_BYTES {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for (idx, line) in text.lines().enumerate() {
-            let is_match = re.as_ref().map(|r| r.is_match(line)).unwrap_or_else(|| {
-                line.to_ascii_lowercase()
-                    .contains(&query.to_ascii_lowercase())
-            });
-            if is_match {
-                matches.push(json!({ "path": display_path(&path), "line": idx + 1, "text": line }));
-                if matches.len() >= 200 {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(json!({ "query": query, "path": display_path(&base), "matches": matches }))
 }
 
 async fn call_ollama_web_tool(
