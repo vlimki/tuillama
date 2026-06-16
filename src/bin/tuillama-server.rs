@@ -7,13 +7,12 @@ use serde_json::{Value as JsonValue, json};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
-    sync::Mutex,
+    sync::{Mutex, oneshot},
     task::JoinHandle,
 };
 
@@ -81,19 +80,6 @@ impl Default for ServerConfig {
             server_addr: DEFAULT_SERVER_ADDR.to_string(),
             max_tool_iters: DEFAULT_MAX_TOOL_ITERS,
         }
-    }
-}
-
-const DEFAULT_MAX_FILE_BYTES: u64 = 200_000;
-
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("~"))
-            .join(rest)
-    } else {
-        PathBuf::from(path)
     }
 }
 
@@ -362,7 +348,11 @@ fn normalize_tool_name(name: &str) -> &str {
 struct ToolContext {
     client: reqwest::Client,
     headers: HeaderMap,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    pending_client_tools: PendingClientTools,
 }
+
+type PendingClientTools = Arc<Mutex<HashMap<String, oneshot::Sender<JsonValue>>>>;
 
 type ToolResult = Result<JsonValue>;
 
@@ -466,24 +456,8 @@ impl Tool for FileListTool {
             vec![],
         )
     }
-    async fn call(&self, args: JsonValue, _ctx: ToolContext) -> ToolResult {
-        let base = expand_home(arg_str(&args, "path").unwrap_or("."));
-        let glob_pat = arg_str(&args, "glob");
-        let mut entries = Vec::new();
-        if let Some(pattern) = glob_pat {
-            let pattern_path = base.join(pattern);
-            for entry in glob::glob(&pattern_path.to_string_lossy())?.take(500) {
-                entries.push(file_entry_json(&entry?));
-            }
-        } else {
-            for entry in fs::read_dir(&base)
-                .with_context(|| format!("read directory {}", base.display()))?
-                .take(500)
-            {
-                entries.push(file_entry_json(&entry?.path()));
-            }
-        }
-        Ok(json!({ "path": base.display().to_string(), "entries": entries }))
+    async fn call(&self, _args: JsonValue, _ctx: ToolContext) -> ToolResult {
+        bail!("filesystem tools must be executed by the connected client")
     }
 }
 
@@ -504,31 +478,8 @@ impl Tool for FileReadTool {
             vec!["path"],
         )
     }
-    async fn call(&self, args: JsonValue, _ctx: ToolContext) -> ToolResult {
-        let rel = arg_str(&args, "path").ok_or_else(|| anyhow!("missing required path"))?;
-        let path = expand_home(rel);
-        let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
-        if !meta.is_file() {
-            bail!("path is not a file");
-        }
-        if meta.len() > DEFAULT_MAX_FILE_BYTES {
-            bail!("file exceeds max byte limit ({})", DEFAULT_MAX_FILE_BYTES);
-        }
-        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let start = arg_u64(&args, "start_line").unwrap_or(1).max(1) as usize;
-        let end = arg_u64(&args, "end_line")
-            .map(|n| n as usize)
-            .unwrap_or(usize::MAX);
-        let mut lines = Vec::new();
-        for (idx, line) in text.lines().enumerate() {
-            let line_no = idx + 1;
-            if line_no >= start && line_no <= end {
-                lines.push(json!({ "line": line_no, "text": line }));
-            }
-        }
-        Ok(
-            json!({ "path": display_path(&path), "start_line": start, "end_line": end.min(text.lines().count()), "lines": lines }),
-        )
+    async fn call(&self, _args: JsonValue, _ctx: ToolContext) -> ToolResult {
+        bail!("filesystem tools must be executed by the connected client")
     }
 }
 
@@ -549,8 +500,8 @@ impl Tool for FileSearchTool {
             vec!["query"],
         )
     }
-    async fn call(&self, args: JsonValue, _ctx: ToolContext) -> ToolResult {
-        search_files(args).await
+    async fn call(&self, _args: JsonValue, _ctx: ToolContext) -> ToolResult {
+        bail!("filesystem tools must be executed by the connected client")
     }
 }
 
@@ -559,6 +510,13 @@ fn build_tool_registry() -> HashMap<String, Arc<dyn Tool>> {
         .into_iter()
         .map(|tool| (tool.name().to_string(), tool))
         .collect()
+}
+
+fn is_client_filesystem_tool(name: &str) -> bool {
+    matches!(
+        normalize_tool_name(name),
+        "file_list" | "file_read" | "file_search"
+    )
 }
 
 fn all_tools() -> Vec<Arc<dyn Tool>> {
@@ -624,104 +582,6 @@ fn normalize_tool_payload(tool_name: &str, raw_args: JsonValue) -> JsonValue {
     }
 }
 
-fn arg_str<'a>(args: &'a JsonValue, key: &str) -> Option<&'a str> {
-    args.as_object()?.get(key)?.as_str()
-}
-
-fn arg_u64(args: &JsonValue, key: &str) -> Option<u64> {
-    args.as_object()?.get(key)?.as_u64()
-}
-
-fn display_path(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
-}
-
-fn file_entry_json(path: &Path) -> JsonValue {
-    let meta = fs::metadata(path).ok();
-    json!({
-        "path": display_path(path),
-        "is_dir": meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-        "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
-    })
-}
-
-fn walk_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) -> Result<()> {
-    if out.len() >= limit {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        if name == ".git" || name == "target" || name == "node_modules" {
-            continue;
-        }
-        let meta = fs::metadata(&path)?;
-        if meta.is_dir() {
-            walk_files(&path, out, limit)?;
-        } else if meta.is_file() {
-            out.push(path);
-            if out.len() >= limit {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn search_files(args: JsonValue) -> ToolResult {
-    let query = arg_str(&args, "query").ok_or_else(|| anyhow!("missing required query"))?;
-    let re = regex::RegexBuilder::new(query)
-        .case_insensitive(true)
-        .build()
-        .ok();
-    let base = expand_home(arg_str(&args, "path").unwrap_or("."));
-    let mut files = Vec::new();
-    if let Some(pattern) = arg_str(&args, "glob") {
-        let pattern_path = base.join(pattern);
-        for entry in glob::glob(&pattern_path.to_string_lossy())?.take(1000) {
-            let path = entry?;
-            if fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
-                files.push(path);
-            }
-        }
-    } else {
-        walk_files(&base, &mut files, 1000)?;
-    }
-
-    let mut matches = Vec::new();
-    for path in files {
-        if matches.len() >= 200 {
-            break;
-        }
-        let meta = fs::metadata(&path)?;
-        if meta.len() > DEFAULT_MAX_FILE_BYTES {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for (idx, line) in text.lines().enumerate() {
-            let is_match = re.as_ref().map(|r| r.is_match(line)).unwrap_or_else(|| {
-                line.to_ascii_lowercase()
-                    .contains(&query.to_ascii_lowercase())
-            });
-            if is_match {
-                matches.push(json!({ "path": display_path(&path), "line": idx + 1, "text": line }));
-                if matches.len() >= 200 {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(json!({ "query": query, "path": display_path(&base), "matches": matches }))
-}
-
 async fn call_ollama_web_tool(
     client: &reqwest::Client,
     headers: &HeaderMap,
@@ -768,6 +628,9 @@ async fn run_tool_call(
         request_id,
         format!("tool call start: name={normalized} payload={payload}"),
     );
+    if is_client_filesystem_tool(&normalized) {
+        return json!({ "error": "filesystem tools must be run through the client-side tool bridge" });
+    }
     let Some(tool) = registry.get(&normalized) else {
         return json!({ "error": format!("Tool {normalized} not found") });
     };
@@ -787,6 +650,44 @@ async fn run_tool_call(
                 format!("tool call error: name={normalized} err={e}"),
             );
             json!({ "error": e.to_string() })
+        }
+    }
+}
+
+async fn run_client_tool_call(
+    ctx: ToolContext,
+    request_id: &str,
+    chat_id: &str,
+    tool_call_id: &str,
+    name: &str,
+    args: JsonValue,
+) -> JsonValue {
+    let (tx, rx) = oneshot::channel();
+    ctx.pending_client_tools
+        .lock()
+        .await
+        .insert(tool_call_id.to_string(), tx);
+    if let Err(e) = send_server_event(
+        &ctx.writer,
+        &ServerEvent::ClientToolRequest {
+            request_id: request_id.to_string(),
+            chat_id: chat_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            name: name.to_string(),
+            args,
+        },
+    )
+    .await
+    {
+        ctx.pending_client_tools.lock().await.remove(tool_call_id);
+        return json!({ "error": format!("failed to send client tool request: {e}") });
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => json!({ "error": "client tool response channel closed" }),
+        Err(_) => {
+            ctx.pending_client_tools.lock().await.remove(tool_call_id);
+            json!({ "error": "client tool timed out" })
         }
     }
 }
@@ -837,7 +738,11 @@ async fn run_tool_call_with_events(
         },
     )
     .await;
-    let result = run_tool_call(registry, ctx, request_id, debug, &name, payload).await;
+    let result = if is_client_filesystem_tool(&name) {
+        run_client_tool_call(ctx, request_id, chat_id, &tool_call_id, &name, payload).await
+    } else {
+        run_tool_call(registry, ctx, request_id, debug, &name, payload).await
+    };
     if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
         let _ = send_server_event(
             writer,
@@ -876,6 +781,7 @@ async fn process_agentic_tools(
     debug: bool,
     server_config: ServerConfig,
     force_web_preflight: bool,
+    pending_client_tools: PendingClientTools,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let headers = build_auth_headers(ollama_api_key.as_deref());
@@ -884,6 +790,8 @@ async fn process_agentic_tools(
     let tool_ctx = ToolContext {
         client: client.clone(),
         headers: headers.clone(),
+        writer: writer.clone(),
+        pending_client_tools,
     };
     let max_tool_iters = server_config.max_tool_iters;
     let api_base = api_base_from_chat_url(&api_url);
@@ -1144,7 +1052,7 @@ async fn process_agentic_tools(
                 .await;
         }
 
-        for tc in tool_calls {
+        for (tool_idx, tc) in tool_calls.into_iter().enumerate() {
             let fn_obj = tc.get("function").cloned().unwrap_or_else(|| json!({}));
             let tool_name = fn_obj
                 .get("name")
@@ -1169,7 +1077,7 @@ async fn process_agentic_tools(
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string)
-                .unwrap_or_else(|| format!("tool-call-{}", iter + 1));
+                .unwrap_or_else(|| format!("tool-call-{}-{}", iter + 1, tool_idx + 1));
             let tool_result = run_tool_call_with_events(
                 writer,
                 request_id,
@@ -1525,6 +1433,7 @@ async fn process_normal_stream(
 
 async fn process_stream_request(
     writer: Arc<Mutex<OwnedWriteHalf>>,
+    pending_client_tools: PendingClientTools,
     request_id: String,
     chat_id: String,
     api_url: String,
@@ -1553,6 +1462,7 @@ async fn process_stream_request(
         debug,
         server_config,
         web_search,
+        pending_client_tools,
     )
     .await
     {
@@ -1575,6 +1485,7 @@ async fn process_stream_request(
 async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<()> {
     let (reader_half, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
+    let pending_client_tools: PendingClientTools = Arc::new(Mutex::new(HashMap::new()));
     let mut active_requests: HashMap<(String, String), JoinHandle<()>> = HashMap::new();
     let mut reader = BufReader::new(reader_half);
     let mut line = String::new();
@@ -1600,11 +1511,13 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                     old.abort();
                 }
                 let writer2 = writer.clone();
+                let pending2 = pending_client_tools.clone();
                 let cfg = config.clone();
                 let key = (chat_id.clone(), request_id.clone());
                 let handle = tokio::spawn(async move {
                     process_stream_request(
                         writer2,
+                        pending2,
                         request_id,
                         chat_id,
                         api_url,
@@ -1648,6 +1561,14 @@ async fn handle_client(stream: TcpStream, config: Arc<ServerConfig>) -> Result<(
                         },
                     )
                     .await;
+                }
+            }
+            ClientRequest::ClientToolResult {
+                tool_call_id,
+                result,
+            } => {
+                if let Some(tx) = pending_client_tools.lock().await.remove(&tool_call_id) {
+                    let _ = tx.send(result);
                 }
             }
         }
