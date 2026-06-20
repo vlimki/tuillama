@@ -522,6 +522,39 @@ fn attachment_from_path(path_text: &str) -> Result<Attachment> {
     })
 }
 
+fn attachment_data_base64_for_wire(attachment: &Attachment) -> Result<Option<String>> {
+    if !attachment.mime_type.starts_with("image/") {
+        return Ok(None);
+    }
+    if let Some(data) = &attachment.data_base64 {
+        return Ok(Some(data.clone()));
+    }
+
+    let path = if !attachment.store_path.is_empty() {
+        PathBuf::from(&attachment.store_path)
+    } else if !attachment.original_path.is_empty() {
+        PathBuf::from(&attachment.original_path)
+    } else {
+        return Ok(None);
+    };
+    let data = fs::read(&path).with_context(|| format!("read attachment data {}", path.display()))?;
+    if data.len() as u64 > MAX_ATTACHMENT_BYTES {
+        return Err(anyhow!("attachment exceeds max size of {} bytes", MAX_ATTACHMENT_BYTES));
+    }
+
+    use base64::Engine as _;
+    Ok(Some(base64::engine::general_purpose::STANDARD.encode(data)))
+}
+
+fn hydrate_client_image_attachments_for_wire(messages: &mut [Message]) -> Result<()> {
+    for message in messages {
+        for attachment in &mut message.attachments {
+            attachment.data_base64 = attachment_data_base64_for_wire(attachment)?;
+        }
+    }
+    Ok(())
+}
+
 fn execute_command_palette(app: &mut App) {
     let command = app.command_input.trim().trim_start_matches(':').trim().to_string();
     if command.is_empty() {
@@ -1145,6 +1178,18 @@ async fn handle_key(
                             },
                         );
                     }
+                }
+                if let Err(e) = hydrate_client_image_attachments_for_wire(&mut convo) {
+                    app.messages.push(Message {
+                        role: Role::System,
+                        content: format!("Attachment failed: {e}"),
+                        created_ts: now_sec(),
+                        thinking: None,
+                        attachments: Vec::new(),
+                        sources: Vec::new(),
+                    });
+                    app.render_cache.clear();
+                    return Ok(());
                 }
 
                 let request_id = gen_chat_id();

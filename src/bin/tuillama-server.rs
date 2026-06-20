@@ -50,7 +50,7 @@ struct Attachment {
     #[serde(default)]
     store_path: String,
     #[allow(dead_code)]
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     data_base64: Option<String>,
 }
 

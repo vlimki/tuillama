@@ -74,7 +74,7 @@ New attachments are stored outside chat JSON under:
 ${XDG_DATA_HOME:-$HOME/.local/share}/tuillama/attachments/<sha256>
 ```
 
-Chat files keep only metadata such as the original path, MIME type, SHA-256, size, and store path. Image attachments are still loaded from the store and sent to Ollama-compatible multimodal models when needed; non-image attachments are stored as metadata for now.
+Chat files keep only metadata such as the original path, MIME type, SHA-256, size, and store path. Before a request is sent to `tuillama-server`, the client loads image bytes from its local attachment store and includes them as base64 data in the request, so the server does not need access to the client filesystem path. Non-image attachments are stored as metadata for now.
 
 ## No LaTeX on the terminal? No problem
 
